@@ -165,9 +165,21 @@ def decode_shard_table(blob: bytes) -> list:
 
 
 def _torch_dtype(label: str):
+    """Resolve a shard-table dtype label to a ``torch.dtype``.
+
+    Publishers emit either ``"torch.bfloat16"`` or ``"bfloat16"``, so the prefix
+    is optional. The label must name a dtype rather than merely some torch
+    attribute. A fixed allowlist of names is deliberately avoided: the publish
+    format is an external contract, and a hardcoded list would reject dtypes a
+    newer torch supports.
+    """
     import torch
 
-    return getattr(torch, label.split(".")[-1])
+    name = label.split(".")[-1]
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"unsupported dtype label {label!r} in shard table")
+    return dtype
 
 
 def build_sources(tensors: list) -> tuple:
@@ -182,6 +194,12 @@ def build_sources(tensors: list) -> tuple:
     session_to_device = {}
     for t in tensors:
         dtype = _torch_dtype(t.dtype)
+        if t.elsize != dtype.itemsize:
+            raise ValueError(
+                f"tensor {t.name!r} published elsize {t.elsize} disagrees with dtype "
+                f"{t.dtype} (itemsize {dtype.itemsize}); elsize drives raw address "
+                f"arithmetic, so a mismatch would read the wrong bytes"
+            )
         shards = []
         for s in t.shards:
             session = s.agent_name
@@ -219,10 +237,14 @@ def merge_shard_tables(tables: list) -> list:
                     t.name, t.dtype, t.elsize, t.full_shape, list(t.shards)
                 )
                 continue
-            if cur.full_shape != t.full_shape or cur.dtype != t.dtype:
+            if (
+                cur.full_shape != t.full_shape
+                or cur.dtype != t.dtype
+                or cur.elsize != t.elsize
+            ):
                 raise ValueError(
-                    f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
-                    f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
+                    f"tensor {t.name!r} published with inconsistent shape/dtype/elsize across ranks: "
+                    f"{cur.full_shape}/{cur.dtype}/{cur.elsize} vs {t.full_shape}/{t.dtype}/{t.elsize}"
                 )
             cur.shards.extend(t.shards)
     return list(merged.values())
