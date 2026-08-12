@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Expose native Megatron storage as HF-canonical reshard source shards."""
+"""Expose native Megatron storage as HF-canonical RL refit source shards."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from modelexpress.refit.reshard.verify import published_digest
 
 
 @dataclass(frozen=True)
-class MegatronAliasInput:
+class MegatronTensorSpec:
+    """One native Megatron tensor and its logical transfer representation."""
+
     name: str
     tensor: Any
     role: str
@@ -23,8 +25,29 @@ class MegatronAliasInput:
     local_shard_range: tuple[int, int] | None
     extras: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.name or not self.hf_names:
+            raise ValueError("name and hf_names are required")
+        if len(set(self.hf_names)) != len(self.hf_names):
+            raise ValueError(f"{self.name}: hf_names must be unique")
+        if not self.global_shape or any(int(dim) <= 0 for dim in self.global_shape):
+            raise ValueError(f"{self.name}: invalid global shape {self.global_shape}")
+        if self.placement_kind not in {"SHARD", "REPLICATE"}:
+            raise ValueError(f"{self.name}: unsupported placement_kind")
+        has_shard_layout = (
+            self.shard_axis is not None and self.local_shard_range is not None
+        )
+        if self.placement_kind == "SHARD" and not has_shard_layout:
+            raise ValueError(
+                f"{self.name}: SHARD requires shard_axis and local_shard_range"
+            )
+        if self.placement_kind == "REPLICATE" and (
+            self.shard_axis is not None or self.local_shard_range is not None
+        ):
+            raise ValueError(f"{self.name}: REPLICATE cannot set shard layout")
 
-def _source_rank_and_size(item: MegatronAliasInput, axis: int) -> tuple[int, int]:
+
+def _source_rank_and_size(item: MegatronTensorSpec, axis: int) -> tuple[int, int]:
     local_extent = int(item.tensor.shape[axis])
     global_extent = int(item.global_shape[axis])
     if item.placement_kind != "SHARD":
@@ -90,7 +113,7 @@ GATE_THEN_UP = "gate_then_up"
 
 
 def _build_gated_aliases(
-    item: MegatronAliasInput, agent_name: str
+    item: MegatronTensorSpec, agent_name: str
 ) -> list[PublishedTensor]:
     if len(item.hf_names) != 2:
         raise ValueError(f"{item.name}: gated tensor requires gate/up HF names")
@@ -119,6 +142,15 @@ def _build_gated_aliases(
     source_rank, source_size = _source_rank_and_size(item, axis)
     full_shape = list(item.tensor.shape)
     full_shape[axis] = half * source_size
+    expected = [int(dim) for dim in item.global_shape]
+    if expected[axis] % 2:
+        raise ValueError(f"{item.name}: fused global extent must be even")
+    expected[axis] //= 2
+    if expected != [int(dim) for dim in full_shape]:
+        raise ValueError(
+            f"{item.name}: derived gate/up shape {tuple(full_shape)} disagrees "
+            f"with declared global shape {item.global_shape}"
+        )
     shard_range = (
         (source_rank * half, (source_rank + 1) * half) if source_size > 1 else None
     )
@@ -136,10 +168,14 @@ def _build_gated_aliases(
 
 
 def _build_qkv_aliases(
-    item: MegatronAliasInput, agent_name: str
+    item: MegatronTensorSpec, agent_name: str
 ) -> list[PublishedTensor]:
     if len(item.hf_names) != 3 or item.tensor.ndim != 2:
         raise ValueError(f"{item.name}: QKV aliasing requires 2D q/k/v weights")
+    required = ("head_dim", "num_heads_local", "num_kv_heads_local")
+    missing = [key for key in required if key not in item.extras]
+    if missing:
+        raise ValueError(f"{item.name}: QKV aliasing requires extras {missing}")
     head_dim = int(item.extras["head_dim"])
     q_heads_local = int(item.extras["num_heads_local"])
     kv_heads_local = int(item.extras["num_kv_heads_local"])
@@ -195,7 +231,7 @@ def _build_qkv_aliases(
 
 
 def build_hf_aliases(
-    items: list[MegatronAliasInput], *, agent_name: str
+    items: list[MegatronTensorSpec], *, agent_name: str
 ) -> list[PublishedTensor]:
     """Build zero-copy HF aliases whose addresses remain in registered storage."""
 
@@ -245,4 +281,8 @@ def build_hf_aliases(
     return aliases
 
 
-__all__ = ["MegatronAliasInput", "build_hf_aliases"]
+# Compatibility name for the existing reshard API.
+MegatronAliasInput = MegatronTensorSpec
+
+
+__all__ = ["MegatronAliasInput", "MegatronTensorSpec", "build_hf_aliases"]

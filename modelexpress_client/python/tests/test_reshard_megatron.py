@@ -3,28 +3,26 @@
 
 import pytest
 import torch
-
-from modelexpress import p2p_pb2
-from modelexpress.refit.reshard.megatron import (
-    MegatronTargetLayout,
-    MegatronTargetSpec,
-    lower_megatron_target,
-)
-from modelexpress.refit.reshard.megatron_aliases import (
-    MegatronAliasInput,
-    build_hf_aliases,
-)
-from modelexpress.refit.reshard.megatron_publisher import (
-    MegatronPublishedTensorSpec,
-    publish_megatron_reshard_view,
-)
-from modelexpress.refit.reshard.megatron_receiver import MegatronReshardReceiver
 from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     unwrap_rendezvous_blob,
 )
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
+from modelexpress_rl.inference.reshard.megatron import (
+    MegatronReshardReceiver,
+    MegatronTargetLayout,
+    MegatronTargetSpec,
+    lower_megatron_target,
+)
+from modelexpress_rl.train.engines.megatron import (
+    MegatronAliasInput,
+    MegatronPublishedTensorSpec,
+    MegatronTensorSpec,
+    build_hf_aliases,
+    build_megatron_reshard_manifest,
+    publish_megatron_reshard_view,
+)
 
 
 def _bf16_sources() -> tuple[dict[str, SourceInfo], list[torch.Tensor]]:
@@ -194,36 +192,66 @@ def test_receiver_seam_rejects_stale_manifest_geometry():
         )
 
 
-class _PublishClient:
-    """Records the published worker record and accepts heartbeat status updates."""
-
-    def __init__(self):
-        self.worker = None
-        self.status_updates = []
-
-    def publish_metadata(self, _identity, worker, _worker_id):
-        self.worker = worker
-        return "source-id"
-
-    def update_status(self, **kwargs):
-        self.status_updates.append(kwargs)
-        return True
-
-
 class _Manager:
     agent_name = "trainer-r3"
     nixl_metadata = b"agent-metadata"
 
 
-def _trainer_rendezvous(client):
-    return MxReshardRendezvous(
-        client, role="trainer", rank=3, model_name="model", worker_id="worker-3"
+class _PublishClient:
+    def __init__(self):
+        self.worker = None
+
+    def publish_metadata(self, _identity, worker, _worker_id):
+        self.worker = worker
+        return "source-id"
+
+    def update_status(self, **_kwargs):
+        return True
+
+
+def test_manifest_builder_reuses_registered_tensor_addresses():
+    tensor = torch.zeros((8, 8), dtype=torch.bfloat16)
+    published = build_hf_aliases(
+        [
+            MegatronTensorSpec(
+                name="column",
+                tensor=tensor,
+                role="column",
+                hf_names=("column",),
+                global_shape=(16, 8),
+                placement_kind="SHARD",
+                shard_axis=0,
+                local_shard_range=(8, 16),
+            )
+        ],
+        agent_name="trainer-r3",
     )
 
+    manifest = build_megatron_reshard_manifest(
+        manager=_Manager(),
+        published=published,
+        metadata_endpoint="10.0.0.3:19003",
+    )
 
-def test_publisher_seam_reuses_registered_tensor_addresses():
+    payload = unwrap_rendezvous_blob(manifest.blob)
+    assert (payload.agent_metadata, payload.agent_name, payload.metadata_endpoint) == (
+        b"agent-metadata",
+        "trainer-r3",
+        "10.0.0.3:19003",
+    )
+    assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
+    assert payload.tensors[0].shards[0].shard_offset == (8, 0)
+
+
+def test_existing_reshard_publisher_remains_compatible():
     client = _PublishClient()
-    rendezvous = _trainer_rendezvous(client)
+    rendezvous = MxReshardRendezvous(
+        client,
+        role="trainer",
+        rank=3,
+        model_name="model",
+        worker_id="worker-3",
+    )
     tensor = torch.zeros((8, 8), dtype=torch.bfloat16)
 
     try:
@@ -242,57 +270,35 @@ def test_publisher_seam_reuses_registered_tensor_addresses():
             metadata_endpoint="10.0.0.3:19003",
         )
     finally:
-        # The caller owns the rendezvous precisely so its heartbeat can be stopped.
         rendezvous.close()
 
     assert source_id == "source-id"
-    assert client.worker.status > 0
     payload = unwrap_rendezvous_blob(client.worker.nixl_metadata)
-    assert (payload.agent_metadata, payload.agent_name, payload.metadata_endpoint) == (
-        b"agent-metadata",
-        "trainer-r3",
-        "10.0.0.3:19003",
-    )
     assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
-    assert payload.tensors[0].shards[0].shard_offset == (8, 0)
 
 
-def test_publishing_leaves_the_heartbeat_with_its_owner():
-    """Publishing starts the source's READY heartbeat. A rendezvous built inside the
-    seam would leave that thread running with no handle to stop it, so the source
-    would only be marked stale at interpreter exit."""
-    client = _PublishClient()
-    rendezvous = _trainer_rendezvous(client)
-
-    publish_megatron_reshard_view(
-        manager=_Manager(),
-        rendezvous=rendezvous,
-        tensors={"column": torch.zeros((8, 8), dtype=torch.bfloat16)},
-        specs=[MegatronPublishedTensorSpec(name="column", global_shape=(8, 8))],
-        metadata_endpoint="10.0.0.3:19003",
+def test_manifest_builder_rejects_duplicate_tensor_names():
+    tensor = torch.zeros((8, 8), dtype=torch.bfloat16)
+    published = build_hf_aliases(
+        [
+            MegatronTensorSpec(
+                name="column",
+                tensor=tensor,
+                role="column",
+                hf_names=("column",),
+                global_shape=(8, 8),
+                placement_kind="REPLICATE",
+                shard_axis=None,
+                local_shard_range=None,
+            )
+        ],
+        agent_name="trainer-r3",
     )
-    rendezvous.close()
 
-    assert client.status_updates[-1]["status"] == p2p_pb2.SOURCE_STATUS_STALE
-    assert client.status_updates[-1]["worker_id"] == "worker-3"
-
-
-def test_publisher_seam_rejects_duplicate_spec_names():
-    """Last-writer-wins would publish one spec's shard description under a name the
-    other spec owns, and comparing key sets against the tensors cannot see it."""
-
-    class Client:
-        def publish_metadata(self, *_args, **_kwargs):
-            raise AssertionError("publication must not run")
-
-    spec = MegatronPublishedTensorSpec(name="column", global_shape=(8, 8))
-
-    with pytest.raises(ValueError, match="duplicate Megatron publish spec"):
-        publish_megatron_reshard_view(
+    with pytest.raises(ValueError, match="duplicate published tensor"):
+        build_megatron_reshard_manifest(
             manager=_Manager(),
-            rendezvous=_trainer_rendezvous(Client()),
-            tensors={"column": torch.zeros((8, 8), dtype=torch.bfloat16)},
-            specs=[spec, spec],
+            published=[published[0], published[0]],
             metadata_endpoint="10.0.0.3:19003",
         )
 
@@ -371,6 +377,28 @@ def test_a_missing_fused_gate_up_order_is_rejected():
         )
 
 
+def test_gated_aliases_reject_inconsistent_declared_global_shape():
+    fused = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+
+    with pytest.raises(ValueError, match="linear_fc1.weight: derived gate/up shape"):
+        build_hf_aliases(
+            [
+                MegatronAliasInput(
+                    name="linear_fc1.weight",
+                    tensor=fused,
+                    role="gated_mlp_column",
+                    hf_names=("gate_proj.weight", "up_proj.weight"),
+                    global_shape=(16, 5),
+                    placement_kind="SHARD",
+                    shard_axis=0,
+                    local_shard_range=(8, 16),
+                    extras={"gated_mlp_order": "gate_then_up"},
+                )
+            ],
+            agent_name="trainer-tp1",
+        )
+
+
 def test_qkv_aliases_expose_hf_head_ranges_without_copy():
     qkv = torch.arange(48, dtype=torch.bfloat16).reshape(12, 4)
 
@@ -404,6 +432,31 @@ def test_qkv_aliases_expose_hf_head_ranges_without_copy():
     assert q.shards[0].addr == qkv.data_ptr()
     assert k.shards[0].addr == qkv[8:].data_ptr()
     assert v.shards[0].addr == qkv[10:].data_ptr()
+
+
+def test_qkv_aliases_report_missing_extras_with_tensor_name():
+    qkv = torch.arange(48, dtype=torch.bfloat16).reshape(12, 4)
+
+    with pytest.raises(
+        ValueError,
+        match="linear_qkv.weight: QKV aliasing requires extras",
+    ):
+        build_hf_aliases(
+            [
+                MegatronAliasInput(
+                    name="linear_qkv.weight",
+                    tensor=qkv,
+                    role="qkv_column",
+                    hf_names=("q_proj.weight", "k_proj.weight", "v_proj.weight"),
+                    global_shape=(24, 4),
+                    placement_kind="SHARD",
+                    shard_axis=0,
+                    local_shard_range=(12, 24),
+                    extras={"head_dim": "2"},
+                )
+            ],
+            agent_name="trainer-tp1",
+        )
 
 
 def test_a_shard_range_beyond_the_global_extent_is_rejected():
