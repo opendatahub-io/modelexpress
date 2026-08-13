@@ -8,6 +8,13 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["tls-rustls"]
+# FIPS builds: RHEL's openssl is validated, ring and aws-lc-rs are not.
+openssl = ["tls-openssl"]
+tls-openssl = ["kube/openssl-tls"]
+tls-rustls = ["kube/rustls-tls"]
+
 [dependencies]
 modelexpress-operator = { path = "../operator" }
 kube = { workspace = true }
