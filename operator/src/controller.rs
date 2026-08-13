@@ -27,6 +27,8 @@ pub enum Error {
     Kube(#[from] kube::Error),
     #[error("CR has no namespace")]
     MissingNamespace,
+    #[error("CR has no uid")]
+    MissingUid,
     #[error("existingClaim {claim} not found")]
     MissingClaim { claim: String },
     #[error(
@@ -110,15 +112,7 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
             cr.status.as_ref().and_then(|s| s.observed_generation),
         ),
     };
-    write_status(
-        &ns,
-        &name,
-        &ctx,
-        condition,
-        endpoint,
-        observed_generation,
-    )
-    .await?;
+    write_status(&ns, &name, &ctx, condition, endpoint, observed_generation).await?;
 
     result.map(|()| Action::requeue(Duration::from_secs(300)))
 }
@@ -132,6 +126,7 @@ pub fn endpoint(name: &str, ns: &str, port: i32) -> String {
 #[tracing::instrument(skip_all)]
 async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Result<(), Error> {
     check_existing_claim(cr, ns, ctx).await?;
+    let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
     let DesiredState {
         mut deployment,
@@ -148,7 +143,7 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
 
     // RBAC before the Deployment: pods referencing a not-yet-existing SA
     // fail admission at the ReplicaSet level.
-    apply_rbac(cr, ns, ctx, &params).await?;
+    apply_rbac(cr, ns, ctx, &params, &uid).await?;
 
     if let Some(mut pvc) = pvc {
         stamp(&mut pvc.metadata, ns, owner);
@@ -171,7 +166,7 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
         }
         // config removed: clean up the stale policy rather than leave a
         // stray ingress restriction behind
-        None => delete_ignoring_404(&api, name).await?,
+        None => delete_if_owned(&api, name, &uid).await?,
     }
 
     tracing::debug!("desired state applied");
@@ -184,6 +179,7 @@ async fn apply_rbac(
     ns: &str,
     ctx: &Ctx,
     params: &PatchParams,
+    uid: &str,
 ) -> Result<(), Error> {
     let name = cr.name_any();
     let ServerRbac {
@@ -203,7 +199,7 @@ async fn apply_rbac(
                 .await?;
         }
         // user brought their own SA: remove the generated one if it lingers
-        None => delete_ignoring_404(&sa_api, &format!("{name}-server")).await?,
+        None => delete_if_owned(&sa_api, &format!("{name}-server"), uid).await?,
     }
 
     let role_api = Api::<Role>::namespaced(ctx.client.clone(), ns);
@@ -220,22 +216,46 @@ async fn apply_rbac(
         }
         // backend no longer needs grants (redis, or user-managed SA)
         _ => {
-            delete_ignoring_404(&binding_api, &rname).await?;
-            delete_ignoring_404(&role_api, &rname).await?;
+            delete_if_owned(&binding_api, &rname, uid).await?;
+            delete_if_owned(&role_api, &rname, uid).await?;
         }
     }
     Ok(())
 }
 
-async fn delete_ignoring_404<K>(api: &Api<K>, name: &str) -> Result<(), Error>
+/// Delete only what this CR owns.
+///
+/// Every cleanup path here targets a name derived from the CR, not a name the
+/// operator can prove it created. `spec.networkPolicy` is unset by default, so
+/// the netpol branch runs on the common path and would otherwise issue a
+/// DELETE against `<namespace>/<cr-name>` on every reconcile, taking out a
+/// user's unrelated NetworkPolicy that merely shares the name. Checking the
+/// ownerReference makes the delete a no-op for anything the operator did not
+/// create.
+async fn delete_if_owned<K>(api: &Api<K>, name: &str, owner_uid: &str) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
 {
+    let Some(existing) = api.get_opt(name).await? else {
+        return Ok(());
+    };
+    if !is_owned_by(existing.meta(), owner_uid) {
+        tracing::debug!(name, "not operator-owned, leaving in place");
+        return Ok(());
+    }
     match api.delete(name, &Default::default()).await {
         Ok(_) => Ok(()),
+        // lost a race with the garbage collector
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
+    meta.owner_references
+        .iter()
+        .flatten()
+        .any(|owner| owner.uid == owner_uid)
 }
 
 /// The admission rules can't see an existing claim's access modes; enforce the
@@ -290,6 +310,7 @@ fn reason(err: &Error) -> &'static str {
     match err {
         Error::Kube(_) => "ApplyFailed",
         Error::MissingNamespace => "MissingNamespace",
+        Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
         Error::SingleNodeClaim { .. } => "CacheClaimSingleNode",
     }
@@ -374,7 +395,7 @@ fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Ac
 mod tests {
     use super::*;
     use crate::crd::{MetadataBackend, ModelExpressServerSpec, RedisBackend};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 
     fn server(status: Option<ModelExpressServerStatus>) -> ModelExpressServer {
         let mut cr = ModelExpressServer::new(
@@ -418,6 +439,41 @@ mod tests {
             conditions: vec![condition],
             endpoint: None,
         })
+    }
+
+    #[test]
+    fn ownership_gates_the_cleanup_deletes() {
+        const UID: &str = "11111111-2222-3333-4444-555555555555";
+        const OTHER: &str = "99999999-8888-7777-6666-555555555555";
+
+        fn owned_by(uids: &[&str]) -> ObjectMeta {
+            ObjectMeta {
+                owner_references: Some(
+                    uids.iter()
+                        .map(|uid| OwnerReference {
+                            uid: (*uid).to_string(),
+                            ..OwnerReference::default()
+                        })
+                        .collect(),
+                ),
+                ..ObjectMeta::default()
+            }
+        }
+
+        assert!(is_owned_by(&owned_by(&[UID]), UID));
+        assert!(
+            is_owned_by(&owned_by(&[OTHER, UID]), UID),
+            "one of several owners still counts"
+        );
+        assert!(
+            !is_owned_by(&owned_by(&[OTHER]), UID),
+            "owned by a different CR"
+        );
+        // a user's own NetworkPolicy that merely shares the CR's name
+        assert!(
+            !is_owned_by(&ObjectMeta::default(), UID),
+            "an unowned object must never be deleted"
+        );
     }
 
     #[test]
