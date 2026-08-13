@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress operator (controller) image for RHEL/UBI9.
+#
+# Multi-stage build that compiles the operator from source on UBI9.
+# Runtime stage uses ubi-minimal for a small footprint with microdnf
+# available if additional packages are ever needed.
+
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:1c2ddbf86e65ddca0703f1a2f61e8b4d4ddda26799ee64f8200b551e835501ce AS build
+
+# cmake + perl for aws-lc-sys (rustls TLS backend)
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
+        rust cargo cmake gcc perl \
+    && dnf clean all
+
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=cargo-registry-ubi9,target=/root/.cargo/registry \
+    --mount=type=cache,id=target-ubi9,target=/src/target \
+    cargo build --release --package modelexpress-operator \
+    && cp target/release/modelexpress-operator /modelexpress-operator
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:d7fc7bb3438b89a103508d78b6fdc371c0b67788999c8be4c40bf22ba110af61
+
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all
+
+COPY --from=build --chmod=0555 /modelexpress-operator /usr/local/bin/modelexpress-operator
+
+LABEL com.redhat.component="odh-modelexpress-operator-container" \
+      description="Kubernetes operator for ModelExpress model routing" \
+      summary="Kubernetes operator for ModelExpress model routing" \
+      name="rhoai/odh-modelexpress-operator-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="8080:http" \
+      io.k8s.display-name="odh-modelexpress-operator" \
+      io.k8s.description="odh-modelexpress-operator" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/modelexpress-operator"]

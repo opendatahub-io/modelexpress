@@ -1,0 +1,17 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: "state.pvc.expect(\"managed pvc\")"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    team: llm-d
+  name: mx-full-model-cache
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: ceph-fs

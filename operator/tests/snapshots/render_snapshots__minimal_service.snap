@@ -1,0 +1,20 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: state.service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: mx-min
+    app.kubernetes.io/managed-by: modelexpress-operator
+    app.kubernetes.io/name: modelexpress-server
+  name: mx-min
+spec:
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: grpc
+  selector:
+    app.kubernetes.io/instance: mx-min
+    app.kubernetes.io/name: modelexpress-server

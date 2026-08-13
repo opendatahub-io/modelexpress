@@ -1,0 +1,582 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: "modelexpress_operator::crd::generate_crd()"
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: modelexpressservers.modelexpress.wseaton.com
+spec:
+  group: modelexpress.wseaton.com
+  names:
+    kind: ModelExpressServer
+    plural: modelexpressservers
+    shortNames:
+      - mxs
+    singular: modelexpressserver
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: ".status.endpoint"
+          name: Endpoint
+          type: string
+        - jsonPath: ".status.conditions[0].status"
+          name: Ready
+          type: string
+        - jsonPath: ".status.conditions[0].reason"
+          name: Reason
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: "Auto-generated derived type for ModelExpressServerSpec via `CustomResource`"
+          properties:
+            spec:
+              description: "Desired state of a ModelExpress metadata coordinator deployment.\n\nGroup is a placeholder until upstream blesses a name under\nmodelexpress.nvidia.com; CRs will need migration on donation.\n\nValidation lives in CEL rules on the schema (enforced at admission by the\napiserver) instead of a webhook, so the operator stays OLMv1-clean."
+              properties:
+                cache:
+                  description: "Model cache, MODEL_EXPRESS_CACHE_DIRECTORY / _CACHE_EVICTION_ENABLED."
+                  nullable: true
+                  properties:
+                    directory:
+                      description: "MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to\n/root, matching the server's HOME-relative cache resolution."
+                      nullable: true
+                      type: string
+                    evictionEnabled:
+                      description: MODEL_EXPRESS_CACHE_EVICTION_ENABLED.
+                      nullable: true
+                      type: boolean
+                    storage:
+                      description: "What backs the cache mount. Defaults to an emptyDir (models re-download\nafter a pod restart, but any replica count works)."
+                      nullable: true
+                      oneOf:
+                        - required:
+                            - emptyDir
+                        - required:
+                            - existingClaim
+                        - required:
+                            - pvc
+                      properties:
+                        emptyDir:
+                          description: "Node-local scratch, lost on pod restart."
+                          properties:
+                            sizeLimit:
+                              description: "Optional cap, e.g. \"200Gi\". Unbounded when unset."
+                              maxLength: 24
+                              nullable: true
+                              type: string
+                              x-kubernetes-validations:
+                                - message: sizeLimit must be a Kubernetes quantity
+                                  rule: "self.matches('^[0-9]+(\\\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E|m)?$')"
+                          type: object
+                        existingClaim:
+                          description: A PVC the user manages; the operator only mounts it.
+                          properties:
+                            claimName:
+                              type: string
+                              x-kubernetes-validations:
+                                - message: claimName must not be empty
+                                  rule: "self != ''"
+                          required:
+                            - claimName
+                          type: object
+                        pvc:
+                          description: "A PVC the operator creates and owns, named `<cr-name>-model-cache`.\nBoxed: the embedded claim spec dwarfs the other variants."
+                          properties:
+                            metadata:
+                              description: Labels and annotations applied to the claim.
+                              nullable: true
+                              properties:
+                                annotations:
+                                  additionalProperties:
+                                    type: string
+                                  nullable: true
+                                  type: object
+                                labels:
+                                  additionalProperties:
+                                    type: string
+                                  nullable: true
+                                  type: object
+                              type: object
+                            spec:
+                              description: "Verbatim PVC spec. accessModes defaults to ReadWriteOnce, which the\nspec-level rule rejects for replicas > 1. Quantity strings are only\nvalidated by the apiserver at claim creation; a bad size shows up as a\nstatus condition, not an admission error."
+                              properties:
+                                accessModes:
+                                  description: "accessModes contains the desired access modes the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1"
+                                  items:
+                                    maxLength: 32
+                                    type: string
+                                  maxItems: 8
+                                  type: array
+                                dataSource:
+                                  description: "dataSource field can be used to specify either: * An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot) * An existing PVC (PersistentVolumeClaim) If the provisioner or an external controller can support the specified data source, it will create a new volume based on the contents of the specified data source. When the AnyVolumeDataSource feature gate is enabled, dataSource contents will be copied to dataSourceRef, and dataSourceRef contents will be copied to dataSource when dataSourceRef.namespace is not specified. If the namespace is specified, then dataSourceRef will not be copied to dataSource."
+                                  properties:
+                                    apiGroup:
+                                      description: "APIGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required."
+                                      type: string
+                                    kind:
+                                      description: Kind is the type of resource being referenced
+                                      type: string
+                                    name:
+                                      description: Name is the name of resource being referenced
+                                      type: string
+                                  required:
+                                    - kind
+                                    - name
+                                  type: object
+                                dataSourceRef:
+                                  description: "dataSourceRef specifies the object from which to populate the volume with data, if a non-empty volume is desired. This may be any object from a non-empty API group (non core object) or a PersistentVolumeClaim object. When this field is specified, volume binding will only succeed if the type of the specified object matches some installed volume populator or dynamic provisioner. This field will replace the functionality of the dataSource field and as such if both fields are non-empty, they must have the same value. For backwards compatibility, when namespace isn't specified in dataSourceRef, both fields (dataSource and dataSourceRef) will be set to the same value automatically if one of them is empty and the other is non-empty. When namespace is specified in dataSourceRef, dataSource isn't set to the same value and must be empty. There are three important differences between dataSource and dataSourceRef: * While dataSource only allows two specific types of objects, dataSourceRef\n  allows any non-core object, as well as PersistentVolumeClaim objects.\n* While dataSource ignores disallowed values (dropping them), dataSourceRef\n  preserves all values, and generates an error if a disallowed value is\n  specified.\n* While dataSource only allows local objects, dataSourceRef allows objects\n  in any namespaces.\n(Beta) Using this field requires the AnyVolumeDataSource feature gate to be enabled. (Alpha) Using the namespace field of dataSourceRef requires the CrossNamespaceVolumeDataSource feature gate to be enabled."
+                                  properties:
+                                    apiGroup:
+                                      description: "APIGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required."
+                                      type: string
+                                    kind:
+                                      description: Kind is the type of resource being referenced
+                                      type: string
+                                    name:
+                                      description: Name is the name of resource being referenced
+                                      type: string
+                                    namespace:
+                                      description: "Namespace is the namespace of resource being referenced Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant object is required in the referent namespace to allow that namespace's owner to accept the reference. See the ReferenceGrant documentation for details. (Alpha) This field requires the CrossNamespaceVolumeDataSource feature gate to be enabled."
+                                      type: string
+                                  required:
+                                    - kind
+                                    - name
+                                  type: object
+                                resources:
+                                  description: "resources represents the minimum resources the volume should have. If RecoverVolumeExpansionFailure feature is enabled users are allowed to specify resource requirements that are lower than previous value but must still be higher than capacity recorded in the status field of the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources"
+                                  properties:
+                                    limits:
+                                      additionalProperties:
+                                        description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                                        x-kubernetes-int-or-string: true
+                                      description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
+                                      type: object
+                                    requests:
+                                      additionalProperties:
+                                        description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                                        x-kubernetes-int-or-string: true
+                                      description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
+                                      type: object
+                                  type: object
+                                selector:
+                                  description: selector is a label query over volumes to consider for binding.
+                                  properties:
+                                    matchExpressions:
+                                      description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                      items:
+                                        description: "A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values."
+                                        properties:
+                                          key:
+                                            description: key is the label key that the selector applies to.
+                                            type: string
+                                          operator:
+                                            description: "operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist."
+                                            type: string
+                                          values:
+                                            description: "values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch."
+                                            items:
+                                              type: string
+                                            type: array
+                                        required:
+                                          - key
+                                          - operator
+                                        type: object
+                                      type: array
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      description: "matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is \"key\", the operator is \"In\", and the values array contains only \"value\". The requirements are ANDed."
+                                      type: object
+                                  type: object
+                                storageClassName:
+                                  description: "storageClassName is the name of the StorageClass required by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1"
+                                  type: string
+                                volumeAttributesClassName:
+                                  description: "volumeAttributesClassName may be used to set the VolumeAttributesClass used by this claim. If specified, the CSI driver will create or update the volume with the attributes defined in the corresponding VolumeAttributesClass. This has a different purpose than storageClassName, it can be changed after the claim is created. An empty string value means that no VolumeAttributesClass will be applied to the claim but it's not allowed to reset this field to empty string once it is set. If unspecified and the PersistentVolumeClaim is unbound, the default VolumeAttributesClass will be set by the persistentvolume controller if it exists. If the resource referred to by volumeAttributesClass does not exist, this PersistentVolumeClaim will be set to a Pending state, as reflected by the modifyVolumeStatus field, until such as a resource exists. More info: https://kubernetes.io/docs/concepts/storage/volume-attributes-classes/ (Beta) Using this field requires the VolumeAttributesClass feature gate to be enabled (off by default)."
+                                  type: string
+                                volumeMode:
+                                  description: volumeMode defines what type of volume is required by the claim. Value of Filesystem is implied when not included in claim spec.
+                                  type: string
+                                volumeName:
+                                  description: volumeName is the binding reference to the PersistentVolume backing this claim.
+                                  type: string
+                              type: object
+                          required:
+                            - spec
+                          type: object
+                          x-kubernetes-validations:
+                            - message: spec.resources.requests.storage is required
+                              rule: "has(self.spec.resources) && has(self.spec.resources.requests) && 'storage' in self.spec.resources.requests"
+                      type: object
+                  type: object
+                credentials:
+                  description: "Download credentials, injected as secretKeyRef env vars."
+                  nullable: true
+                  properties:
+                    hfTokenSecret:
+                      description: "Secret holding the HuggingFace token, injected as HF_TOKEN."
+                      nullable: true
+                      properties:
+                        key:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: secret key must not be empty
+                              rule: "self != ''"
+                        name:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: secret name must not be empty
+                              rule: "self != ''"
+                      required:
+                        - key
+                        - name
+                      type: object
+                    ngcApiKeySecret:
+                      description: "Secret holding the NGC API key, injected as NGC_API_KEY."
+                      nullable: true
+                      properties:
+                        key:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: secret key must not be empty
+                              rule: "self != ''"
+                        name:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: secret name must not be empty
+                              rule: "self != ''"
+                      required:
+                        - key
+                        - name
+                      type: object
+                  type: object
+                image:
+                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it,\nso a rolling image change cold-starts P2P discovery between old and new\nworkers."
+                  type: string
+                  x-kubernetes-validations:
+                    - message: image must not be empty
+                      rule: "self != ''"
+                log:
+                  description: "Logging, MODEL_EXPRESS_LOG_LEVEL / MODEL_EXPRESS_LOG_FORMAT."
+                  nullable: true
+                  properties:
+                    format:
+                      description: Mirrors upstream LogFormat; env value is the lowercase name.
+                      enum:
+                        - json
+                        - pretty
+                        - compact
+                        - ~
+                      nullable: true
+                      type: string
+                    level:
+                      description: Mirrors upstream LogLevel; env value is the lowercase name.
+                      enum:
+                        - trace
+                        - debug
+                        - info
+                        - warn
+                        - error
+                        - ~
+                      nullable: true
+                      type: string
+                  type: object
+                metadataBackend:
+                  description: "Metadata backend. Upstream has no default (MX_METADATA_BACKEND is\nmandatory), so it is required here too."
+                  oneOf:
+                    - required:
+                        - redis
+                    - required:
+                        - kubernetes
+                  properties:
+                    kubernetes:
+                      description: "CRD-backed storage in the server's own namespace. Requires the\nModelMetadata/ModelCacheEntry CRDs and namespace RBAC. The namespace\ncomes from the downward API (POD_NAMESPACE)."
+                      type: object
+                    redis:
+                      description: External Redis via REDIS_URL.
+                      properties:
+                        url:
+                          description: "Full connection URL, e.g. redis://host:6379."
+                          type: string
+                          x-kubernetes-validations:
+                            - message: "url must be a redis:// or rediss:// URL"
+                              rule: "self.startsWith('redis://') || self.startsWith('rediss://')"
+                      required:
+                        - url
+                      type: object
+                  type: object
+                networkPolicy:
+                  description: "Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane\nonly; worker-to-worker RDMA never crosses the CNI."
+                  nullable: true
+                  properties:
+                    allowFrom:
+                      description: "Who may connect. Deliberately required and non-empty: an empty `from`\nin a NetworkPolicy rule means allow-everywhere, which is what *not*\nsetting networkPolicy already gives you."
+                      items:
+                        description: NetworkPolicyPeer describes a peer to allow traffic to/from. Only certain combinations of fields are allowed
+                        properties:
+                          ipBlock:
+                            description: ipBlock defines policy on a particular IPBlock. If this field is set then neither of the other fields can be.
+                            properties:
+                              cidr:
+                                description: "cidr is a string representing the IPBlock Valid examples are \"192.168.1.0/24\" or \"2001:db8::/64\""
+                                type: string
+                              except:
+                                description: "except is a slice of CIDRs that should not be included within an IPBlock Valid examples are \"192.168.1.0/24\" or \"2001:db8::/64\" Except values will be rejected if they are outside the cidr range"
+                                items:
+                                  type: string
+                                type: array
+                            required:
+                              - cidr
+                            type: object
+                          namespaceSelector:
+                            description: "namespaceSelector selects namespaces using cluster-scoped labels. This field follows standard label selector semantics; if present but empty, it selects all namespaces.\n\nIf podSelector is also set, then the NetworkPolicyPeer as a whole selects the pods matching podSelector in the namespaces selected by namespaceSelector. Otherwise it selects all pods in the namespaces selected by namespaceSelector."
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: "A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values."
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: "operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist."
+                                      type: string
+                                    values:
+                                      description: "values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch."
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                    - key
+                                    - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: "matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is \"key\", the operator is \"In\", and the values array contains only \"value\". The requirements are ANDed."
+                                type: object
+                            type: object
+                          podSelector:
+                            description: "podSelector is a label selector which selects pods. This field follows standard label selector semantics; if present but empty, it selects all pods.\n\nIf namespaceSelector is also set, then the NetworkPolicyPeer as a whole selects the pods matching podSelector in the Namespaces selected by NamespaceSelector. Otherwise it selects the pods matching podSelector in the policy's own namespace."
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: "A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values."
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: "operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist."
+                                      type: string
+                                    values:
+                                      description: "values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch."
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                    - key
+                                    - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: "matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is \"key\", the operator is \"In\", and the values array contains only \"value\". The requirements are ANDed."
+                                type: object
+                            type: object
+                        type: object
+                      maxItems: 32
+                      minItems: 1
+                      type: array
+                  required:
+                    - allowFrom
+                  type: object
+                podMetadata:
+                  description: "Extra labels/annotations for the server pods. The escape hatch for\nmesh sidecar injection, ambient enrollment, scrape annotations, etc.\nOperator-owned selector labels win on conflict."
+                  nullable: true
+                  properties:
+                    annotations:
+                      additionalProperties:
+                        type: string
+                      nullable: true
+                      type: object
+                    labels:
+                      additionalProperties:
+                        type: string
+                      nullable: true
+                      type: object
+                  type: object
+                port:
+                  default: 8001
+                  description: "gRPC port, MODEL_EXPRESS_SERVER_PORT."
+                  format: int32
+                  type: integer
+                  x-kubernetes-validations:
+                    - message: port must be 1-65535
+                      rule: self > 0 && self < 65536
+                reaper:
+                  description: "Stale-worker reaper timings, MX_REAPER_* / MX_HEARTBEAT_* / MX_GC_*."
+                  nullable: true
+                  properties:
+                    gcTimeoutSecs:
+                      description: MX_GC_TIMEOUT_SECS (upstream default 3600).
+                      format: uint32
+                      minimum: 0
+                      nullable: true
+                      type: integer
+                      x-kubernetes-validations:
+                        - message: gcTimeoutSecs must be positive
+                          rule: self > 0
+                    heartbeatTimeoutSecs:
+                      description: MX_HEARTBEAT_TIMEOUT_SECS (upstream default 90).
+                      format: uint32
+                      minimum: 0
+                      nullable: true
+                      type: integer
+                      x-kubernetes-validations:
+                        - message: heartbeatTimeoutSecs must be positive
+                          rule: self > 0
+                    scanIntervalSecs:
+                      description: MX_REAPER_SCAN_INTERVAL_SECS (upstream default 30).
+                      format: uint32
+                      minimum: 0
+                      nullable: true
+                      type: integer
+                      x-kubernetes-validations:
+                        - message: scanIntervalSecs must be positive
+                          rule: self > 0
+                  type: object
+                  x-kubernetes-validations:
+                    - message: heartbeatTimeoutSecs must be greater than scanIntervalSecs
+                      rule: "!has(self.scanIntervalSecs) || !has(self.heartbeatTimeoutSecs) || self.heartbeatTimeoutSecs > self.scanIntervalSecs"
+                    - message: gcTimeoutSecs must be at least heartbeatTimeoutSecs
+                      rule: "!has(self.heartbeatTimeoutSecs) || !has(self.gcTimeoutSecs) || self.gcTimeoutSecs >= self.heartbeatTimeoutSecs"
+                replicas:
+                  default: 1
+                  description: "Replicas are stateless and share no locks; safe to scale as long as the\ncache volume is RWX or per-replica."
+                  format: int32
+                  type: integer
+                  x-kubernetes-validations:
+                    - message: replicas must not be negative
+                      rule: self >= 0
+                security:
+                  description: "ServiceAccount token auth, MODEL_EXPRESS_SECURITY_*."
+                  nullable: true
+                  properties:
+                    allowedServiceAccounts:
+                      description: "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS (rendered `ns:sa,...`)."
+                      items:
+                        description: "An allowed caller, rendered as `<namespace>:<serviceAccount>`.\nmaxLength bounds keep the regex rules inside the apiserver's CEL cost\nbudget; unbounded strings get costed at worst case and rejected."
+                        properties:
+                          namespace:
+                            maxLength: 63
+                            type: string
+                            x-kubernetes-validations:
+                              - message: namespace must be a DNS-1123 label
+                                rule: "self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')"
+                          serviceAccount:
+                            maxLength: 253
+                            type: string
+                            x-kubernetes-validations:
+                              - message: serviceAccount must be a DNS-1123 subdomain
+                                rule: "self.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')"
+                        required:
+                          - namespace
+                          - serviceAccount
+                        type: object
+                      maxItems: 256
+                      type: array
+                    cacheTtlSecs:
+                      description: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS (upstream default 60).
+                      format: uint32
+                      minimum: 0
+                      nullable: true
+                      type: integer
+                    mode:
+                      default: disabled
+                      description: MODEL_EXPRESS_SECURITY_MODE.
+                      enum:
+                        - disabled
+                        - enforce
+                      type: string
+                    tokenAudiences:
+                      description: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES (rendered comma-separated).
+                      items:
+                        type: string
+                      maxItems: 32
+                      type: array
+                  type: object
+                  x-kubernetes-validations:
+                    - message: enforce mode requires tokenAudiences and allowedServiceAccounts
+                      rule: "!(has(self.mode) && self.mode == 'enforce') || (has(self.tokenAudiences) && size(self.tokenAudiences) > 0 && has(self.allowedServiceAccounts) && size(self.allowedServiceAccounts) > 0)"
+                serviceAccountName:
+                  description: "Run the server as an existing ServiceAccount instead of the generated\n`<cr-name>-server`. Binding the metadata Role to it becomes your job."
+                  maxLength: 253
+                  nullable: true
+                  type: string
+              required:
+                - image
+                - metadataBackend
+              type: object
+              x-kubernetes-validations:
+                - message: replicas > 1 with a ReadWriteOnce cache PVC deadlocks scheduling; use ReadWriteMany or emptyDir
+                  rule: "self.replicas <= 1 || !has(self.cache) || !has(self.cache.storage) || !has(self.cache.storage.pvc) || (has(self.cache.storage.pvc.spec.accessModes) && self.cache.storage.pvc.spec.accessModes.exists(m, m == 'ReadWriteMany' || m == 'ReadOnlyMany'))"
+            status:
+              nullable: true
+              properties:
+                conditions:
+                  description: Standard conditions; Ready is the rollup.
+                  items:
+                    description: Condition contains details for one aspect of the current state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: "lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable."
+                        format: date-time
+                        type: string
+                      message:
+                        description: message is a human readable message indicating details about the transition. This may be an empty string.
+                        type: string
+                      observedGeneration:
+                        description: "observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance."
+                        format: int64
+                        type: integer
+                      reason:
+                        description: "reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty."
+                        type: string
+                      status:
+                        description: "status of the condition, one of True, False, Unknown."
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                endpoint:
+                  description: gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to.
+                  nullable: true
+                  type: string
+                observedGeneration:
+                  description: Generation last acted on by the controller.
+                  format: int64
+                  nullable: true
+                  type: integer
+              type: object
+          required:
+            - spec
+          title: ModelExpressServer
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

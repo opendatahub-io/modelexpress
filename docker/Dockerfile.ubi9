@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress coordinator (server) image for RHEL/UBI9.
+#
+# Multi-stage build that compiles the server from source on UBI9.
+# Replaces the upstream Dockerfile's Ubuntu base with UBI9 for
+# Red Hat / Konflux builds.
+
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:1c2ddbf86e65ddca0703f1a2f61e8b4d4ddda26799ee64f8200b551e835501ce AS build
+
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
+        rust cargo cmake gcc gcc-c++ perl \
+        protobuf-compiler openssl-devel git-core \
+    && dnf clean all
+
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=cargo-registry-ubi9-server,target=/root/.cargo/registry \
+    --mount=type=cache,id=target-ubi9-server,target=/src/target \
+    cargo build --release --bin modelexpress-server \
+    && cp target/release/modelexpress-server /modelexpress-server
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:d7fc7bb3438b89a103508d78b6fdc371c0b67788999c8be4c40bf22ba110af61
+
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all
+
+COPY --from=build --chmod=0555 /modelexpress-server /usr/local/bin/modelexpress-server
+
+COPY NOTICES /app/NOTICES
+
+LABEL com.redhat.component="odh-modelexpress-server-container" \
+      description="ModelExpress coordinator server for model routing and P2P metadata" \
+      summary="ModelExpress coordinator server for model routing and P2P metadata" \
+      name="rhoai/odh-modelexpress-server-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="8001:grpc" \
+      io.k8s.display-name="odh-modelexpress-server" \
+      io.k8s.description="odh-modelexpress-server" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+USER 1000:1000
+EXPOSE 8001
+
+ENV MODEL_EXPRESS_SERVER_PORT=8001
+ENV MODEL_EXPRESS_LOG_LEVEL=info
+
+ENTRYPOINT ["/usr/local/bin/modelexpress-server"]

@@ -1,0 +1,28 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: "state.network_policy.expect(\"network policy\")"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: mx-full
+    app.kubernetes.io/managed-by: modelexpress-operator
+    app.kubernetes.io/name: modelexpress-server
+    istio.io/dataplane-mode: ambient
+  name: mx-full
+spec:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: llm-d
+      ports:
+        - port: 8001
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: mx-full
+      app.kubernetes.io/name: modelexpress-server
+  policyTypes:
+    - Ingress

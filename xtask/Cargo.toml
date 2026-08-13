@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+modelexpress-operator = { path = "../operator" }
+kube = { workspace = true }
+modelexpress-types = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true
