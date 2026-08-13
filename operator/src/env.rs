@@ -79,10 +79,14 @@ pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
         }
     }
 
+    // Unconditional: the volume is mounted at this path, and leaving the var
+    // unset makes the server fall back to HOME and write outside the mount.
+    env.push(literal(
+        MODEL_EXPRESS_CACHE_DIRECTORY,
+        crate::volume::mount_path(spec),
+    ));
+
     if let Some(cache) = &spec.cache {
-        if let Some(dir) = &cache.directory {
-            env.push(literal(MODEL_EXPRESS_CACHE_DIRECTORY, dir));
-        }
         if let Some(eviction) = cache.eviction_enabled {
             env.push(literal(
                 MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
@@ -210,13 +214,36 @@ mod tests {
         assert_eq!(value_of(&env, MODEL_EXPRESS_SERVER_PORT), Some("8001"));
         for name in [
             MODEL_EXPRESS_LOG_LEVEL,
-            MODEL_EXPRESS_CACHE_DIRECTORY,
             MODEL_EXPRESS_SECURITY_MODE,
             MX_REAPER_SCAN_INTERVAL_SECS,
             HF_TOKEN,
         ] {
             assert!(!env.iter().any(|e| e.name == name), "{name} unexpected");
         }
+    }
+
+    #[test]
+    fn cache_directory_always_matches_the_mount_path() {
+        let spec = base_spec(MetadataBackend::Kubernetes {});
+        assert_eq!(
+            value_of(&render_env(&spec), MODEL_EXPRESS_CACHE_DIRECTORY),
+            Some(crate::volume::DEFAULT_MOUNT_PATH),
+            "unset means the server falls back to HOME and misses the volume"
+        );
+
+        let mut spec = base_spec(MetadataBackend::Kubernetes {});
+        spec.cache = Some(crate::crd::CacheConfig {
+            directory: Some("/cache".into()),
+            ..crate::crd::CacheConfig::default()
+        });
+        assert_eq!(
+            value_of(&render_env(&spec), MODEL_EXPRESS_CACHE_DIRECTORY),
+            Some("/cache")
+        );
+        assert_eq!(
+            crate::volume::render_cache_volume("mx", &spec).mount.mount_path,
+            "/cache"
+        );
     }
 
     #[test]

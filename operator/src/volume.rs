@@ -12,9 +12,13 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 
 pub const VOLUME_NAME: &str = "model-cache";
-/// Matches the Helm chart: the server resolves its cache under HOME (/root)
-/// when MODEL_EXPRESS_CACHE_DIRECTORY is unset.
-pub const DEFAULT_MOUNT_PATH: &str = "/root";
+/// The chart leaned on the server resolving its cache under HOME (/root),
+/// which only works as root. The images run as UID 1000 and OpenShift's
+/// restricted SCC assigns an arbitrary UID with no passwd entry at all, so
+/// HOME is unwritable (and not even /root) in both cases. Mount somewhere
+/// the volume makes writable instead, and always pass the path explicitly
+/// via MODEL_EXPRESS_CACHE_DIRECTORY rather than inferring it from HOME.
+pub const DEFAULT_MOUNT_PATH: &str = "/var/cache/modelexpress";
 pub const PVC_NAME_SUFFIX: &str = "model-cache";
 
 /// Everything the Deployment (and reconciler) needs for the cache mount. The
@@ -30,16 +34,21 @@ pub fn managed_pvc_name(cr_name: &str) -> String {
     format!("{cr_name}-{PVC_NAME_SUFFIX}")
 }
 
+/// Where the cache volume lands in the container. Also what the server is
+/// told via MODEL_EXPRESS_CACHE_DIRECTORY, so the two cannot drift.
+pub fn mount_path(spec: &ModelExpressServerSpec) -> &str {
+    spec.cache
+        .as_ref()
+        .and_then(|c| c.directory.as_deref())
+        .unwrap_or(DEFAULT_MOUNT_PATH)
+}
+
 pub fn render_cache_volume(cr_name: &str, spec: &ModelExpressServerSpec) -> CacheVolume {
     let cache = spec.cache.as_ref();
 
-    let mount_path = cache
-        .and_then(|c| c.directory.as_deref())
-        .unwrap_or(DEFAULT_MOUNT_PATH)
-        .to_string();
     let mount = VolumeMount {
         name: VOLUME_NAME.to_string(),
-        mount_path,
+        mount_path: mount_path(spec).to_string(),
         ..VolumeMount::default()
     };
 
@@ -144,9 +153,13 @@ mod tests {
     }
 
     #[test]
-    fn default_is_empty_dir_at_root() {
+    fn default_is_empty_dir_at_the_default_path() {
         let cv = render_cache_volume("mx", &spec_with_cache(None));
-        assert_eq!(cv.mount.mount_path, "/root");
+        assert_eq!(cv.mount.mount_path, DEFAULT_MOUNT_PATH);
+        assert_ne!(
+            cv.mount.mount_path, "/root",
+            "a non-root UID cannot write HOME"
+        );
         assert_eq!(cv.mount.name, VOLUME_NAME);
         assert!(cv.volume.empty_dir.is_some());
         assert!(cv.pvc.is_none());

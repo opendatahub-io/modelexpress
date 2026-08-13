@@ -193,7 +193,8 @@ impl LogFormat {
 #[serde(rename_all = "camelCase")]
 pub struct CacheConfig {
     /// MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to
-    /// /root, matching the server's HOME-relative cache resolution.
+    /// /var/cache/modelexpress; the operator always sets the env var so the
+    /// server never falls back to a HOME it cannot write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
     /// MODEL_EXPRESS_CACHE_EVICTION_ENABLED.

@@ -44,7 +44,7 @@ spec:
                 nullable: true
                 properties:
                   directory:
-                    description: MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to /root, matching the server's HOME-relative cache resolution.
+                    description: MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to /var/cache/modelexpress; the operator always sets the env var so the server never falls back to a HOME it cannot write.
                     nullable: true
                     type: string
                   evictionEnabled:
