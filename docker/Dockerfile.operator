@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -17,9 +16,7 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
 
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,id=cargo-registry-ubi9,target=/root/.cargo/registry \
-    --mount=type=cache,id=target-ubi9,target=/src/target \
-    cargo build --release --package modelexpress-operator \
+RUN cargo build --release --package modelexpress-operator \
         --no-default-features --features openssl \
     && cp target/release/modelexpress-operator /modelexpress-operator
 
