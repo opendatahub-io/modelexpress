@@ -86,13 +86,11 @@ pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
         crate::volume::mount_path(spec),
     ));
 
-    if let Some(cache) = &spec.cache {
-        if let Some(eviction) = cache.eviction_enabled {
-            env.push(literal(
-                MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
-                eviction.to_string(),
-            ));
-        }
+    if let Some(eviction) = spec.cache.as_ref().and_then(|c| c.eviction_enabled) {
+        env.push(literal(
+            MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
+            eviction.to_string(),
+        ));
     }
 
     if let Some(security) = &spec.security {
@@ -241,7 +239,9 @@ mod tests {
             Some("/cache")
         );
         assert_eq!(
-            crate::volume::render_cache_volume("mx", &spec).mount.mount_path,
+            crate::volume::render_cache_volume("mx", &spec)
+                .mount
+                .mount_path,
             "/cache"
         );
     }

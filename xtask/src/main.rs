@@ -121,9 +121,7 @@ fn write_or_check(files: Vec<(PathBuf, String)>, check: bool, cmd: &'static str)
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Crdgen { check } => write_or_check(all_crds()?, check, "crdgen"),
-        Cmd::Manifests { check, image } => {
-            write_or_check(manifests(&image)?, check, "manifests")
-        }
+        Cmd::Manifests { check, image } => write_or_check(manifests(&image)?, check, "manifests"),
     }
 }
 

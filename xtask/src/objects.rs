@@ -7,7 +7,7 @@
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, HTTPGetAction, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SecurityContext, SeccompProfile, ServiceAccount,
+    PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
 };
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;

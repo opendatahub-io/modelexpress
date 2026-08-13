@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use kube::{CustomResource, CELSchema};
+use kube::{CELSchema, CustomResource};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
