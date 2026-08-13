@@ -282,21 +282,38 @@ fn reason(err: &Error) -> &'static str {
     }
 }
 
+pub const READY_CONDITION: &str = "Ready";
+
+/// Per the API conventions lastTransitionTime records when the condition last
+/// changed state, so it has to be carried forward while status/reason/message
+/// hold. Restamping it every pass would make each applied status differ from
+/// the stored one, and since the controller watches ModelExpressServer, every
+/// status write would schedule the next reconcile: an unbounded loop that the
+/// requeue interval never gates.
 fn ready_condition(
     cr: &ModelExpressServer,
     status: &str,
     reason: &str,
     message: &str,
 ) -> Condition {
+    let previous = cr
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == READY_CONDITION));
+    let last_transition_time = match previous {
+        Some(prev) if prev.status == status && prev.reason == reason && prev.message == message => {
+            prev.last_transition_time.clone()
+        }
+        _ => k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+    };
+
     Condition {
-        type_: "Ready".to_string(),
+        type_: READY_CONDITION.to_string(),
         status: status.to_string(),
         reason: reason.to_string(),
         message: message.to_string(),
         observed_generation: cr.metadata.generation,
-        last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-            chrono::Utc::now(),
-        ),
+        last_transition_time,
     }
 }
 
@@ -336,5 +353,114 @@ fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Ac
             Action::requeue(Duration::from_secs(120))
         }
         _ => Action::requeue(Duration::from_secs(15)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::crd::{MetadataBackend, ModelExpressServerSpec, RedisBackend};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    fn server(status: Option<ModelExpressServerStatus>) -> ModelExpressServer {
+        let mut cr = ModelExpressServer::new(
+            "mx",
+            ModelExpressServerSpec {
+                image: "img".into(),
+                replicas: 1,
+                metadata_backend: MetadataBackend::Redis(RedisBackend {
+                    url: "redis://mx-redis:6379".into(),
+                }),
+                port: 8001,
+                log: None,
+                cache: None,
+                security: None,
+                reaper: None,
+                credentials: None,
+                pod_metadata: None,
+                network_policy: None,
+                service_account_name: None,
+            },
+        );
+        cr.metadata.generation = Some(1);
+        cr.status = status;
+        cr
+    }
+
+    fn stamped(at: chrono::DateTime<chrono::Utc>, status: &str, reason: &str) -> Condition {
+        Condition {
+            type_: READY_CONDITION.to_string(),
+            status: status.to_string(),
+            reason: reason.to_string(),
+            message: "resources applied".to_string(),
+            observed_generation: Some(1),
+            last_transition_time: Time(at),
+        }
+    }
+
+    fn with_ready(condition: Condition) -> Option<ModelExpressServerStatus> {
+        Some(ModelExpressServerStatus {
+            observed_generation: Some(1),
+            conditions: vec![condition],
+            endpoint: None,
+        })
+    }
+
+    #[test]
+    fn unchanged_condition_keeps_its_transition_time() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let cr = server(with_ready(stamped(earlier, "True", "Applied")));
+        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        assert_eq!(
+            next.last_transition_time,
+            Time(earlier),
+            "restamping an unchanged condition re-triggers our own watch"
+        );
+    }
+
+    #[test]
+    fn flipping_status_restamps_transition_time() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let cr = server(with_ready(stamped(earlier, "True", "Applied")));
+        let next = ready_condition(&cr, "False", "ApplyFailed", "kube api: boom");
+        assert!(next.last_transition_time.0 > earlier);
+    }
+
+    #[test]
+    fn same_status_but_new_reason_restamps() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let cr = server(with_ready(stamped(earlier, "False", "CacheClaimMissing")));
+        let next = ready_condition(&cr, "False", "ApplyFailed", "resources applied");
+        assert!(next.last_transition_time.0 > earlier);
+    }
+
+    #[test]
+    fn same_status_and_reason_but_new_message_restamps() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let cr = server(with_ready(stamped(earlier, "False", "ApplyFailed")));
+        let next = ready_condition(&cr, "False", "ApplyFailed", "kube api: different");
+        assert!(next.last_transition_time.0 > earlier);
+    }
+
+    #[test]
+    fn first_reconcile_stamps_a_fresh_time() {
+        let before = chrono::Utc::now();
+        let cr = server(None);
+        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        assert!(next.last_transition_time.0 >= before);
+        assert_eq!(next.type_, READY_CONDITION);
+        assert_eq!(next.observed_generation, Some(1));
+    }
+
+    #[test]
+    fn a_foreign_condition_type_does_not_supply_the_timestamp() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut other = stamped(earlier, "True", "Applied");
+        other.type_ = "Degraded".to_string();
+        let before = chrono::Utc::now();
+        let cr = server(with_ready(other));
+        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        assert!(next.last_transition_time.0 >= before);
     }
 }
