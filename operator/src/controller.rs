@@ -366,9 +366,11 @@ async fn write_status(
         endpoint,
     };
     let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
+    // An apply patch must carry apiVersion/kind. Taking them from the Resource
+    // impl means the group is spelled once, in the CRD derive.
     let patch = serde_json::json!({
-        "apiVersion": "modelexpress.wseaton.com/v1alpha1",
-        "kind": "ModelExpressServer",
+        "apiVersion": ModelExpressServer::api_version(&()),
+        "kind": ModelExpressServer::kind(&()),
         "status": status,
     });
     api.patch_status(
