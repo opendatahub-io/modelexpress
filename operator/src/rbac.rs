@@ -9,6 +9,7 @@
 //! ci/k8s/server/rbac-modelmetadata.yaml.
 
 use crate::crd::{MetadataBackend, ModelExpressServerSpec};
+use crate::labels::managed_labels;
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use kube::api::ObjectMeta;
@@ -91,6 +92,7 @@ pub fn render_rbac(cr_name: &str, spec: &ModelExpressServerSpec) -> ServerRbac {
     let service_account = Some(ServiceAccount {
         metadata: ObjectMeta {
             name: Some(sa_name.clone()),
+            labels: Some(managed_labels(cr_name)),
             ..ObjectMeta::default()
         },
         ..ServiceAccount::default()
@@ -109,6 +111,7 @@ pub fn render_rbac(cr_name: &str, spec: &ModelExpressServerSpec) -> ServerRbac {
     let role = Role {
         metadata: ObjectMeta {
             name: Some(role_name(cr_name)),
+            labels: Some(managed_labels(cr_name)),
             ..ObjectMeta::default()
         },
         rules: Some(server_policy_rules()),
@@ -116,6 +119,7 @@ pub fn render_rbac(cr_name: &str, spec: &ModelExpressServerSpec) -> ServerRbac {
     let role_binding = RoleBinding {
         metadata: ObjectMeta {
             name: Some(role_name(cr_name)),
+            labels: Some(managed_labels(cr_name)),
             ..ObjectMeta::default()
         },
         role_ref: RoleRef {

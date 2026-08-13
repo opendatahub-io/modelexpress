@@ -4,6 +4,7 @@
 //! Renders the model-cache volume for the server pod.
 
 use crate::crd::{CacheStorage, ModelExpressServerSpec};
+use crate::labels::managed_labels;
 use k8s_openapi::api::core::v1::{
     EmptyDirVolumeSource, PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Volume,
     VolumeMount,
@@ -70,10 +71,14 @@ pub fn render_cache_volume(cr_name: &str, spec: &ModelExpressServerSpec) -> Cach
                 claim_spec.access_modes = Some(vec!["ReadWriteOnce".to_string()]);
             }
             let claim_meta = managed.metadata.clone().unwrap_or_default();
+            // user labels first: the operator's own must win, or the claim
+            // drops out of the controller's watch
+            let mut labels = claim_meta.labels.unwrap_or_default();
+            labels.extend(managed_labels(cr_name));
             let pvc = PersistentVolumeClaim {
                 metadata: ObjectMeta {
                     name: Some(claim_name.clone()),
-                    labels: claim_meta.labels,
+                    labels: Some(labels),
                     annotations: claim_meta.annotations,
                     ..ObjectMeta::default()
                 },

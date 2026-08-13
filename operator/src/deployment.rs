@@ -5,6 +5,7 @@
 
 use crate::crd::ModelExpressServerSpec;
 use crate::env::render_env;
+use crate::labels::{managed_labels, selector_labels};
 use crate::volume::{CacheVolume, render_cache_volume};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
@@ -148,23 +149,6 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
     }
 }
 
-/// Immutable subset used for the Deployment selector; changing these on an
-/// existing CR would orphan its pods.
-fn selector_labels(cr_name: &str) -> BTreeMap<String, String> {
-    [
-        (
-            "app.kubernetes.io/name".to_string(),
-            "modelexpress-server".to_string(),
-        ),
-        (
-            "app.kubernetes.io/instance".to_string(),
-            cr_name.to_string(),
-        ),
-    ]
-    .into_iter()
-    .collect()
-}
-
 /// User podMetadata labels first, operator labels on top: the selector subset
 /// must never be overridable or the Deployment orphans its pods.
 fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, String> {
@@ -173,11 +157,7 @@ fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, 
         .as_ref()
         .and_then(|meta| meta.labels.clone())
         .unwrap_or_default();
-    labels.extend(selector_labels(cr_name));
-    labels.insert(
-        "app.kubernetes.io/managed-by".to_string(),
-        "modelexpress-operator".to_string(),
-    );
+    labels.extend(managed_labels(cr_name));
     labels
 }
 
@@ -476,6 +456,87 @@ mod tests {
             ..CacheConfig::default()
         });
         assert_eq!(strategy(&spec), Some("Recreate".to_string()));
+    }
+
+    /// The controller's owned watches filter on this label, so anything
+    /// rendered without it silently stops producing reconcile events.
+    #[test]
+    fn every_rendered_object_carries_the_managed_by_label() {
+        use crate::labels::{MANAGED_BY, MANAGED_BY_LABEL};
+        use k8s_openapi::api::networking::v1::NetworkPolicyPeer;
+
+        let mut spec = base_spec();
+        spec.replicas = 1;
+        spec.metadata_backend = MetadataBackend::Kubernetes {};
+        spec.cache = Some(CacheConfig {
+            storage: Some(CacheStorage::Pvc(Box::new(ManagedPvcStorage {
+                metadata: None,
+                spec: PersistentVolumeClaimSpec::default(),
+            }))),
+            ..CacheConfig::default()
+        });
+        spec.network_policy = Some(crate::crd::NetworkPolicyConfig {
+            allow_from: vec![NetworkPolicyPeer::default()],
+        });
+
+        let state = render("mx", &spec);
+        let rbac = crate::rbac::render_rbac("mx", &spec);
+
+        let mut checked = 0;
+        for (what, labels) in [
+            ("deployment", &state.deployment.metadata.labels),
+            ("service", &state.service.metadata.labels),
+            ("pvc", &state.pvc.as_ref().expect("pvc").metadata.labels),
+            (
+                "networkpolicy",
+                &state
+                    .network_policy
+                    .as_ref()
+                    .expect("netpol")
+                    .metadata
+                    .labels,
+            ),
+            (
+                "serviceaccount",
+                &rbac.service_account.as_ref().expect("sa").metadata.labels,
+            ),
+            ("role", &rbac.role.as_ref().expect("role").metadata.labels),
+            (
+                "rolebinding",
+                &rbac.role_binding.as_ref().expect("binding").metadata.labels,
+            ),
+        ] {
+            assert_eq!(
+                labels
+                    .as_ref()
+                    .and_then(|l| l.get(MANAGED_BY_LABEL))
+                    .map(String::as_str),
+                Some(MANAGED_BY),
+                "{what} would never reach the controller's watch"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 7,
+            "a resource kind was added without a label check"
+        );
+
+        // the pod template too, so the Deployment's own selector still matches
+        let pod_meta = state
+            .deployment
+            .spec
+            .expect("spec")
+            .template
+            .metadata
+            .expect("pod meta");
+        assert_eq!(
+            pod_meta
+                .labels
+                .expect("labels")
+                .get(MANAGED_BY_LABEL)
+                .map(String::as_str),
+            Some(MANAGED_BY)
+        );
     }
 
     #[test]
