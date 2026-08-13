@@ -8,8 +8,9 @@ use crate::env::render_env;
 use crate::volume::{CacheVolume, render_cache_volume};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, GRPCAction, PersistentVolumeClaim, PodSpec, PodTemplateSpec, Probe,
-    Service, ServicePort, ServiceSpec,
+    Capabilities, Container, ContainerPort, GRPCAction, PersistentVolumeClaim, PodSecurityContext,
+    PodSpec, PodTemplateSpec, Probe, SeccompProfile, SecurityContext, Service, ServicePort,
+    ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
@@ -59,6 +60,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
         volume_mounts: Some(vec![mount]),
         readiness_probe: Some(readiness),
         liveness_probe: Some(liveness),
+        security_context: Some(container_security_context()),
         ..Container::default()
     };
 
@@ -82,6 +84,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
+                    security_context: Some(pod_security_context()),
                     volumes: Some(vec![volume]),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
                     ..PodSpec::default()
@@ -174,6 +177,40 @@ fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, 
         "modelexpress-operator".to_string(),
     );
     labels
+}
+
+/// Without these a namespace labelled with the restricted Pod Security
+/// Standard rejects the pod outright, and the CRD exposes no override for a
+/// user to work around it.
+///
+/// runAsUser and fsGroup are deliberately absent: OpenShift's restricted-v2
+/// SCC assigns both from the namespace range, and pinning them here would
+/// conflict with that while buying nothing on vanilla Kubernetes, where the
+/// image's own USER applies.
+fn pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            localhost_profile: None,
+        }),
+        ..PodSecurityContext::default()
+    }
+}
+
+/// readOnlyRootFilesystem is deliberately not set: unlike the controller, the
+/// server unpacks downloads and the provider SDKs write scratch state outside
+/// the cache mount.
+fn container_security_context() -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        run_as_non_root: Some(true),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: None,
+        }),
+        ..SecurityContext::default()
+    }
 }
 
 fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {

@@ -50,9 +50,19 @@ spec:
               port: 8001
             initialDelaySeconds: 5
             periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
           volumeMounts:
             - mountPath: /var/cache/modelexpress
               name: model-cache
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: mx-min-server
       volumes:
         - emptyDir: {}
