@@ -14,6 +14,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
+use modelexpress_operator::crd::API_GROUP;
 use modelexpress_operator::telemetry;
 use std::collections::BTreeMap;
 
@@ -50,13 +51,13 @@ fn crud() -> Vec<String> {
 pub fn cluster_role_rules() -> Vec<PolicyRule> {
     let mut rules = vec![
         PolicyRule {
-            api_groups: Some(vec!["modelexpress.wseaton.com".to_string()]),
+            api_groups: Some(vec![API_GROUP.to_string()]),
             resources: Some(vec!["modelexpressservers".to_string()]),
             verbs: ["get", "list", "watch", "patch"].map(String::from).to_vec(),
             ..PolicyRule::default()
         },
         PolicyRule {
-            api_groups: Some(vec!["modelexpress.wseaton.com".to_string()]),
+            api_groups: Some(vec![API_GROUP.to_string()]),
             resources: Some(vec![
                 "modelexpressservers/status".to_string(),
                 "modelexpressservers/finalizers".to_string(),

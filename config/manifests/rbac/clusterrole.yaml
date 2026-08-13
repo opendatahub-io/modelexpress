@@ -10,7 +10,7 @@ metadata:
   name: modelexpress-operator
 rules:
 - apiGroups:
-  - modelexpress.wseaton.com
+  - modelexpress.opendatahub.io
   resources:
   - modelexpressservers
   verbs:
@@ -19,7 +19,7 @@ rules:
   - watch
   - patch
 - apiGroups:
-  - modelexpress.wseaton.com
+  - modelexpress.opendatahub.io
   resources:
   - modelexpressservers/status
   - modelexpressservers/finalizers

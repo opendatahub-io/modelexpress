@@ -5,16 +5,21 @@ use kube::{CELSchema, CustomResource};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Desired state of a ModelExpress metadata coordinator deployment.
+/// The group this operator owns. The backend CRs the server reads and writes
+/// stay under modelexpress.nvidia.com (see rbac::UPSTREAM_API_GROUP); only
+/// ModelExpressServer, which is a midstream addition, lives here.
 ///
-/// Group is a placeholder until upstream blesses a name under
-/// modelexpress.nvidia.com; CRs will need migration on donation.
+/// The kube derive needs a literal, so `group_matches_the_derive` guards the
+/// two against drifting.
+pub const API_GROUP: &str = "modelexpress.opendatahub.io";
+
+/// Desired state of a ModelExpress metadata coordinator deployment.
 ///
 /// Validation lives in CEL rules on the schema (enforced at admission by the
 /// apiserver) instead of a webhook, so the operator stays OLMv1-clean.
 #[derive(CustomResource, CELSchema, Clone, Debug, Deserialize, Serialize)]
 #[kube(
-    group = "modelexpress.wseaton.com",
+    group = "modelexpress.opendatahub.io",
     version = "v1alpha1",
     kind = "ModelExpressServer",
     namespaced,
@@ -510,5 +515,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(required.contains(&"image"));
         assert!(required.contains(&"metadataBackend"));
+    }
+
+    #[test]
+    fn group_matches_the_derive() {
+        let crd = generate_crd();
+        assert_eq!(crd.spec.group, API_GROUP);
+        assert_eq!(
+            crd.metadata.name.as_deref(),
+            Some(format!("modelexpressservers.{API_GROUP}").as_str())
+        );
+        assert!(
+            <ModelExpressServer as kube::Resource>::api_version(&()).starts_with(API_GROUP),
+            "the status apply patch would target the wrong group"
+        );
     }
 }

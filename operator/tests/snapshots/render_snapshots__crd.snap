@@ -5,9 +5,9 @@ expression: "modelexpress_operator::crd::generate_crd()"
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: modelexpressservers.modelexpress.wseaton.com
+  name: modelexpressservers.modelexpress.opendatahub.io
 spec:
-  group: modelexpress.wseaton.com
+  group: modelexpress.opendatahub.io
   names:
     categories: []
     kind: ModelExpressServer
@@ -33,7 +33,7 @@ spec:
           description: "Auto-generated derived type for ModelExpressServerSpec via `CustomResource`"
           properties:
             spec:
-              description: "Desired state of a ModelExpress metadata coordinator deployment.\n\nGroup is a placeholder until upstream blesses a name under modelexpress.nvidia.com; CRs will need migration on donation.\n\nValidation lives in CEL rules on the schema (enforced at admission by the apiserver) instead of a webhook, so the operator stays OLMv1-clean."
+              description: "Desired state of a ModelExpress metadata coordinator deployment.\n\nValidation lives in CEL rules on the schema (enforced at admission by the apiserver) instead of a webhook, so the operator stays OLMv1-clean."
               properties:
                 cache:
                   description: "Model cache, MODEL_EXPRESS_CACHE_DIRECTORY / _CACHE_EVICTION_ENABLED."
