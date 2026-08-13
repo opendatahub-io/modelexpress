@@ -31,6 +31,17 @@ fn full_spec() -> ModelExpressServerSpec {
             url_secret: None,
         }),
         port: 8001,
+        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            requests: Some(
+                [(
+                    "memory".to_string(),
+                    k8s_openapi::apimachinery::pkg::api::resource::Quantity("2Gi".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        }),
         log: Some(LogConfig {
             level: Some(LogLevel::Debug),
             format: Some(LogFormat::Json),

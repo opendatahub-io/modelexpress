@@ -78,6 +78,9 @@ spec:
               port: 8001
             initialDelaySeconds: 5
             periodSeconds: 10
+          resources:
+            requests:
+              memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

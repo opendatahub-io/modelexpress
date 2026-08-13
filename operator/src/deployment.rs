@@ -10,12 +10,13 @@ use crate::volume::{CacheVolume, render_cache_volume};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, GRPCAction, PersistentVolumeClaim, PodSecurityContext,
-    PodSpec, PodTemplateSpec, Probe, SeccompProfile, SecurityContext, Service, ServicePort,
-    ServiceSpec, Volume,
+    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext,
+    Service, ServicePort, ServiceSpec, Volume,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
@@ -63,6 +64,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
         readiness_probe: Some(readiness),
         liveness_probe: Some(liveness),
         security_context: Some(container_security_context()),
+        resources: Some(spec.resources.clone().unwrap_or_else(default_resources)),
         ..Container::default()
     };
 
@@ -204,6 +206,23 @@ fn rollout_strategy(volume: &Volume) -> DeploymentStrategy {
     }
 }
 
+/// Requests only. A CPU limit would throttle downloads, and a memory limit
+/// risks OOMKills while unpacking a large model, so neither is guessed here;
+/// the point is to leave BestEffort, where the pod is evicted first.
+fn default_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        requests: Some(
+            [
+                ("cpu".to_string(), Quantity("100m".to_string())),
+                ("memory".to_string(), Quantity("256Mi".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        ..ResourceRequirements::default()
+    }
+}
+
 fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
     Probe {
         grpc: Some(GRPCAction {
@@ -239,6 +258,7 @@ mod tests {
             reaper: None,
             credentials: None,
             pod_metadata: None,
+            resources: None,
             network_policy: None,
             service_account_name: None,
         }

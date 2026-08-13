@@ -149,6 +149,7 @@ mod tests {
             reaper: None,
             credentials: None,
             pod_metadata: None,
+            resources: None,
             network_policy: None,
             service_account_name: None,
         }

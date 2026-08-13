@@ -87,6 +87,13 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_metadata: Option<MetadataOverrides>,
 
+    /// Compute resources for the server container. Defaults to modest
+    /// requests and no limits; unset entirely would put the pod in BestEffort,
+    /// first to be evicted under node pressure, which is a poor default for
+    /// something holding a model cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
+
     /// Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane
     /// only; worker-to-worker RDMA never crosses the CNI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
