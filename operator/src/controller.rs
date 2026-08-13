@@ -111,7 +111,6 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
         ),
     };
     write_status(
-        &cr,
         &ns,
         &name,
         &ctx,
@@ -333,7 +332,6 @@ fn ready_condition(
 
 #[tracing::instrument(skip_all)]
 async fn write_status(
-    cr: &ModelExpressServer,
     ns: &str,
     name: &str,
     ctx: &Ctx,
