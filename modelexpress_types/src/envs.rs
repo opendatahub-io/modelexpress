@@ -7,8 +7,8 @@
 
 // ── Config-loader prefix ────────────────────────────────────────────────────
 /// Prefix consumed by the `config` crate's `Environment` source in
-/// [`crate::config::load_layered_config`] (env vars like `MODEL_EXPRESS_*`
-/// override matching config-file fields).
+/// `modelexpress_common::config::load_layered_config` (env vars like
+/// `MODEL_EXPRESS_*` override matching config-file fields).
 pub const MODEL_EXPRESS_PREFIX: &str = "MODEL_EXPRESS";
 
 // ── ModelExpress-owned variables ────────────────────────────────────────────
