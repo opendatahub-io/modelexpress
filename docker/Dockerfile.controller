@@ -10,9 +10,10 @@
 
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:1c2ddbf86e65ddca0703f1a2f61e8b4d4ddda26799ee64f8200b551e835501ce AS build
 
-# cmake + perl for aws-lc-sys (rustls TLS backend)
+# openssl-devel: the operator builds against RHEL's openssl, which is the
+# FIPS-validated implementation (see ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        rust cargo cmake gcc perl \
+        rust cargo gcc openssl-devel \
     && dnf clean all
 
 WORKDIR /src
@@ -20,11 +21,12 @@ COPY . .
 RUN --mount=type=cache,id=cargo-registry-ubi9,target=/root/.cargo/registry \
     --mount=type=cache,id=target-ubi9,target=/src/target \
     cargo build --release --package modelexpress-operator \
+        --no-default-features --features openssl \
     && cp target/release/modelexpress-operator /modelexpress-operator
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:d7fc7bb3438b89a103508d78b6fdc371c0b67788999c8be4c40bf22ba110af61
 
-RUN microdnf install -y --nodocs ca-certificates \
+RUN microdnf install -y --nodocs ca-certificates openssl-libs \
     && microdnf clean all
 
 COPY --from=build --chmod=0555 /modelexpress-operator /usr/local/bin/modelexpress-operator
