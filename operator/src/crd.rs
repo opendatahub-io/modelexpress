@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
+};
 use kube::{CELSchema, CustomResource};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -428,6 +431,8 @@ pub fn generate_crd()
         else {
             continue;
         };
+        restore_int_or_string(schema);
+
         let access_modes = ["spec", "cache", "storage", "pvc", "spec"]
             .iter()
             .try_fold(schema, |props, key| {
@@ -444,6 +449,59 @@ pub fn generate_crd()
         }
     }
     crd
+}
+
+/// k8s-openapi 0.24 renders Quantity as a plain string, where Kubernetes' own
+/// PVC schema marks it int-or-string. Left alone, `storage: 100` is rejected
+/// where `storage: 100Gi` is accepted, which is not how a Quantity behaves
+/// anywhere else in the API.
+///
+/// Matching on the description is ugly, but the Quantity schema carries no
+/// other marker by the time schemars is done with it.
+fn restore_int_or_string(schema: &mut JSONSchemaProps) {
+    const QUANTITY_DOC: &str = "Quantity is a fixed-point representation of a number.";
+
+    let is_quantity = schema.type_.as_deref() == Some("string")
+        && schema
+            .description
+            .as_deref()
+            .is_some_and(|d| d.starts_with(QUANTITY_DOC));
+    if is_quantity {
+        // the apiserver rejects x-kubernetes-int-or-string alongside a type
+        schema.type_ = None;
+        schema.x_kubernetes_int_or_string = Some(true);
+        return;
+    }
+
+    if let Some(properties) = schema.properties.as_mut() {
+        for child in properties.values_mut() {
+            restore_int_or_string(child);
+        }
+    }
+    if let Some(JSONSchemaPropsOrBool::Schema(child)) = schema.additional_properties.as_mut() {
+        restore_int_or_string(child);
+    }
+    match schema.items.as_mut() {
+        Some(JSONSchemaPropsOrArray::Schema(child)) => restore_int_or_string(child),
+        Some(JSONSchemaPropsOrArray::Schemas(children)) => {
+            for child in children {
+                restore_int_or_string(child);
+            }
+        }
+        None => {}
+    }
+    for group in [
+        schema.all_of.as_mut(),
+        schema.any_of.as_mut(),
+        schema.one_of.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for child in group {
+            restore_int_or_string(child);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +592,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(required.contains(&"image"));
         assert!(required.contains(&"metadataBackend"));
+    }
+
+    #[test]
+    fn quantities_are_int_or_string() {
+        fn walk(node: &serde_json::Value, quantities: &mut Vec<serde_json::Value>) {
+            if let Some(obj) = node.as_object() {
+                let is_quantity = obj
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|d| d.starts_with("Quantity is a fixed-point"));
+                if is_quantity {
+                    quantities.push(node.clone());
+                }
+                for child in obj.values() {
+                    walk(child, quantities);
+                }
+            } else if let Some(items) = node.as_array() {
+                for child in items {
+                    walk(child, quantities);
+                }
+            }
+        }
+
+        let crd = serde_json::to_value(generate_crd()).expect("CRD serializes");
+        let mut quantities = Vec::new();
+        walk(&crd, &mut quantities);
+
+        // pvc.spec.resources and spec.resources, requests and limits each
+        assert_eq!(quantities.len(), 4, "Quantity schema count changed");
+        for q in &quantities {
+            assert_eq!(
+                q.get("x-kubernetes-int-or-string"),
+                Some(&serde_json::Value::Bool(true)),
+                "k8s-openapi renders Quantity as a plain string; `storage: 100` \
+                 would be rejected where `storage: 100Gi` is accepted"
+            );
+            // the apiserver rejects int-or-string alongside a type
+            assert_eq!(q.get("type"), None);
+        }
     }
 
     #[test]
