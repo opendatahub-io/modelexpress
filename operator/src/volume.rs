@@ -13,12 +13,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 
 pub const VOLUME_NAME: &str = "model-cache";
-/// The chart leaned on the server resolving its cache under HOME (/root),
-/// which only works as root. The images run as UID 1000 and OpenShift's
-/// restricted SCC assigns an arbitrary UID with no passwd entry at all, so
-/// HOME is unwritable (and not even /root) in both cases. Mount somewhere
-/// the volume makes writable instead, and always pass the path explicitly
-/// via MODEL_EXPRESS_CACHE_DIRECTORY rather than inferring it from HOME.
+/// Not /root: the chart relied on the server resolving its cache under HOME,
+/// but the images run as UID 1000 and OpenShift's restricted SCC assigns an
+/// arbitrary UID with no passwd entry, so HOME is unwritable either way.
 pub const DEFAULT_MOUNT_PATH: &str = "/var/cache/modelexpress";
 pub const PVC_NAME_SUFFIX: &str = "model-cache";
 
@@ -35,8 +32,8 @@ pub fn managed_pvc_name(cr_name: &str) -> String {
     format!("{cr_name}-{PVC_NAME_SUFFIX}")
 }
 
-/// Where the cache volume lands in the container. Also what the server is
-/// told via MODEL_EXPRESS_CACHE_DIRECTORY, so the two cannot drift.
+/// Also what the server is told via MODEL_EXPRESS_CACHE_DIRECTORY, so the
+/// mount and the env var cannot drift.
 pub fn mount_path(spec: &ModelExpressServerSpec) -> &str {
     spec.cache
         .as_ref()

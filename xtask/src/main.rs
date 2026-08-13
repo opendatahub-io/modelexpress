@@ -70,9 +70,8 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Root of the packaged kustomize tree. Everything generated here is a
-/// resource of one of its kustomizations, so generating anywhere else
-/// produces files nothing deploys.
+/// Root of the packaged kustomize tree; generating elsewhere produces files
+/// nothing deploys.
 fn manifests_root() -> PathBuf {
     repo_root().join("config/manifests")
 }
@@ -86,8 +85,7 @@ fn write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Emitted on every generated manifest: copyright-check.ps1 scopes `.yaml`,
-/// so generated files have to carry it or the check fails on regeneration.
+/// copyright-check.ps1 scopes `.yaml`, so regeneration has to re-emit this.
 const SPDX_HEADER: &str = "\
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0

@@ -79,8 +79,7 @@ pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
         }
     }
 
-    // Unconditional: the volume is mounted at this path, and leaving the var
-    // unset makes the server fall back to HOME and write outside the mount.
+    // unset makes the server fall back to HOME and write outside the mount
     env.push(literal(
         MODEL_EXPRESS_CACHE_DIRECTORY,
         crate::volume::mount_path(spec),

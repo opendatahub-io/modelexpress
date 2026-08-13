@@ -10,8 +10,7 @@
 
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:1c2ddbf86e65ddca0703f1a2f61e8b4d4ddda26799ee64f8200b551e835501ce AS build
 
-# openssl-devel: the operator builds against RHEL's openssl, which is the
-# FIPS-validated implementation (see ci/check-fips-crypto.sh)
+# openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         rust cargo gcc openssl-devel \
     && dnf clean all

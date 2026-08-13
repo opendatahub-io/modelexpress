@@ -60,15 +60,8 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     let roles = Api::<Role>::all(client.clone());
     let bindings = Api::<RoleBinding>::all(client.clone());
 
-    // Two separate costs here. Unfiltered, each watch lists and caches every
-    // object of that kind in the cluster, and ServiceAccounts and RoleBindings
-    // run to thousands in a real one, so the label selector keeps the working
-    // set proportional to the number of CRs rather than to cluster size.
-    //
-    // Beyond that, the controller only ever reads ownerReferences off these
-    // objects to map them back to a CR, so metadata_watcher trades the full
-    // spec and status for just ObjectMeta. A cached Deployment or RoleBinding
-    // is mostly the parts we throw away.
+    // Unfiltered these cache every object of their kind in the cluster, and
+    // ServiceAccounts and RoleBindings run to thousands in a real one.
     let owned = watcher::Config::default().labels(labels::MANAGED_BY_SELECTOR);
 
     Controller::new(servers, watcher::Config::default())
@@ -91,8 +84,8 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     Ok(())
 }
 
-/// Owned objects are only ever read for their ownerReferences, so watch
-/// ObjectMeta instead of the whole object.
+/// Owned objects are only read for their ownerReferences, so the spec and
+/// status a full watch would cache are dead weight.
 fn owned_meta<K>(
     api: Api<K>,
     config: watcher::Config,
@@ -137,9 +130,8 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
         Err(err) => (
             ready_condition(&cr, "False", reason(err), &err.to_string()),
             None,
-            // Nothing was applied, so leave the previous value alone: clients
-            // compare generation against observedGeneration to decide whether
-            // the current spec has been acted on.
+            // clients compare this against metadata.generation to decide
+            // whether the current spec has been acted on
             cr.status.as_ref().and_then(|s| s.observed_generation),
         ),
     };
@@ -254,15 +246,10 @@ async fn apply_rbac(
     Ok(())
 }
 
-/// Delete only what this CR owns.
-///
-/// Every cleanup path here targets a name derived from the CR, not a name the
-/// operator can prove it created. `spec.networkPolicy` is unset by default, so
-/// the netpol branch runs on the common path and would otherwise issue a
-/// DELETE against `<namespace>/<cr-name>` on every reconcile, taking out a
-/// user's unrelated NetworkPolicy that merely shares the name. Checking the
-/// ownerReference makes the delete a no-op for anything the operator did not
-/// create.
+/// Cleanup targets names derived from the CR, not names the operator can prove
+/// it created. `spec.networkPolicy` is unset by default, so without this check
+/// the netpol branch deletes a user's unrelated same-named policy on every
+/// reconcile.
 async fn delete_if_owned<K>(api: &Api<K>, name: &str, owner_uid: &str) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -349,12 +336,10 @@ fn reason(err: &Error) -> &'static str {
 
 pub const READY_CONDITION: &str = "Ready";
 
-/// Per the API conventions lastTransitionTime records when the condition last
-/// changed state, so it has to be carried forward while status/reason/message
-/// hold. Restamping it every pass would make each applied status differ from
-/// the stored one, and since the controller watches ModelExpressServer, every
-/// status write would schedule the next reconcile: an unbounded loop that the
-/// requeue interval never gates.
+/// Carries lastTransitionTime forward while the condition holds, per the API
+/// conventions. Restamping it makes every status write differ from the stored
+/// object, and since the controller watches its own CR that write schedules
+/// the next reconcile: an unbounded loop the requeue never gates.
 fn ready_condition(
     cr: &ModelExpressServer,
     status: &str,
@@ -397,8 +382,7 @@ async fn write_status(
         endpoint,
     };
     let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
-    // An apply patch must carry apiVersion/kind. Taking them from the Resource
-    // impl means the group is spelled once, in the CRD derive.
+    // from the Resource impl so the group is spelled once, in the derive
     let patch = serde_json::json!({
         "apiVersion": ModelExpressServer::api_version(&()),
         "kind": ModelExpressServer::kind(&()),

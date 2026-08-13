@@ -19,10 +19,8 @@ use modelexpress_operator::telemetry;
 use std::collections::BTreeMap;
 
 pub const NAME: &str = "modelexpress-operator";
-/// Where the midstream publishes the controller image. Overridable with
-/// `--image` so a release can pin a digest without editing the generator;
-/// the default has to keep reproducing the committed tree or `--check`
-/// fails for everyone who did not pass the flag.
+/// Must keep reproducing the committed tree, or `--check` fails for anyone
+/// who did not pass `--image`.
 pub const DEFAULT_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress-operator:latest";
 
 pub fn labels() -> BTreeMap<String, String> {
@@ -157,10 +155,8 @@ fn http_probe(path: &str) -> Probe {
     }
 }
 
-/// The controller only talks to the apiserver and serves /metrics, so it can
-/// run under the restricted Pod Security Standard with nothing relaxed. The
-/// image ships USER 1000:1000, but the image alone is advisory: without
-/// runAsNonRoot the admission plugin has nothing to enforce.
+/// The image ships USER 1000:1000, but that is advisory: without runAsNonRoot
+/// the admission plugin has nothing to enforce.
 fn pod_security_context() -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
@@ -172,8 +168,7 @@ fn pod_security_context() -> PodSecurityContext {
     }
 }
 
-/// No filesystem writes anywhere in the controller, so the root filesystem is
-/// read-only and needs no writable volume alongside it.
+/// The controller writes nothing, so a read-only root needs no scratch volume.
 fn container_security_context() -> SecurityContext {
     SecurityContext {
         allow_privilege_escalation: Some(false),

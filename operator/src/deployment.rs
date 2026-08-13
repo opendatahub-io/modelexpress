@@ -161,14 +161,9 @@ fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, 
     labels
 }
 
-/// Without these a namespace labelled with the restricted Pod Security
-/// Standard rejects the pod outright, and the CRD exposes no override for a
-/// user to work around it.
-///
 /// runAsUser and fsGroup are deliberately absent: OpenShift's restricted-v2
-/// SCC assigns both from the namespace range, and pinning them here would
-/// conflict with that while buying nothing on vanilla Kubernetes, where the
-/// image's own USER applies.
+/// SCC assigns both from the namespace range, and pinning them would conflict
+/// with that while buying nothing on vanilla Kubernetes.
 fn pod_security_context() -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
@@ -180,9 +175,8 @@ fn pod_security_context() -> PodSecurityContext {
     }
 }
 
-/// readOnlyRootFilesystem is deliberately not set: unlike the controller, the
-/// server unpacks downloads and the provider SDKs write scratch state outside
-/// the cache mount.
+/// No readOnlyRootFilesystem: unlike the controller, the server unpacks
+/// downloads and the provider SDKs write scratch outside the cache mount.
 fn container_security_context() -> SecurityContext {
     SecurityContext {
         allow_privilege_escalation: Some(false),
@@ -195,11 +189,9 @@ fn container_security_context() -> SecurityContext {
     }
 }
 
-/// RollingUpdate at replicas: 1 leaves maxUnavailable at 25%, which rounds
-/// down to 0, so Kubernetes starts the new pod before terminating the old
-/// one. A ReadWriteOnce claim cannot attach twice, so the rollout wedges
-/// until someone deletes the old pod by hand. Managed PVCs default to RWO and
-/// existingClaim is just as exposed, so any PVC-backed cache gets Recreate.
+/// RollingUpdate at replicas: 1 rounds maxUnavailable down to 0, so the new
+/// pod starts before the old one goes away and a ReadWriteOnce claim cannot
+/// attach to both. Managed PVCs default to RWO.
 fn rollout_strategy(volume: &Volume) -> DeploymentStrategy {
     let type_ = if volume.persistent_volume_claim.is_some() {
         "Recreate"
@@ -458,8 +450,7 @@ mod tests {
         assert_eq!(strategy(&spec), Some("Recreate".to_string()));
     }
 
-    /// The controller's owned watches filter on this label, so anything
-    /// rendered without it silently stops producing reconcile events.
+    /// Anything rendered without this label stops producing reconcile events.
     #[test]
     fn every_rendered_object_carries_the_managed_by_label() {
         use crate::labels::{MANAGED_BY, MANAGED_BY_LABEL};

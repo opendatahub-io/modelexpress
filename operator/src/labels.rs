@@ -3,11 +3,9 @@
 
 //! Labels shared by everything the operator creates.
 //!
-//! These are load-bearing twice over: the Deployment and Service select pods
-//! with the [`selector_labels`] subset, and the controller's owned watches
-//! filter on [`MANAGED_BY_SELECTOR`], so an object that ships without
-//! [`managed_labels`] never produces a watch event and its drift goes
-//! unnoticed until the next resync.
+//! Load-bearing: the controller's owned watches filter on
+//! [`MANAGED_BY_SELECTOR`], so an object rendered without [`managed_labels`]
+//! never produces a watch event.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +16,6 @@ pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 pub const SERVER_NAME: &str = "modelexpress-server";
 pub const MANAGED_BY: &str = "modelexpress-operator";
 
-/// Label selector form of [`MANAGED_BY_LABEL`], for `watcher::Config::labels`.
 pub const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=modelexpress-operator";
 
 /// Immutable subset used for the Deployment and Service selectors; changing
@@ -32,7 +29,7 @@ pub fn selector_labels(cr_name: &str) -> BTreeMap<String, String> {
     .collect()
 }
 
-/// What every operator-owned object carries, pods included.
+/// What every operator-owned object carries.
 pub fn managed_labels(cr_name: &str) -> BTreeMap<String, String> {
     let mut labels = selector_labels(cr_name);
     labels.insert(MANAGED_BY_LABEL.to_string(), MANAGED_BY.to_string());
