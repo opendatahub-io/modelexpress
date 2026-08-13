@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 mod objects;
 
 use clap::{Parser, Subcommand};
@@ -73,11 +76,20 @@ fn write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Emitted on every generated manifest: copyright-check.ps1 scopes `.yaml`,
+/// so generated files have to carry it or the check fails on regeneration.
+const SPDX_HEADER: &str = "\
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+";
+
 fn to_yaml<T: serde::Serialize>(value: &T) -> Result<String> {
-    serde_norway::to_string(value).map_err(|source| XtaskError::Yaml {
+    let body = serde_norway::to_string(value).map_err(|source| XtaskError::Yaml {
         what: std::any::type_name::<T>(),
         source,
-    })
+    })?;
+    Ok(format!("{SPDX_HEADER}{body}"))
 }
 
 /// Write each (path, contents) pair, or with `check` fail on any drift.

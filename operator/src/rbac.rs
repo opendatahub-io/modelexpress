@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! ServiceAccount and namespace RBAC for the server pod.
 //!
 //! The kubernetes metadata backend stores state in modelexpress.nvidia.com

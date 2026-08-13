@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prometheus metrics and health endpoints for the operator process.
 //!
 //! Server-workload metrics are deliberately absent: modelexpress-server has

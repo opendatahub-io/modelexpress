@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reconcile loop: ModelExpressServer -> Deployment + Service + PVC.
 
 use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
