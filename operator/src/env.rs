@@ -60,7 +60,12 @@ pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
     match &spec.metadata_backend {
         MetadataBackend::Redis(redis) => {
             env.push(literal(MX_METADATA_BACKEND, "redis"));
-            env.push(literal(REDIS_URL, &redis.url));
+            // admission enforces exactly one of the two
+            if let Some(secret) = &redis.url_secret {
+                env.push(from_secret(REDIS_URL, secret));
+            } else if let Some(url) = &redis.url {
+                env.push(literal(REDIS_URL, url));
+            }
         }
         MetadataBackend::Kubernetes {} => {
             env.push(literal(MX_METADATA_BACKEND, "kubernetes"));
@@ -182,7 +187,8 @@ mod tests {
     #[test]
     fn redis_backend_sets_backend_and_url() {
         let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
-            url: "redis://mx-redis:6379".into(),
+            url: Some("redis://mx-redis:6379".into()),
+            url_secret: None,
         })));
         assert_eq!(value_of(&env, MX_METADATA_BACKEND), Some("redis"));
         assert_eq!(value_of(&env, REDIS_URL), Some("redis://mx-redis:6379"));
@@ -220,6 +226,47 @@ mod tests {
     }
 
     #[test]
+    fn redis_url_renders_from_a_secret_when_set() {
+        let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
+            url: None,
+            url_secret: Some(crate::crd::SecretKeyRef {
+                name: "mx-redis".into(),
+                key: "url".into(),
+            }),
+        })));
+        let var = env
+            .iter()
+            .find(|e| e.name == REDIS_URL)
+            .expect("REDIS_URL rendered");
+        assert!(
+            var.value.is_none(),
+            "credentials must not land in the pod template"
+        );
+        let secret = var
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .expect("secretKeyRef");
+        assert_eq!(secret.name, "mx-redis");
+        assert_eq!(secret.key, "url");
+    }
+
+    #[test]
+    fn redis_url_secret_wins_over_a_literal() {
+        // admission rejects both being set; this pins the render if it slips
+        let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
+            url: Some("redis://plain:6379".into()),
+            url_secret: Some(crate::crd::SecretKeyRef {
+                name: "mx-redis".into(),
+                key: "url".into(),
+            }),
+        })));
+        let var = env.iter().find(|e| e.name == REDIS_URL).expect("REDIS_URL");
+        assert_eq!(var.value, None);
+        assert!(var.value_from.is_some());
+    }
+
+    #[test]
     fn cache_directory_always_matches_the_mount_path() {
         let spec = base_spec(MetadataBackend::Kubernetes {});
         assert_eq!(
@@ -248,7 +295,8 @@ mod tests {
     #[test]
     fn full_spec_renders_every_var() {
         let mut spec = base_spec(MetadataBackend::Redis(RedisBackend {
-            url: "rediss://mx-redis:6380".into(),
+            url: Some("rediss://mx-redis:6380".into()),
+            url_secret: None,
         }));
         spec.port = 9000;
         spec.log = Some(LogConfig {

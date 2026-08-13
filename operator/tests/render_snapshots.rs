@@ -27,7 +27,8 @@ fn full_spec() -> ModelExpressServerSpec {
         image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
         replicas: 3,
         metadata_backend: MetadataBackend::Redis(RedisBackend {
-            url: "redis://mx-redis:6379".into(),
+            url: Some("redis://mx-redis:6379".into()),
+            url_secret: None,
         }),
         port: 8001,
         log: Some(LogConfig {

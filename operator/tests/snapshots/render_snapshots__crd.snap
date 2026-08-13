@@ -300,15 +300,35 @@ spec:
                       description: External Redis via REDIS_URL.
                       properties:
                         url:
-                          description: "Full connection URL, e.g. redis://host:6379."
+                          description: "Full connection URL, e.g. redis://host:6379. Use urlSecret instead when the URL embeds credentials."
+                          nullable: true
                           type: string
                           x-kubernetes-validations:
                             - message: "url must be a redis:// or rediss:// URL"
                               rule: "self.startsWith('redis://') || self.startsWith('rediss://')"
-                      required:
-                        - url
+                        urlSecret:
+                          description: "Secret holding the connection URL, rendered as a secretKeyRef so the credentials never enter the CR."
+                          nullable: true
+                          properties:
+                            key:
+                              type: string
+                              x-kubernetes-validations:
+                                - message: secret key must not be empty
+                                  rule: "self != ''"
+                            name:
+                              type: string
+                              x-kubernetes-validations:
+                                - message: secret name must not be empty
+                                  rule: "self != ''"
+                          required:
+                            - key
+                            - name
+                          type: object
+                          x-kubernetes-validations: []
                       type: object
-                      x-kubernetes-validations: []
+                      x-kubernetes-validations:
+                        - message: set exactly one of url or urlSecret
+                          rule: has(self.url) != has(self.urlSecret)
                   type: object
                 networkPolicy:
                   description: Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane only; worker-to-worker RDMA never crosses the CNI.

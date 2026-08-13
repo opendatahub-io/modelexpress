@@ -194,7 +194,8 @@ mod tests {
             "mx",
             &spec(
                 MetadataBackend::Redis(RedisBackend {
-                    url: "redis://r:6379".into(),
+                    url: Some("redis://r:6379".into()),
+                    url_secret: None,
                 }),
                 None,
             ),

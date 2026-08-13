@@ -136,11 +136,23 @@ pub enum MetadataBackend {
 
 #[derive(CELSchema, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+// Redis URLs routinely embed credentials (rediss://user:pass@host:6380). A
+// literal url lands in the CR and in the pod template, readable by anyone with
+// get on either, so urlSecret exists for that case.
+#[cel_validate(rule = Rule::new("has(self.url) != has(self.urlSecret)")
+    .message("set exactly one of url or urlSecret"))]
 pub struct RedisBackend {
-    /// Full connection URL, e.g. redis://host:6379.
+    /// Full connection URL, e.g. redis://host:6379. Use urlSecret instead when
+    /// the URL embeds credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cel_validate(rule = Rule::new("self.startsWith('redis://') || self.startsWith('rediss://')")
         .message("url must be a redis:// or rediss:// URL"))]
-    pub url: String,
+    pub url: Option<String>,
+
+    /// Secret holding the connection URL, rendered as a secretKeyRef so the
+    /// credentials never enter the CR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_secret: Option<SecretKeyRef>,
 }
 
 #[derive(JsonSchema, Clone, Copy, Debug, Default, Deserialize, Serialize)]

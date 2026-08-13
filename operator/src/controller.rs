@@ -421,7 +421,8 @@ mod tests {
                 image: "img".into(),
                 replicas: 1,
                 metadata_backend: MetadataBackend::Redis(RedisBackend {
-                    url: "redis://mx-redis:6379".into(),
+                    url: Some("redis://mx-redis:6379".into()),
+                    url_secret: None,
                 }),
                 port: 8001,
                 log: None,
