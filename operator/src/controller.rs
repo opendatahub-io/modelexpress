@@ -95,17 +95,31 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     let name = cr.name_any();
 
     let result = apply(&cr, &ns, &name, &ctx).await;
-    let (condition, endpoint) = match &result {
+    let (condition, endpoint, observed_generation) = match &result {
         Ok(()) => (
             ready_condition(&cr, "True", "Applied", "resources applied"),
             Some(endpoint(&name, &ns, cr.spec.port)),
+            cr.metadata.generation,
         ),
         Err(err) => (
             ready_condition(&cr, "False", reason(err), &err.to_string()),
             None,
+            // Nothing was applied, so leave the previous value alone: clients
+            // compare generation against observedGeneration to decide whether
+            // the current spec has been acted on.
+            cr.status.as_ref().and_then(|s| s.observed_generation),
         ),
     };
-    write_status(&cr, &ns, &name, &ctx, condition, endpoint).await?;
+    write_status(
+        &cr,
+        &ns,
+        &name,
+        &ctx,
+        condition,
+        endpoint,
+        observed_generation,
+    )
+    .await?;
 
     result.map(|()| Action::requeue(Duration::from_secs(300)))
 }
@@ -325,9 +339,10 @@ async fn write_status(
     ctx: &Ctx,
     condition: Condition,
     endpoint: Option<String>,
+    observed_generation: Option<i64>,
 ) -> Result<(), Error> {
     let status = ModelExpressServerStatus {
-        observed_generation: cr.metadata.generation,
+        observed_generation,
         conditions: vec![condition],
         endpoint,
     };
