@@ -9,7 +9,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kube = { workspace = true }
+# unstable-runtime: Controller::owns_stream, needed to feed metadata-only
+# watches in place of the full-object ones Controller::owns builds
+kube = { workspace = true, features = ["unstable-runtime"] }
 modelexpress-types = { workspace = true }
 k8s-openapi = { workspace = true, features = ["schemars"] }
 schemars = { workspace = true }

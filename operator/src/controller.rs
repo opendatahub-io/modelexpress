@@ -13,9 +13,11 @@ use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service, ServiceAccount}
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
-use kube::api::{Api, ObjectMeta, Patch, PatchParams};
+use kube::api::{Api, ObjectMeta, PartialObjectMeta, Patch, PatchParams};
+use kube::runtime::WatchStreamExt;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
+use kube::runtime::watcher::metadata_watcher;
 use kube::{Client, Resource, ResourceExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,21 +60,25 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     let roles = Api::<Role>::all(client.clone());
     let bindings = Api::<RoleBinding>::all(client.clone());
 
-    // Unfiltered, each owns() lists and caches every object of that kind in
-    // the cluster. ServiceAccounts and RoleBindings run to thousands in any
-    // real cluster, so the reflector's memory and the initial list would scale
-    // with cluster size rather than with the number of CRs. Everything the
-    // operator creates carries this label (see labels::managed_labels).
+    // Two separate costs here. Unfiltered, each watch lists and caches every
+    // object of that kind in the cluster, and ServiceAccounts and RoleBindings
+    // run to thousands in a real one, so the label selector keeps the working
+    // set proportional to the number of CRs rather than to cluster size.
+    //
+    // Beyond that, the controller only ever reads ownerReferences off these
+    // objects to map them back to a CR, so metadata_watcher trades the full
+    // spec and status for just ObjectMeta. A cached Deployment or RoleBinding
+    // is mostly the parts we throw away.
     let owned = watcher::Config::default().labels(labels::MANAGED_BY_SELECTOR);
 
     Controller::new(servers, watcher::Config::default())
-        .owns(deployments, owned.clone())
-        .owns(services, owned.clone())
-        .owns(pvcs, owned.clone())
-        .owns(netpols, owned.clone())
-        .owns(sas, owned.clone())
-        .owns(roles, owned.clone())
-        .owns(bindings, owned)
+        .owns_stream(owned_meta(deployments, owned.clone()))
+        .owns_stream(owned_meta(services, owned.clone()))
+        .owns_stream(owned_meta(pvcs, owned.clone()))
+        .owns_stream(owned_meta(netpols, owned.clone()))
+        .owns_stream(owned_meta(sas, owned.clone()))
+        .owns_stream(owned_meta(roles, owned.clone()))
+        .owns_stream(owned_meta(bindings, owned))
         .shutdown_on_signal()
         .run(reconcile, error_policy, Arc::new(Ctx { client }))
         .for_each(|result| async move {
@@ -83,6 +89,23 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
         })
         .await;
     Ok(())
+}
+
+/// Owned objects are only ever read for their ownerReferences, so watch
+/// ObjectMeta instead of the whole object.
+fn owned_meta<K>(
+    api: Api<K>,
+    config: watcher::Config,
+) -> impl futures::Stream<Item = Result<PartialObjectMeta<K>, watcher::Error>> + Send
+where
+    K: Resource<DynamicType = ()>
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + Send
+        + 'static,
+{
+    metadata_watcher(api, config).touched_objects()
 }
 
 async fn reconcile(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<Action, Error> {
