@@ -6,11 +6,11 @@
 use crate::crd::ModelExpressServerSpec;
 use crate::env::render_env;
 use crate::volume::{CacheVolume, render_cache_volume};
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, GRPCAction, PersistentVolumeClaim, PodSecurityContext,
     PodSpec, PodTemplateSpec, Probe, SeccompProfile, SecurityContext, Service, ServicePort,
-    ServiceSpec,
+    ServiceSpec, Volume,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
@@ -35,6 +35,7 @@ pub struct DesiredState {
 
 pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
     let CacheVolume { volume, mount, pvc } = render_cache_volume(cr_name, spec);
+    let strategy = rollout_strategy(&volume);
     let labels = pod_labels(cr_name, spec);
     let pod_annotations = spec
         .pod_metadata
@@ -72,6 +73,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
         },
         spec: Some(DeploymentSpec {
             replicas: Some(spec.replicas),
+            strategy: Some(strategy),
             selector: LabelSelector {
                 match_labels: Some(selector_labels(cr_name)),
                 ..LabelSelector::default()
@@ -210,6 +212,23 @@ fn container_security_context() -> SecurityContext {
             add: None,
         }),
         ..SecurityContext::default()
+    }
+}
+
+/// RollingUpdate at replicas: 1 leaves maxUnavailable at 25%, which rounds
+/// down to 0, so Kubernetes starts the new pod before terminating the old
+/// one. A ReadWriteOnce claim cannot attach twice, so the rollout wedges
+/// until someone deletes the old pod by hand. Managed PVCs default to RWO and
+/// existingClaim is just as exposed, so any PVC-backed cache gets Recreate.
+fn rollout_strategy(volume: &Volume) -> DeploymentStrategy {
+    let type_ = if volume.persistent_volume_claim.is_some() {
+        "Recreate"
+    } else {
+        "RollingUpdate"
+    };
+    DeploymentStrategy {
+        type_: Some(type_.to_string()),
+        rolling_update: None,
     }
 }
 
@@ -413,6 +432,50 @@ mod tests {
                 .map(String::as_str),
             Some("false")
         );
+    }
+
+    #[test]
+    fn ephemeral_cache_rolls_but_pvc_cache_recreates() {
+        let strategy = |spec: &ModelExpressServerSpec| {
+            render("mx", spec)
+                .deployment
+                .spec
+                .expect("spec")
+                .strategy
+                .expect("strategy")
+                .type_
+        };
+
+        let mut spec = base_spec();
+        spec.replicas = 1;
+        assert_eq!(
+            strategy(&spec),
+            Some("RollingUpdate".to_string()),
+            "emptyDir attaches anywhere"
+        );
+
+        spec.cache = Some(CacheConfig {
+            storage: Some(CacheStorage::Pvc(Box::new(ManagedPvcStorage {
+                metadata: None,
+                spec: PersistentVolumeClaimSpec::default(),
+            }))),
+            ..CacheConfig::default()
+        });
+        assert_eq!(
+            strategy(&spec),
+            Some("Recreate".to_string()),
+            "a RWO claim cannot attach to the new pod while the old one holds it"
+        );
+
+        spec.cache = Some(CacheConfig {
+            storage: Some(CacheStorage::ExistingClaim(
+                crate::crd::ExistingClaimStorage {
+                    claim_name: "shared-models".into(),
+                },
+            )),
+            ..CacheConfig::default()
+        });
+        assert_eq!(strategy(&spec), Some("Recreate".to_string()));
     }
 
     #[test]

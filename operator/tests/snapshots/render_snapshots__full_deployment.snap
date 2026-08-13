@@ -17,6 +17,8 @@ spec:
     matchLabels:
       app.kubernetes.io/instance: mx-full
       app.kubernetes.io/name: modelexpress-server
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
