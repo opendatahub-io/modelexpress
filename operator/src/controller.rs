@@ -5,6 +5,7 @@
 
 use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
+use crate::labels;
 use crate::rbac::{ServerRbac, render_rbac, role_name, service_account_name};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -57,14 +58,21 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     let roles = Api::<Role>::all(client.clone());
     let bindings = Api::<RoleBinding>::all(client.clone());
 
+    // Unfiltered, each owns() lists and caches every object of that kind in
+    // the cluster. ServiceAccounts and RoleBindings run to thousands in any
+    // real cluster, so the reflector's memory and the initial list would scale
+    // with cluster size rather than with the number of CRs. Everything the
+    // operator creates carries this label (see labels::managed_labels).
+    let owned = watcher::Config::default().labels(labels::MANAGED_BY_SELECTOR);
+
     Controller::new(servers, watcher::Config::default())
-        .owns(deployments, watcher::Config::default())
-        .owns(services, watcher::Config::default())
-        .owns(pvcs, watcher::Config::default())
-        .owns(netpols, watcher::Config::default())
-        .owns(sas, watcher::Config::default())
-        .owns(roles, watcher::Config::default())
-        .owns(bindings, watcher::Config::default())
+        .owns(deployments, owned.clone())
+        .owns(services, owned.clone())
+        .owns(pvcs, owned.clone())
+        .owns(netpols, owned.clone())
+        .owns(sas, owned.clone())
+        .owns(roles, owned.clone())
+        .owns(bindings, owned)
         .shutdown_on_signal()
         .run(reconcile, error_policy, Arc::new(Ctx { client }))
         .for_each(|result| async move {
