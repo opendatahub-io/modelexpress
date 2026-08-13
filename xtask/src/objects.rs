@@ -6,8 +6,8 @@
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-    ServiceAccount,
+    Capabilities, Container, ContainerPort, HTTPGetAction, PodSecurityContext, PodSpec,
+    PodTemplateSpec, Probe, ResourceRequirements, SecurityContext, SeccompProfile, ServiceAccount,
 };
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -156,6 +156,36 @@ fn http_probe(path: &str) -> Probe {
     }
 }
 
+/// The controller only talks to the apiserver and serves /metrics, so it can
+/// run under the restricted Pod Security Standard with nothing relaxed. The
+/// image ships USER 1000:1000, but the image alone is advisory: without
+/// runAsNonRoot the admission plugin has nothing to enforce.
+fn pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            localhost_profile: None,
+        }),
+        ..PodSecurityContext::default()
+    }
+}
+
+/// No filesystem writes anywhere in the controller, so the root filesystem is
+/// read-only and needs no writable volume alongside it.
+fn container_security_context() -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        run_as_non_root: Some(true),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: None,
+        }),
+        ..SecurityContext::default()
+    }
+}
+
 pub fn deployment(image: &str) -> Deployment {
     let selector: BTreeMap<String, String> =
         [("app.kubernetes.io/name".to_string(), NAME.to_string())]
@@ -191,9 +221,11 @@ pub fn deployment(image: &str) -> Deployment {
                 }),
                 spec: Some(PodSpec {
                     service_account_name: Some(NAME.to_string()),
+                    security_context: Some(pod_security_context()),
                     containers: vec![Container {
                         name: "operator".to_string(),
                         image: Some(image.to_string()),
+                        security_context: Some(container_security_context()),
                         ports: Some(vec![ContainerPort {
                             name: Some(telemetry::PORT_NAME.to_string()),
                             container_port: telemetry::PORT,
