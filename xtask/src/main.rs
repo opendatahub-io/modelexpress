@@ -56,6 +56,9 @@ enum Cmd {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
         #[arg(long)]
         check: bool,
+        /// Controller image to render, e.g. a release digest
+        #[arg(long, default_value = objects::DEFAULT_IMAGE)]
+        image: String,
     },
 }
 
@@ -118,7 +121,9 @@ fn write_or_check(files: Vec<(PathBuf, String)>, check: bool, cmd: &'static str)
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Crdgen { check } => write_or_check(all_crds()?, check, "crdgen"),
-        Cmd::Manifests { check } => write_or_check(manifests()?, check, "manifests"),
+        Cmd::Manifests { check, image } => {
+            write_or_check(manifests(&image)?, check, "manifests")
+        }
     }
 }
 
@@ -145,14 +150,10 @@ fn all_crds() -> Result<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
-fn manifests() -> Result<Vec<(PathBuf, String)>> {
+fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
     let config = manifests_root();
     let rbac = config.join("rbac");
-    let params = format!(
-        "MODELEXPRESS_OPERATOR_IMAGE={}:{}\n",
-        objects::IMAGE,
-        objects::VERSION
-    );
+    let params = format!("MODELEXPRESS_OPERATOR_IMAGE={image}\n");
     Ok(vec![
         (
             rbac.join("serviceaccount.yaml"),
@@ -168,7 +169,7 @@ fn manifests() -> Result<Vec<(PathBuf, String)>> {
         ),
         (
             config.join("manager/deployment.yaml"),
-            to_yaml(&objects::deployment())?,
+            to_yaml(&objects::deployment(image))?,
         ),
         (config.join("base/params.env"), params),
     ])

@@ -18,9 +18,11 @@ use modelexpress_operator::telemetry;
 use std::collections::BTreeMap;
 
 pub const NAME: &str = "modelexpress-operator";
-/// Placeholder until an image build/publish pipeline exists.
-pub const IMAGE: &str = "ghcr.io/wseaton/modelexpress-operator";
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Where the midstream publishes the controller image. Overridable with
+/// `--image` so a release can pin a digest without editing the generator;
+/// the default has to keep reproducing the committed tree or `--check`
+/// fails for everyone who did not pass the flag.
+pub const DEFAULT_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress-operator:latest";
 
 pub fn labels() -> BTreeMap<String, String> {
     [
@@ -154,7 +156,7 @@ fn http_probe(path: &str) -> Probe {
     }
 }
 
-pub fn deployment() -> Deployment {
+pub fn deployment(image: &str) -> Deployment {
     let selector: BTreeMap<String, String> =
         [("app.kubernetes.io/name".to_string(), NAME.to_string())]
             .into_iter()
@@ -191,7 +193,7 @@ pub fn deployment() -> Deployment {
                     service_account_name: Some(NAME.to_string()),
                     containers: vec![Container {
                         name: "operator".to_string(),
-                        image: Some(format!("{IMAGE}:{VERSION}")),
+                        image: Some(image.to_string()),
                         ports: Some(vec![ContainerPort {
                             name: Some(telemetry::PORT_NAME.to_string()),
                             container_port: telemetry::PORT,
