@@ -8,6 +8,7 @@ metadata:
 spec:
   group: modelexpress.nvidia.com
   names:
+    categories: []
     kind: ModelMetadata
     plural: modelmetadatas
     shortNames:
@@ -15,7 +16,8 @@ spec:
     singular: modelmetadata
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns: []
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for ModelMetadataSpec via `CustomResource`
@@ -111,9 +113,7 @@ spec:
                         minimum: 0.0
                         type: integer
                       totalSize:
-                        description: |-
-                          Total artifact bytes across all manifest files. Kubernetes OpenAPI
-                          exposes this as int64; the backend converts to/from the proto uint64.
+                        description: Total artifact bytes across all manifest files. Kubernetes OpenAPI exposes this as int64; the backend converts to/from the proto uint64.
                         format: int64
                         type: integer
                     required:

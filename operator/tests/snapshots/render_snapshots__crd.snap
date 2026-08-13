@@ -9,6 +9,7 @@ metadata:
 spec:
   group: modelexpress.wseaton.com
   names:
+    categories: []
     kind: ModelExpressServer
     plural: modelexpressservers
     shortNames:
@@ -32,14 +33,14 @@ spec:
           description: "Auto-generated derived type for ModelExpressServerSpec via `CustomResource`"
           properties:
             spec:
-              description: "Desired state of a ModelExpress metadata coordinator deployment.\n\nGroup is a placeholder until upstream blesses a name under\nmodelexpress.nvidia.com; CRs will need migration on donation.\n\nValidation lives in CEL rules on the schema (enforced at admission by the\napiserver) instead of a webhook, so the operator stays OLMv1-clean."
+              description: "Desired state of a ModelExpress metadata coordinator deployment.\n\nGroup is a placeholder until upstream blesses a name under modelexpress.nvidia.com; CRs will need migration on donation.\n\nValidation lives in CEL rules on the schema (enforced at admission by the apiserver) instead of a webhook, so the operator stays OLMv1-clean."
               properties:
                 cache:
                   description: "Model cache, MODEL_EXPRESS_CACHE_DIRECTORY / _CACHE_EVICTION_ENABLED."
                   nullable: true
                   properties:
                     directory:
-                      description: "MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to\n/root, matching the server's HOME-relative cache resolution."
+                      description: "MODEL_EXPRESS_CACHE_DIRECTORY, also the volume mount path. Defaults to /root, matching the server's HOME-relative cache resolution."
                       nullable: true
                       type: string
                     evictionEnabled:
@@ -47,7 +48,7 @@ spec:
                       nullable: true
                       type: boolean
                     storage:
-                      description: "What backs the cache mount. Defaults to an emptyDir (models re-download\nafter a pod restart, but any replica count works)."
+                      description: "What backs the cache mount. Defaults to an emptyDir (models re-download after a pod restart, but any replica count works)."
                       nullable: true
                       oneOf:
                         - required:
@@ -69,6 +70,7 @@ spec:
                                 - message: sizeLimit must be a Kubernetes quantity
                                   rule: "self.matches('^[0-9]+(\\\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E|m)?$')"
                           type: object
+                          x-kubernetes-validations: []
                         existingClaim:
                           description: A PVC the user manages; the operator only mounts it.
                           properties:
@@ -80,8 +82,9 @@ spec:
                           required:
                             - claimName
                           type: object
+                          x-kubernetes-validations: []
                         pvc:
-                          description: "A PVC the operator creates and owns, named `<cr-name>-model-cache`.\nBoxed: the embedded claim spec dwarfs the other variants."
+                          description: "A PVC the operator creates and owns, named `<cr-name>-model-cache`. Boxed: the embedded claim spec dwarfs the other variants."
                           properties:
                             metadata:
                               description: Labels and annotations applied to the claim.
@@ -99,7 +102,7 @@ spec:
                                   type: object
                               type: object
                             spec:
-                              description: "Verbatim PVC spec. accessModes defaults to ReadWriteOnce, which the\nspec-level rule rejects for replicas > 1. Quantity strings are only\nvalidated by the apiserver at claim creation; a bad size shows up as a\nstatus condition, not an admission error."
+                              description: "Verbatim PVC spec. accessModes defaults to ReadWriteOnce, which the spec-level rule rejects for replicas > 1. Quantity strings are only validated by the apiserver at claim creation; a bad size shows up as a status condition, not an admission error."
                               properties:
                                 accessModes:
                                   description: "accessModes contains the desired access modes the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1"
@@ -149,13 +152,13 @@ spec:
                                     limits:
                                       additionalProperties:
                                         description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
-                                        x-kubernetes-int-or-string: true
+                                        type: string
                                       description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                                       type: object
                                     requests:
                                       additionalProperties:
                                         description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
-                                        x-kubernetes-int-or-string: true
+                                        type: string
                                       description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                                       type: object
                                   type: object
@@ -232,6 +235,7 @@ spec:
                         - key
                         - name
                       type: object
+                      x-kubernetes-validations: []
                     ngcApiKeySecret:
                       description: "Secret holding the NGC API key, injected as NGC_API_KEY."
                       nullable: true
@@ -250,9 +254,10 @@ spec:
                         - key
                         - name
                       type: object
+                      x-kubernetes-validations: []
                   type: object
                 image:
-                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it,\nso a rolling image change cold-starts P2P discovery between old and new\nworkers."
+                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it, so a rolling image change cold-starts P2P discovery between old and new workers."
                   type: string
                   x-kubernetes-validations:
                     - message: image must not be empty
@@ -267,7 +272,6 @@ spec:
                         - json
                         - pretty
                         - compact
-                        - ~
                       nullable: true
                       type: string
                     level:
@@ -278,12 +282,11 @@ spec:
                         - info
                         - warn
                         - error
-                        - ~
                       nullable: true
                       type: string
                   type: object
                 metadataBackend:
-                  description: "Metadata backend. Upstream has no default (MX_METADATA_BACKEND is\nmandatory), so it is required here too."
+                  description: "Metadata backend. Upstream has no default (MX_METADATA_BACKEND is mandatory), so it is required here too."
                   oneOf:
                     - required:
                         - redis
@@ -291,7 +294,7 @@ spec:
                         - kubernetes
                   properties:
                     kubernetes:
-                      description: "CRD-backed storage in the server's own namespace. Requires the\nModelMetadata/ModelCacheEntry CRDs and namespace RBAC. The namespace\ncomes from the downward API (POD_NAMESPACE)."
+                      description: "CRD-backed storage in the server's own namespace. Requires the ModelMetadata/ModelCacheEntry CRDs and namespace RBAC. The namespace comes from the downward API (POD_NAMESPACE)."
                       type: object
                     redis:
                       description: External Redis via REDIS_URL.
@@ -305,13 +308,14 @@ spec:
                       required:
                         - url
                       type: object
+                      x-kubernetes-validations: []
                   type: object
                 networkPolicy:
-                  description: "Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane\nonly; worker-to-worker RDMA never crosses the CNI."
+                  description: Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane only; worker-to-worker RDMA never crosses the CNI.
                   nullable: true
                   properties:
                     allowFrom:
-                      description: "Who may connect. Deliberately required and non-empty: an empty `from`\nin a NetworkPolicy rule means allow-everywhere, which is what *not*\nsetting networkPolicy already gives you."
+                      description: "Who may connect. Deliberately required and non-empty: an empty `from` in a NetworkPolicy rule means allow-everywhere, which is what *not* setting networkPolicy already gives you."
                       items:
                         description: NetworkPolicyPeer describes a peer to allow traffic to/from. Only certain combinations of fields are allowed
                         properties:
@@ -396,8 +400,9 @@ spec:
                   required:
                     - allowFrom
                   type: object
+                  x-kubernetes-validations: []
                 podMetadata:
-                  description: "Extra labels/annotations for the server pods. The escape hatch for\nmesh sidecar injection, ambient enrollment, scrape annotations, etc.\nOperator-owned selector labels win on conflict."
+                  description: "Extra labels/annotations for the server pods. The escape hatch for mesh sidecar injection, ambient enrollment, scrape annotations, etc. Operator-owned selector labels win on conflict."
                   nullable: true
                   properties:
                     annotations:
@@ -458,7 +463,7 @@ spec:
                       rule: "!has(self.heartbeatTimeoutSecs) || !has(self.gcTimeoutSecs) || self.gcTimeoutSecs >= self.heartbeatTimeoutSecs"
                 replicas:
                   default: 1
-                  description: "Replicas are stateless and share no locks; safe to scale as long as the\ncache volume is RWX or per-replica."
+                  description: Replicas are stateless and share no locks; safe to scale as long as the cache volume is RWX or per-replica.
                   format: int32
                   type: integer
                   x-kubernetes-validations:
@@ -471,7 +476,7 @@ spec:
                     allowedServiceAccounts:
                       description: "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS (rendered `ns:sa,...`)."
                       items:
-                        description: "An allowed caller, rendered as `<namespace>:<serviceAccount>`.\nmaxLength bounds keep the regex rules inside the apiserver's CEL cost\nbudget; unbounded strings get costed at worst case and rejected."
+                        description: "An allowed caller, rendered as `<namespace>:<serviceAccount>`. maxLength bounds keep the regex rules inside the apiserver's CEL cost budget; unbounded strings get costed at worst case and rejected."
                         properties:
                           namespace:
                             maxLength: 63
@@ -489,6 +494,7 @@ spec:
                           - namespace
                           - serviceAccount
                         type: object
+                        x-kubernetes-validations: []
                       maxItems: 256
                       type: array
                     cacheTtlSecs:
@@ -515,7 +521,7 @@ spec:
                     - message: enforce mode requires tokenAudiences and allowedServiceAccounts
                       rule: "!(has(self.mode) && self.mode == 'enforce') || (has(self.tokenAudiences) && size(self.tokenAudiences) > 0 && has(self.allowedServiceAccounts) && size(self.allowedServiceAccounts) > 0)"
                 serviceAccountName:
-                  description: "Run the server as an existing ServiceAccount instead of the generated\n`<cr-name>-server`. Binding the metadata Role to it becomes your job."
+                  description: "Run the server as an existing ServiceAccount instead of the generated `<cr-name>-server`. Binding the metadata Role to it becomes your job."
                   maxLength: 253
                   nullable: true
                   type: string

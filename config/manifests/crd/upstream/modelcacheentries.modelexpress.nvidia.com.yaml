@@ -8,6 +8,7 @@ metadata:
 spec:
   group: modelexpress.nvidia.com
   names:
+    categories: []
     kind: ModelCacheEntry
     plural: modelcacheentries
     shortNames:
@@ -15,7 +16,8 @@ spec:
     singular: modelcacheentry
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns: []
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for ModelCacheEntrySpec via `CustomResource`
@@ -24,10 +26,7 @@ spec:
             description: ModelCacheEntry spec - desired state. One CR per cached model.
             properties:
               modelName:
-                description: |-
-                  Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so
-                  operators can recover the original name even when the CR's metadata.name is a
-                  sanitized/hashed form.
+                description: Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so operators can recover the original name even when the CR's metadata.name is a sanitized/hashed form.
                 type: string
               provider:
                 description: Provider string — `"HuggingFace"`, `"Ngc"`, or `"Gcs"`.
@@ -53,9 +52,7 @@ spec:
                 nullable: true
                 type: string
               leaseExpiresAt:
-                description: |-
-                  Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value
-                  to measure liveness locally instead of comparing clocks across replicas.
+                description: Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value to measure liveness locally instead of comparing clocks across replicas.
                 nullable: true
                 type: string
               message:
@@ -64,9 +61,7 @@ spec:
                 type: string
               phase:
                 default: ''
-                description: |-
-                  One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created
-                  records that haven't yet received a status patch.
+                description: One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created records that haven't yet received a status patch.
                 type: string
             type: object
         required:
