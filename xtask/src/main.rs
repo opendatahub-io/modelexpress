@@ -44,14 +44,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate CRD manifests into config/crd/
+    /// Generate CRD manifests into config/manifests/crd/
     Crdgen {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
         #[arg(long)]
         check: bool,
     },
-    /// Generate the operator's deploy manifests into config/rbac/, config/manager/
-    /// and config/base/params.env
+    /// Generate the operator's deploy manifests into config/manifests/rbac/,
+    /// config/manifests/manager/ and config/manifests/base/params.env
     Manifests {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
         #[arg(long)]
@@ -65,6 +65,13 @@ fn repo_root() -> PathBuf {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Root of the packaged kustomize tree. Everything generated here is a
+/// resource of one of its kustomizations, so generating anywhere else
+/// produces files nothing deploys.
+fn manifests_root() -> PathBuf {
+    repo_root().join("config/manifests")
 }
 
 fn write(path: &Path, contents: &str) -> Result<()> {
@@ -119,7 +126,7 @@ fn main() -> Result<()> {
 /// generated from the pinned modelexpress-types crate (guaranteed to match
 /// the linked server version, unlike vendored YAML).
 fn all_crds() -> Result<Vec<(PathBuf, String)>> {
-    let dir = repo_root().join("config/crd");
+    let dir = manifests_root().join("crd");
     let mut out = Vec::new();
     let ours = generate_crd();
     for (crd, sub) in [
@@ -139,7 +146,7 @@ fn all_crds() -> Result<Vec<(PathBuf, String)>> {
 }
 
 fn manifests() -> Result<Vec<(PathBuf, String)>> {
-    let config = repo_root().join("config");
+    let config = manifests_root();
     let rbac = config.join("rbac");
     let params = format!(
         "MODELEXPRESS_OPERATOR_IMAGE={}:{}\n",
