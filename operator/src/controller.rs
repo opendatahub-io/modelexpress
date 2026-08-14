@@ -24,6 +24,8 @@ use std::time::Duration;
 
 pub const FIELD_MANAGER: &str = "modelexpress-operator";
 
+const WATCH_TIMEOUT_SECS: u32 = 290;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("kube api: {0}")]
@@ -62,25 +64,30 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
 
     // Unfiltered these cache every object of their kind in the cluster, and
     // ServiceAccounts and RoleBindings run to thousands in a real one.
-    let owned = watcher::Config::default().labels(labels::MANAGED_BY_SELECTOR);
+    let owned = watcher::Config::default()
+        .labels(labels::MANAGED_BY_SELECTOR)
+        .timeout(WATCH_TIMEOUT_SECS);
 
-    Controller::new(servers, watcher::Config::default())
-        .owns_stream(owned_meta(deployments, owned.clone()))
-        .owns_stream(owned_meta(services, owned.clone()))
-        .owns_stream(owned_meta(pvcs, owned.clone()))
-        .owns_stream(owned_meta(netpols, owned.clone()))
-        .owns_stream(owned_meta(sas, owned.clone()))
-        .owns_stream(owned_meta(roles, owned.clone()))
-        .owns_stream(owned_meta(bindings, owned))
-        .shutdown_on_signal()
-        .run(reconcile, error_policy, Arc::new(Ctx { client }))
-        .for_each(|result| async move {
-            match result {
-                Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
-                Err(err) => tracing::warn!(%err, "reconcile failed"),
-            }
-        })
-        .await;
+    Controller::new(
+        servers,
+        watcher::Config::default().timeout(WATCH_TIMEOUT_SECS),
+    )
+    .owns_stream(owned_meta(deployments, owned.clone()))
+    .owns_stream(owned_meta(services, owned.clone()))
+    .owns_stream(owned_meta(pvcs, owned.clone()))
+    .owns_stream(owned_meta(netpols, owned.clone()))
+    .owns_stream(owned_meta(sas, owned.clone()))
+    .owns_stream(owned_meta(roles, owned.clone()))
+    .owns_stream(owned_meta(bindings, owned))
+    .shutdown_on_signal()
+    .run(reconcile, error_policy, Arc::new(Ctx { client }))
+    .for_each(|result| async move {
+        match result {
+            Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
+            Err(err) => tracing::warn!(%err, "reconcile failed"),
+        }
+    })
+    .await;
     Ok(())
 }
 
