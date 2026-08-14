@@ -55,7 +55,7 @@ COPY NOTICES /app/NOTICES
 LABEL com.redhat.component="odh-modelexpress-container" \
       description="ModelExpress coordinator server for model routing and P2P metadata" \
       summary="ModelExpress coordinator server for model routing and P2P metadata" \
-      name="rhoai/odh-modelexpress-rhel9" \
+      name="odh-modelexpress-rhel9" \
       maintainer="['managed-open-data-hub@redhat.com']" \
       io.openshift.expose-services="8001:grpc" \
       io.k8s.display-name="odh-modelexpress" \

@@ -30,13 +30,13 @@ COPY --from=build --chmod=0555 /modelexpress-operator /usr/local/bin/modelexpres
 LABEL com.redhat.component="odh-modelexpress-operator-container" \
       description="Kubernetes operator for ModelExpress model routing" \
       summary="Kubernetes operator for ModelExpress model routing" \
-      name="rhoai/odh-modelexpress-operator-rhel9" \
+      name="odh-modelexpress-operator-rhel9" \
       maintainer="['managed-open-data-hub@redhat.com']" \
       io.openshift.expose-services="8080:http" \
       io.k8s.display-name="odh-modelexpress-operator" \
       io.k8s.description="odh-modelexpress-operator" \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
 
-USER 1000:1000
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/modelexpress-operator"]
