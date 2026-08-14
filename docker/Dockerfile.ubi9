@@ -62,7 +62,7 @@ LABEL com.redhat.component="odh-modelexpress-container" \
       io.k8s.description="odh-modelexpress" \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
 
-USER 1000:1000
+USER 65532:65532
 EXPOSE 8001
 
 ENV MODEL_EXPRESS_SERVER_PORT=8001
