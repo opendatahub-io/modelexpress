@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["tls-rustls"]
+# FIPS builds: RHEL's openssl is validated, ring and aws-lc-rs are not.
+openssl = ["tls-openssl"]
+tls-openssl = ["kube/openssl-tls"]
+tls-rustls = ["kube/rustls-tls"]
+
+[dependencies]
+modelexpress-operator = { path = "../operator" }
+kube = { workspace = true }
+# the server's own CRD types, so generated manifests cannot drift from
+# what the server actually reads and writes
+modelexpress-server = { workspace = true, features = ["tls-rustls"] }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

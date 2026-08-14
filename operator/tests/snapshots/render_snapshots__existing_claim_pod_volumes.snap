@@ -1,0 +1,7 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: volumes(&state)
+---
+- name: model-cache
+  persistentVolumeClaim:
+    claimName: shared-models

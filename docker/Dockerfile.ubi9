@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress coordinator (server) image for RHEL/UBI9.
+#
+# Multi-stage build that compiles the server from source on UBI9.
+# Replaces the upstream Dockerfile's Ubuntu base with UBI9 for
+# Red Hat / Konflux builds.
+#
+# Built --no-default-features --features openssl for FIPS. That drops the gcs
+# feature along with rustls, so this image cannot pull models from GCS:
+# google-cloud-auth hardcodes rustls. HuggingFace and NGC are unaffected.
+
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae604b5f072e1833b2bde417a0ffd4afd938b96 AS build
+
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
+        rust cargo cmake gcc gcc-c++ perl \
+        openssl-devel git-core unzip \
+    && dnf clean all
+
+# prost-build has needed a system protoc since 0.11, and RHEL ships no protoc
+# RPM (only protobuf-c). Fetch the upstream release, checksum-pinned per arch.
+# Konflux hermetic builds will take these through the generic fetcher instead.
+ARG PROTOC_VERSION=35.1
+ARG PROTOC_SHA256_X86_64=6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7
+ARG PROTOC_SHA256_AARCH_64=01bf9d08808c7f96678b63f4bd8efa559bb4f83d5a7a270d5edaf507f9d5d9cf
+RUN set -eux; \
+    case "$(uname -m)" in \
+        x86_64)  PROTOC_ARCH=x86_64;  PROTOC_SHA256="${PROTOC_SHA256_X86_64}"  ;; \
+        aarch64) PROTOC_ARCH=aarch_64; PROTOC_SHA256="${PROTOC_SHA256_AARCH_64}" ;; \
+        *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/protoc.zip \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"; \
+    echo "${PROTOC_SHA256}  /tmp/protoc.zip" | sha256sum -c -; \
+    unzip -q /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'; \
+    rm -f /tmp/protoc.zip; \
+    protoc --version
+
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin modelexpress-server \
+        --no-default-features --features openssl \
+    && cp target/release/modelexpress-server /modelexpress-server
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
+
+RUN microdnf install -y --nodocs ca-certificates openssl-libs \
+    && microdnf clean all
+
+COPY --from=build --chmod=0555 /modelexpress-server /usr/local/bin/modelexpress-server
+
+COPY NOTICES /app/NOTICES
+
+LABEL com.redhat.component="odh-modelexpress-container" \
+      description="ModelExpress coordinator server for model routing and P2P metadata" \
+      summary="ModelExpress coordinator server for model routing and P2P metadata" \
+      name="odh-modelexpress-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="8001:grpc" \
+      io.k8s.display-name="odh-modelexpress" \
+      io.k8s.description="odh-modelexpress" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+USER 65532:65532
+EXPOSE 8001
+
+ENV MODEL_EXPRESS_SERVER_PORT=8001
+ENV MODEL_EXPRESS_LOG_LEVEL=info
+
+ENTRYPOINT ["/usr/local/bin/modelexpress-server"]

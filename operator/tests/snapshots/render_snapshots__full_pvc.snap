@@ -1,0 +1,20 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: "state.pvc.expect(\"managed pvc\")"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: mx-full
+    app.kubernetes.io/managed-by: modelexpress-operator
+    app.kubernetes.io/name: modelexpress-server
+    team: llm-d
+  name: mx-full-model-cache
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: ceph-fs

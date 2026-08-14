@@ -1,0 +1,7 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: volumes(&state)
+---
+- emptyDir:
+    sizeLimit: 200Gi
+  name: model-cache

@@ -1,0 +1,101 @@
+---
+source: operator/tests/render_snapshots.rs
+expression: state.deployment
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: mx-full
+    app.kubernetes.io/managed-by: modelexpress-operator
+    app.kubernetes.io/name: modelexpress-server
+    istio.io/dataplane-mode: ambient
+  name: mx-full
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: mx-full
+      app.kubernetes.io/name: modelexpress-server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: mx-full
+        app.kubernetes.io/managed-by: modelexpress-operator
+        app.kubernetes.io/name: modelexpress-server
+        istio.io/dataplane-mode: ambient
+    spec:
+      containers:
+        - env:
+            - name: MX_METADATA_BACKEND
+              value: redis
+            - name: REDIS_URL
+              value: "redis://mx-redis:6379"
+            - name: MODEL_EXPRESS_SERVER_PORT
+              value: "8001"
+            - name: MODEL_EXPRESS_LOG_LEVEL
+              value: debug
+            - name: MODEL_EXPRESS_LOG_FORMAT
+              value: json
+            - name: MODEL_EXPRESS_CACHE_DIRECTORY
+              value: /cache
+            - name: MODEL_EXPRESS_CACHE_EVICTION_ENABLED
+              value: "true"
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: enforce
+            - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+              value: mx
+            - name: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
+              value: "llm-d:decode"
+            - name: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+              value: "120"
+            - name: MX_REAPER_SCAN_INTERVAL_SECS
+              value: "10"
+            - name: MX_HEARTBEAT_TIMEOUT_SECS
+              value: "30"
+            - name: MX_GC_TIMEOUT_SECS
+              value: "600"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: HF_TOKEN
+                  name: hf-secret
+                  optional: false
+          image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0"
+          livenessProbe:
+            grpc:
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          name: server
+          ports:
+            - containerPort: 8001
+              name: grpc
+          readinessProbe:
+            grpc:
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          volumeMounts:
+            - mountPath: /cache
+              name: model-cache
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: mx-full-server
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: mx-full-model-cache
