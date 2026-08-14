@@ -40,10 +40,12 @@ jobs:
             ${{ runner.os }}-cargo-xtask-
             ${{ runner.os }}-cargo-
 
+      # protoc: xtask reads the CRD types from modelexpress-server, which pulls
+      # modelexpress-common and runs tonic-build at compile time
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
 
       - name: Check CRDs
         run: cargo run --package xtask -- crdgen --check
