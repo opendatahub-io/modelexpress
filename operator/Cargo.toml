@@ -19,7 +19,6 @@ tls-rustls = ["kube/rustls-tls"]
 # unstable-runtime: Controller::owns_stream, needed to feed metadata-only
 # watches in place of the full-object ones Controller::owns builds
 kube = { workspace = true, features = ["unstable-runtime"] }
-modelexpress-types = { workspace = true }
 k8s-openapi = { workspace = true, features = ["schemars"] }
 schemars = { workspace = true }
 serde = { workspace = true }
@@ -35,6 +34,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
+# only to assert our env-var names match the server's; not linked into the binary
+modelexpress-common = { workspace = true, features = ["tls-rustls"] }
 serde_norway = "0.9"
 insta = { version = "1", features = ["yaml", "redactions"] }
 

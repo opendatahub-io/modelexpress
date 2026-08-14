@@ -6,8 +6,8 @@ mod objects;
 use clap::{Parser, Subcommand};
 use kube::CustomResourceExt;
 use modelexpress_operator::crd::generate_crd;
-use modelexpress_types::p2p::ModelMetadata;
-use modelexpress_types::registry::ModelCacheEntry;
+use modelexpress_server::p2p::k8s_types::ModelMetadata;
+use modelexpress_server::registry::k8s_types::ModelCacheEntry;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]

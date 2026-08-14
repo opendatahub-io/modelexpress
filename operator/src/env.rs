@@ -6,15 +6,28 @@
 use crate::crd::{MetadataBackend, ModelExpressServerSpec, SecretKeyRef};
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, ObjectFieldSelector, SecretKeySelector};
 
-// re-exported so operator code and tests don't each depend on the types crate
-pub use modelexpress_types::envs::{
-    HF_TOKEN, MODEL_EXPRESS_CACHE_DIRECTORY, MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
-    MODEL_EXPRESS_LOG_FORMAT, MODEL_EXPRESS_LOG_LEVEL,
-    MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS, MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
-    MODEL_EXPRESS_SECURITY_MODE, MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES, MODEL_EXPRESS_SERVER_PORT,
-    MX_GC_TIMEOUT_SECS, MX_HEARTBEAT_TIMEOUT_SECS, MX_METADATA_BACKEND,
-    MX_REAPER_SCAN_INTERVAL_SECS, NGC_API_KEY, POD_NAMESPACE, REDIS_URL,
-};
+// The subset of the server's env vars the operator sets. Declared here rather
+// than taken from modelexpress-common so the operator binary doesn't link the
+// gRPC and download stack for seventeen strings; `envs_match_the_server` fails
+// the build if they ever drift.
+pub const HF_TOKEN: &str = "HF_TOKEN";
+pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
+pub const MODEL_EXPRESS_CACHE_EVICTION_ENABLED: &str = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED";
+pub const MODEL_EXPRESS_LOG_FORMAT: &str = "MODEL_EXPRESS_LOG_FORMAT";
+pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
+pub const MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS: &str =
+    "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS";
+pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS";
+pub const MODEL_EXPRESS_SECURITY_MODE: &str = "MODEL_EXPRESS_SECURITY_MODE";
+pub const MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES: &str = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES";
+pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
+pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
+pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
+pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
+pub const MX_REAPER_SCAN_INTERVAL_SECS: &str = "MX_REAPER_SCAN_INTERVAL_SECS";
+pub const NGC_API_KEY: &str = "NGC_API_KEY";
+pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
+pub const REDIS_URL: &str = "REDIS_URL";
 
 fn literal(name: &str, value: impl Into<String>) -> EnvVar {
     EnvVar {
@@ -160,6 +173,56 @@ mod tests {
         AuthMode, CacheConfig, CredentialsConfig, LogConfig, LogFormat, LogLevel, ReaperConfig,
         RedisBackend, SecurityConfig, ServiceAccountRef,
     };
+
+    /// The operator writes these names, the server reads them. Renaming one on
+    /// either side without the other silently drops config, so pin them to the
+    /// server's own definitions.
+    #[test]
+    fn envs_match_the_server() {
+        use modelexpress_common::envs as server;
+        for (ours, theirs) in [
+            (HF_TOKEN, server::HF_TOKEN),
+            (
+                MODEL_EXPRESS_CACHE_DIRECTORY,
+                server::MODEL_EXPRESS_CACHE_DIRECTORY,
+            ),
+            (
+                MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
+                server::MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
+            ),
+            (MODEL_EXPRESS_LOG_FORMAT, server::MODEL_EXPRESS_LOG_FORMAT),
+            (MODEL_EXPRESS_LOG_LEVEL, server::MODEL_EXPRESS_LOG_LEVEL),
+            (
+                MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS,
+                server::MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS,
+            ),
+            (
+                MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
+                server::MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
+            ),
+            (
+                MODEL_EXPRESS_SECURITY_MODE,
+                server::MODEL_EXPRESS_SECURITY_MODE,
+            ),
+            (
+                MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
+                server::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
+            ),
+            (MODEL_EXPRESS_SERVER_PORT, server::MODEL_EXPRESS_SERVER_PORT),
+            (MX_GC_TIMEOUT_SECS, server::MX_GC_TIMEOUT_SECS),
+            (MX_HEARTBEAT_TIMEOUT_SECS, server::MX_HEARTBEAT_TIMEOUT_SECS),
+            (MX_METADATA_BACKEND, server::MX_METADATA_BACKEND),
+            (
+                MX_REAPER_SCAN_INTERVAL_SECS,
+                server::MX_REAPER_SCAN_INTERVAL_SECS,
+            ),
+            (NGC_API_KEY, server::NGC_API_KEY),
+            (POD_NAMESPACE, server::POD_NAMESPACE),
+            (REDIS_URL, server::REDIS_URL),
+        ] {
+            assert_eq!(ours, theirs);
+        }
+    }
 
     fn base_spec(backend: MetadataBackend) -> ModelExpressServerSpec {
         ModelExpressServerSpec {

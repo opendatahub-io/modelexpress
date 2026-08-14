@@ -7,7 +7,6 @@ members = [
     "modelexpress_server", # modelexpress-server
     "modelexpress_client", # modelexpress-client
     "modelexpress_common", # modelexpress-common
-    "modelexpress_types",  # modelexpress-types
     "operator",
     "xtask",
     "workspace-tests",
@@ -75,7 +74,6 @@ k8s-openapi = { version = "0.24", features = ["v1_31"] }
 schemars = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-modelexpress-types = { path = "modelexpress_types", version = "0.5.0" }
 serde_norway = "0.9"
 
 [workspace.lints.clippy]

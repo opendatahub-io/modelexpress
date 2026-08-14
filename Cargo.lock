@@ -2692,7 +2692,7 @@ dependencies = [
  "kube",
  "metrics",
  "metrics-exporter-prometheus",
- "modelexpress-types",
+ "modelexpress-common",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -2745,18 +2745,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "modelexpress-types"
-version = "0.5.0"
-dependencies = [
- "chrono",
- "k8s-openapi",
- "kube",
- "schemars 0.8.22",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -5698,7 +5686,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "modelexpress-operator",
- "modelexpress-types",
+ "modelexpress-server",
  "serde",
  "serde_norway",
  "thiserror 2.0.16",
