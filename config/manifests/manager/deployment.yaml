@@ -22,7 +22,12 @@ spec:
         app.kubernetes.io/name: modelexpress-operator
     spec:
       containers:
-      - image: quay.io/opendatahub/odh-modelexpress-operator:latest
+      - env:
+        - name: CONTROLLER_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        image: quay.io/opendatahub/odh-modelexpress-operator:latest
         livenessProbe:
           httpGet:
             path: /healthz

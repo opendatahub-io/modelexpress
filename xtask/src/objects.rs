@@ -6,14 +6,16 @@
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, HTTPGetAction, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
+    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    ObjectFieldSelector, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+    SeccompProfile, SecurityContext, ServiceAccount,
 };
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
+use modelexpress_operator::controller;
 use modelexpress_operator::crd::API_GROUP;
 use modelexpress_operator::telemetry;
 use std::collections::BTreeMap;
@@ -89,6 +91,12 @@ pub fn cluster_role_rules() -> Vec<PolicyRule> {
             api_groups: Some(vec!["rbac.authorization.k8s.io".to_string()]),
             resources: Some(vec!["roles".to_string(), "rolebindings".to_string()]),
             verbs: crud(),
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["events.k8s.io".to_string()]),
+            resources: Some(vec!["events".to_string()]),
+            verbs: ["create", "patch"].map(String::from).to_vec(),
             ..PolicyRule::default()
         },
     ];
@@ -226,6 +234,17 @@ pub fn deployment(image: &str) -> Deployment {
                             name: Some(telemetry::PORT_NAME.to_string()),
                             container_port: telemetry::PORT,
                             ..ContainerPort::default()
+                        }]),
+                        env: Some(vec![EnvVar {
+                            name: controller::POD_NAME_ENV.to_string(),
+                            value_from: Some(EnvVarSource {
+                                field_ref: Some(ObjectFieldSelector {
+                                    field_path: "metadata.name".to_string(),
+                                    api_version: None,
+                                }),
+                                ..EnvVarSource::default()
+                            }),
+                            ..EnvVar::default()
                         }]),
                         liveness_probe: Some(http_probe("/healthz")),
                         readiness_probe: Some(http_probe("/readyz")),

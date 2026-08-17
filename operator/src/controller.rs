@@ -16,6 +16,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{Api, ObjectMeta, PartialObjectMeta, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Event as K8sEvent, EventType, Recorder, Reporter};
 use kube::runtime::watcher;
 use kube::runtime::watcher::metadata_watcher;
 use kube::{Client, Resource, ResourceExt};
@@ -52,6 +53,18 @@ pub enum Error {
 
 pub struct Ctx {
     pub client: Client,
+    pub recorder: Recorder,
+}
+
+pub const POD_NAME_ENV: &str = "CONTROLLER_POD_NAME";
+
+fn reporter() -> Reporter {
+    Reporter {
+        controller: FIELD_MANAGER.to_string(),
+        instance: std::env::var(POD_NAME_ENV)
+            .ok()
+            .filter(|instance| !instance.is_empty()),
+    }
 }
 
 pub async fn run(client: Client) -> Result<(), kube::Error> {
@@ -83,7 +96,14 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     .owns_stream(owned_meta(roles, owned.clone()))
     .owns_stream(owned_meta(bindings, owned))
     .shutdown_on_signal()
-    .run(reconcile, error_policy, Arc::new(Ctx { client }))
+    .run(
+        reconcile,
+        error_policy,
+        Arc::new(Ctx {
+            recorder: Recorder::new(client.clone(), reporter()),
+            client,
+        }),
+    )
     .for_each(|result| async move {
         match result {
             Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
@@ -147,9 +167,54 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
             cr.status.as_ref().and_then(|s| s.observed_generation),
         ),
     };
+    let announce = condition_changed(ready_condition_of(&cr), &condition).then(|| K8sEvent {
+        type_: event_type(&condition),
+        reason: condition.reason.clone(),
+        note: note(&condition.message),
+        action: RECONCILE_ACTION.to_string(),
+        secondary: None,
+    });
     write_status(&ns, &name, &ctx, condition, endpoint, observed_generation).await?;
+    if let Some(event) = announce
+        && let Err(err) = ctx.recorder.publish(&event, &cr.object_ref(&())).await
+    {
+        tracing::warn!(%err, "publishing event failed");
+    }
 
     result.map(|rollout| Action::requeue(rollout.requeue()))
+}
+
+const RECONCILE_ACTION: &str = "Reconcile";
+const NOTE_LIMIT: usize = 1000;
+
+fn ready_condition_of(cr: &ModelExpressServer) -> Option<&Condition> {
+    cr.status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == READY_CONDITION))
+}
+
+fn condition_changed(previous: Option<&Condition>, next: &Condition) -> bool {
+    match previous {
+        Some(prev) => {
+            prev.status != next.status || prev.reason != next.reason || prev.message != next.message
+        }
+        None => true,
+    }
+}
+
+fn event_type(condition: &Condition) -> EventType {
+    if condition.status == "True" || condition.reason == PROGRESSING_REASON {
+        EventType::Normal
+    } else {
+        EventType::Warning
+    }
+}
+
+fn note(message: &str) -> Option<String> {
+    if message.is_empty() {
+        return None;
+    }
+    Some(message.chars().take(NOTE_LIMIT).collect())
 }
 
 enum Rollout {
@@ -468,10 +533,7 @@ fn ready_condition(
     reason: &str,
     message: &str,
 ) -> Condition {
-    let previous = cr
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.iter().find(|c| c.type_ == READY_CONDITION));
+    let previous = ready_condition_of(cr);
     let last_transition_time = match previous {
         Some(prev) if prev.status == status && prev.reason == reason && prev.message == message => {
             prev.last_transition_time.clone()
@@ -696,6 +758,74 @@ mod tests {
 
     fn progressing(status: &str) -> DeploymentCondition {
         dep_condition("Progressing", status, "ReplicaSetUpdated", "rolling out")
+    }
+
+    #[test]
+    fn a_steady_state_publishes_nothing() {
+        let now = chrono::Utc::now();
+        let held = stamped(now, "True", "Available");
+        let mut next = stamped(now, "True", "Available");
+        next.last_transition_time = Time(now + chrono::Duration::minutes(5));
+        assert!(
+            !condition_changed(Some(&held), &next),
+            "a requeue that changes nothing must not publish an event"
+        );
+    }
+
+    #[test]
+    fn every_visible_change_publishes() {
+        let now = chrono::Utc::now();
+        let held = stamped(now, "True", "Available");
+
+        let mut flipped = stamped(now, "False", "Available");
+        flipped.message = "resources applied".to_string();
+        assert!(condition_changed(Some(&held), &flipped), "status changed");
+
+        let mut rereasoned = stamped(now, "True", "RolloutInProgress");
+        rereasoned.message = "resources applied".to_string();
+        assert!(
+            condition_changed(Some(&held), &rereasoned),
+            "reason changed"
+        );
+
+        let mut remessaged = stamped(now, "True", "Available");
+        remessaged.message = "2/3 replicas available".to_string();
+        assert!(
+            condition_changed(Some(&held), &remessaged),
+            "message changed"
+        );
+
+        assert!(
+            condition_changed(None, &held),
+            "the first reconcile has nothing to compare against"
+        );
+    }
+
+    #[test]
+    fn only_actionable_states_warn() {
+        let now = chrono::Utc::now();
+        for (status, reason, expected) in [
+            ("True", AVAILABLE_REASON, EventType::Normal),
+            ("False", PROGRESSING_REASON, EventType::Normal),
+            ("False", "ProgressDeadlineExceeded", EventType::Warning),
+            ("False", "ApplyFailed", EventType::Warning),
+            ("False", "CacheClaimMissing", EventType::Warning),
+            ("False", "CacheClaimSingleNode", EventType::Warning),
+        ] {
+            assert_eq!(
+                event_type(&stamped(now, status, reason)),
+                expected,
+                "{status}/{reason} classified wrong; a rollout in flight is not a problem"
+            );
+        }
+    }
+
+    #[test]
+    fn a_note_stays_inside_the_api_limit() {
+        assert_eq!(note(""), None);
+        assert_eq!(note("boom").as_deref(), Some("boom"));
+        let long = "x".repeat(4000);
+        assert_eq!(note(&long).expect("note").chars().count(), NOTE_LIMIT);
     }
 
     #[test]
