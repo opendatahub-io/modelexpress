@@ -95,6 +95,35 @@ fn full_spec() -> ModelExpressServerSpec {
             ),
             annotations: None,
         }),
+        node_selector: Some(
+            [("kubernetes.io/arch".to_string(), "arm64".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        tolerations: Some(vec![
+            serde_json::from_value(serde_json::json!({
+                "key": "nvidia.com/gpu",
+                "operator": "Exists",
+                "effect": "NoSchedule",
+            }))
+            .expect("toleration"),
+        ]),
+        affinity: Some(
+            serde_json::from_value(serde_json::json!({
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{
+                            "matchExpressions": [{
+                                "key": "kubernetes.io/os",
+                                "operator": "In",
+                                "values": ["linux"],
+                            }],
+                        }],
+                    },
+                },
+            }))
+            .expect("affinity"),
+        ),
         network_policy: Some(NetworkPolicyConfig {
             allow_from: vec![
                 serde_json::from_value(serde_json::json!({
