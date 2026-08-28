@@ -26,6 +26,9 @@ pub const FIELD_MANAGER: &str = "modelexpress-operator";
 
 const WATCH_TIMEOUT_SECS: u32 = 290;
 
+const READY_REQUEUE: Duration = Duration::from_secs(300);
+const ROLLOUT_REQUEUE: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("kube api: {0}")]
@@ -127,10 +130,12 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     let ns = cr.namespace().ok_or(Error::MissingNamespace)?;
     let name = cr.name_any();
 
-    let result = apply(&cr, &ns, &name, &ctx).await;
+    let result = apply(&cr, &ns, &name, &ctx)
+        .await
+        .map(|deployment| rollout_state(&deployment));
     let (condition, endpoint, observed_generation) = match &result {
-        Ok(()) => (
-            ready_condition(&cr, "True", "Applied", "resources applied"),
+        Ok(rollout) => (
+            ready_condition(&cr, rollout.status(), rollout.reason(), rollout.message()),
             Some(endpoint(&name, &ns, cr.spec.port)),
             cr.metadata.generation,
         ),
@@ -144,7 +149,112 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     };
     write_status(&ns, &name, &ctx, condition, endpoint, observed_generation).await?;
 
-    result.map(|()| Action::requeue(Duration::from_secs(300)))
+    result.map(|rollout| Action::requeue(rollout.requeue()))
+}
+
+enum Rollout {
+    Available { message: String },
+    NotReady { reason: String, message: String },
+}
+
+impl Rollout {
+    fn status(&self) -> &'static str {
+        match self {
+            Rollout::Available { .. } => "True",
+            Rollout::NotReady { .. } => "False",
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Rollout::Available { .. } => AVAILABLE_REASON,
+            Rollout::NotReady { reason, .. } => reason,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Rollout::Available { message } | Rollout::NotReady { message, .. } => message,
+        }
+    }
+
+    fn requeue(&self) -> Duration {
+        match self {
+            Rollout::Available { .. } => READY_REQUEUE,
+            Rollout::NotReady { .. } => ROLLOUT_REQUEUE,
+        }
+    }
+}
+
+const AVAILABLE_REASON: &str = "Available";
+const PROGRESSING_REASON: &str = "RolloutInProgress";
+
+fn rollout_state(deployment: &Deployment) -> Rollout {
+    let status = deployment.status.as_ref();
+    let field = |get: fn(&k8s_openapi::api::apps::v1::DeploymentStatus) -> Option<i32>| {
+        status.and_then(get).unwrap_or_default()
+    };
+
+    let observed = status
+        .and_then(|s| s.observed_generation)
+        .unwrap_or_default();
+    if observed < deployment.metadata.generation.unwrap_or_default() {
+        return Rollout::NotReady {
+            reason: PROGRESSING_REASON.to_string(),
+            message: "waiting for the deployment controller to observe the update".to_string(),
+        };
+    }
+
+    let stalled = status
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == "Progressing" && c.status == "False");
+    if let Some(stalled) = stalled {
+        return Rollout::NotReady {
+            reason: stalled
+                .reason
+                .clone()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| PROGRESSING_REASON.to_string()),
+            message: stalled
+                .message
+                .clone()
+                .unwrap_or_else(|| "rollout stalled".to_string()),
+        };
+    }
+
+    let desired = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let updated = field(|s| s.updated_replicas);
+    let total = field(|s| s.replicas);
+    let available = field(|s| s.available_replicas);
+
+    let progress = if updated < desired {
+        Some(format!("{updated}/{desired} replicas updated"))
+    } else if total > updated {
+        Some(format!(
+            "{} old replicas pending termination",
+            total.saturating_sub(updated)
+        ))
+    } else if available < updated {
+        Some(format!("{available}/{updated} updated replicas available"))
+    } else {
+        None
+    };
+
+    match progress {
+        Some(message) => Rollout::NotReady {
+            reason: PROGRESSING_REASON.to_string(),
+            message,
+        },
+        None => Rollout::Available {
+            message: format!("{available}/{desired} replicas available"),
+        },
+    }
 }
 
 /// What clients set MODEL_EXPRESS_ENDPOINT to. The Service is always named
@@ -154,7 +264,12 @@ pub fn endpoint(name: &str, ns: &str, port: i32) -> String {
 }
 
 #[tracing::instrument(skip_all)]
-async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Result<(), Error> {
+async fn apply(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+) -> Result<Deployment, Error> {
     check_existing_claim(cr, ns, ctx).await?;
     let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
@@ -183,7 +298,7 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     }
 
     let api = Api::<Deployment>::namespaced(ctx.client.clone(), ns);
-    api.patch(name, &params, &Patch::Apply(&deployment)).await?;
+    let applied = api.patch(name, &params, &Patch::Apply(&deployment)).await?;
 
     let api = Api::<Service>::namespaced(ctx.client.clone(), ns);
     api.patch(name, &params, &Patch::Apply(&service)).await?;
@@ -200,7 +315,7 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     }
 
     tracing::debug!("desired state applied");
-    Ok(())
+    Ok(applied)
 }
 
 #[tracing::instrument(skip_all)]
@@ -419,6 +534,7 @@ fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Ac
 mod tests {
     use super::*;
     use crate::crd::{MetadataBackend, ModelExpressServerSpec, RedisBackend};
+    use k8s_openapi::api::apps::v1::{DeploymentCondition, DeploymentSpec, DeploymentStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 
     fn server(status: Option<ModelExpressServerStatus>) -> ModelExpressServer {
@@ -546,6 +662,202 @@ mod tests {
         assert!(next.last_transition_time.0 >= before);
         assert_eq!(next.type_, READY_CONDITION);
         assert_eq!(next.observed_generation, Some(1));
+    }
+
+    fn deployment(generation: i64, status: Option<DeploymentStatus>) -> Deployment {
+        Deployment {
+            metadata: ObjectMeta {
+                name: Some("mx".to_string()),
+                generation: Some(generation),
+                ..ObjectMeta::default()
+            },
+            spec: Some(DeploymentSpec {
+                replicas: Some(3),
+                ..DeploymentSpec::default()
+            }),
+            status,
+        }
+    }
+
+    fn dep_condition(
+        type_: &str,
+        status: &str,
+        reason: &str,
+        message: &str,
+    ) -> DeploymentCondition {
+        DeploymentCondition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+            ..DeploymentCondition::default()
+        }
+    }
+
+    fn progressing(status: &str) -> DeploymentCondition {
+        dep_condition("Progressing", status, "ReplicaSetUpdated", "rolling out")
+    }
+
+    #[test]
+    fn a_generation_the_deployment_controller_has_not_seen_is_not_ready() {
+        let state = rollout_state(&deployment(
+            2,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                available_replicas: Some(3),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(
+            state.status(),
+            "False",
+            "the previous spec's status must not report the new one ready"
+        );
+        assert_eq!(state.reason(), PROGRESSING_REASON);
+    }
+
+    #[test]
+    fn a_freshly_created_deployment_is_not_ready() {
+        let state = rollout_state(&deployment(1, None));
+        assert_eq!(state.status(), "False");
+        assert_eq!(state.requeue(), ROLLOUT_REQUEUE);
+    }
+
+    #[test]
+    fn a_fully_rolled_out_deployment_is_ready() {
+        let state = rollout_state(&deployment(
+            1,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                ready_replicas: Some(3),
+                available_replicas: Some(3),
+                conditions: Some(vec![dep_condition(
+                    "Progressing",
+                    "True",
+                    "NewReplicaSetAvailable",
+                    "replica set is available",
+                )]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.status(), "True");
+        assert_eq!(state.reason(), AVAILABLE_REASON);
+        assert_eq!(state.message(), "3/3 replicas available");
+        assert_eq!(state.requeue(), READY_REQUEUE);
+    }
+
+    #[test]
+    fn a_new_image_is_not_ready_while_the_old_pods_still_serve() {
+        let state = rollout_state(&deployment(
+            2,
+            Some(DeploymentStatus {
+                observed_generation: Some(2),
+                replicas: Some(4),
+                updated_replicas: Some(1),
+                ready_replicas: Some(3),
+                available_replicas: Some(3),
+                conditions: Some(vec![
+                    dep_condition("Available", "True", "MinimumReplicasAvailable", "available"),
+                    progressing("True"),
+                ]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.status(), "False");
+        assert_eq!(state.message(), "1/3 replicas updated");
+        assert_eq!(
+            state.requeue(),
+            ROLLOUT_REQUEUE,
+            "an unfinished rollout should be rechecked sooner than a settled one"
+        );
+    }
+
+    #[test]
+    fn old_replicas_still_terminating_are_not_ready() {
+        let state = rollout_state(&deployment(
+            1,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(4),
+                updated_replicas: Some(3),
+                available_replicas: Some(3),
+                conditions: Some(vec![progressing("True")]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.status(), "False");
+        assert_eq!(state.message(), "1 old replicas pending termination");
+    }
+
+    #[test]
+    fn updated_replicas_not_yet_serving_are_not_ready() {
+        let state = rollout_state(&deployment(
+            1,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                available_replicas: Some(2),
+                conditions: Some(vec![progressing("True")]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.status(), "False");
+        assert_eq!(state.message(), "2/3 updated replicas available");
+    }
+
+    #[test]
+    fn a_stalled_rollout_reports_the_deployments_own_reason() {
+        let state = rollout_state(&deployment(
+            1,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(3),
+                conditions: Some(vec![
+                    dep_condition(
+                        "Available",
+                        "False",
+                        "MinimumReplicasUnavailable",
+                        "unavailable",
+                    ),
+                    dep_condition(
+                        "Progressing",
+                        "False",
+                        "ProgressDeadlineExceeded",
+                        r#"ReplicaSet "mx-7c9f" has timed out progressing."#,
+                    ),
+                ]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.status(), "False");
+        assert_eq!(
+            state.reason(),
+            "ProgressDeadlineExceeded",
+            "an unpullable image must not read as a rollout still in progress"
+        );
+        assert!(state.message().contains("timed out"));
+    }
+
+    #[test]
+    fn a_stalled_rollout_without_a_reason_falls_back() {
+        let mut stalled = dep_condition("Progressing", "False", "", "");
+        stalled.reason = None;
+        stalled.message = None;
+        let state = rollout_state(&deployment(
+            1,
+            Some(DeploymentStatus {
+                observed_generation: Some(1),
+                conditions: Some(vec![stalled]),
+                ..DeploymentStatus::default()
+            }),
+        ));
+        assert_eq!(state.reason(), PROGRESSING_REASON, "reason is never empty");
+        assert!(!state.message().is_empty());
     }
 
     #[test]
