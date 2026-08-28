@@ -15,11 +15,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: ["--allow-multiple-documents"]
-        exclude: '^helm/templates/'
+        # Helm and envsubst templates are not YAML until rendered.
+        exclude: '^(helm/templates/|examples/rl/dynamo_vllm_refit/rl-job\.yaml$)'
       - id: check-toml
       - id: check-json
         exclude: .devcontainer
       - id: check-merge-conflict
+        # Generated third-party license text can contain separator lines.
+        exclude: '^NOTICES$'
       - id: check-added-large-files
         args: ["--maxkb=1000"]
       - id: check-case-conflict
