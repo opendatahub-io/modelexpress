@@ -134,9 +134,9 @@ pub fn cluster_role_binding() -> ClusterRoleBinding {
         subjects: Some(vec![Subject {
             kind: "ServiceAccount".to_string(),
             name: NAME.to_string(),
-            // placeholder; the kustomize namespace transformer sets the
-            // real install namespace
-            namespace: Some("modelexpress-operator-system".to_string()),
+            // the kustomize namespace transformer only rewrites a subject
+            // namespace that is `default` or absent
+            namespace: Some("default".to_string()),
             ..Subject::default()
         }]),
     }
