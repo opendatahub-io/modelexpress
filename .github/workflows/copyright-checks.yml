@@ -5,6 +5,9 @@ on:
 
 jobs:
   copyright-checks:
+      # The helm-tester image is private to ai-dynamo. Forks cannot pull it,
+      # even when the workflow has packages: read on their own repository.
+      if: github.repository == 'ai-dynamo/modelexpress'
       runs-on: ubuntu-24.04
       container:
         image: ghcr.io/ai-dynamo/dynamo/helm-tester:0.1.1
