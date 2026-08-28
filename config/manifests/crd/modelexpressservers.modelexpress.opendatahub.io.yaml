@@ -774,6 +774,27 @@ spec:
                 x-kubernetes-validations:
                 - message: image must not be empty
                   rule: self != ''
+              imagePullPolicy:
+                description: 'Pull policy for the server container. Kubernetes decides from the tag when unset: `Always` for `:latest`, `IfNotPresent` otherwise.'
+                enum:
+                - Always
+                - IfNotPresent
+                - Never
+                nullable: true
+                type: string
+              imagePullSecrets:
+                description: 'Pull secrets for `spec.image`. Needed for a private registry: the generated ServiceAccount is operator-owned, so a secret attached to it out of band is reverted on the next reconcile.'
+                items:
+                  description: LocalObjectReference contains enough information to let you locate the referenced object inside the same namespace.
+                  properties:
+                    name:
+                      description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                      type: string
+                  required:
+                  - name
+                  type: object
+                nullable: true
+                type: array
               log:
                 description: Logging, MODEL_EXPRESS_LOG_LEVEL / MODEL_EXPRESS_LOG_FORMAT.
                 nullable: true
@@ -968,6 +989,71 @@ spec:
                 x-kubernetes-validations:
                 - message: port must be 1-65535
                   rule: self > 0 && self < 65536
+              probes:
+                description: Probe timings. Startup governs how long a cold start may take before liveness begins; while it is failing, liveness and readiness are suspended.
+                nullable: true
+                properties:
+                  liveness:
+                    description: Overrides for one probe. Unset entries keep the operator's default.
+                    nullable: true
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      initialDelaySeconds:
+                        format: int32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  readiness:
+                    description: Overrides for one probe. Unset entries keep the operator's default.
+                    nullable: true
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      initialDelaySeconds:
+                        format: int32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  startup:
+                    description: Overrides for one probe. Unset entries keep the operator's default.
+                    nullable: true
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      initialDelaySeconds:
+                        format: int32
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    type: object
+                type: object
               reaper:
                 description: Stale-worker reaper timings, MX_REAPER_* / MX_HEARTBEAT_* / MX_GC_*.
                 nullable: true

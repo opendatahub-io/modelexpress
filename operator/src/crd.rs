@@ -97,6 +97,23 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
 
+    /// Pull secrets for `spec.image`. Needed for a private registry: the
+    /// generated ServiceAccount is operator-owned, so a secret attached to it
+    /// out of band is reverted on the next reconcile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_secrets: Option<Vec<k8s_openapi::api::core::v1::LocalObjectReference>>,
+
+    /// Pull policy for the server container. Kubernetes decides from the tag
+    /// when unset: `Always` for `:latest`, `IfNotPresent` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
+
+    /// Probe timings. Startup governs how long a cold start may take before
+    /// liveness begins; while it is failing, liveness and readiness are
+    /// suspended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<ProbeConfig>,
+
     /// Node labels the server pods must match. Required on clusters whose
     /// nodes are not interchangeable, e.g. a mixed-architecture cluster where
     /// `spec.image` only runs on one of them.
@@ -187,6 +204,55 @@ pub struct LogConfig {
     pub level: Option<LogLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<LogFormat>,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ImagePullPolicy {
+    Always,
+    IfNotPresent,
+    Never,
+}
+
+impl ImagePullPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::IfNotPresent => "IfNotPresent",
+            Self::Never => "Never",
+        }
+    }
+}
+
+impl From<ImagePullPolicy> for String {
+    fn from(policy: ImagePullPolicy) -> Self {
+        policy.as_str().to_string()
+    }
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<ProbeTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ProbeTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<ProbeTiming>,
+}
+
+/// Overrides for one probe. Unset entries keep the operator's default.
+#[derive(JsonSchema, Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeTiming {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub initial_delay_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub period_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub failure_threshold: Option<i32>,
 }
 
 /// Mirrors upstream LogLevel; env value is the lowercase name.

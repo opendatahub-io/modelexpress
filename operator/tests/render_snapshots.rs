@@ -8,9 +8,9 @@
 
 use modelexpress_operator::crd::{
     AuthMode, CacheConfig, CacheStorage, CredentialsConfig, EmptyDirStorage, ExistingClaimStorage,
-    LogConfig, LogFormat, LogLevel, ManagedPvcStorage, MetadataBackend, MetadataOverrides,
-    ModelExpressServerSpec, NetworkPolicyConfig, ReaperConfig, RedisBackend, SecretKeyRef,
-    SecurityConfig, ServiceAccountRef,
+    ImagePullPolicy, LogConfig, LogFormat, LogLevel, ManagedPvcStorage, MetadataBackend,
+    MetadataOverrides, ModelExpressServerSpec, NetworkPolicyConfig, ProbeConfig, ProbeTiming,
+    ReaperConfig, RedisBackend, SecretKeyRef, SecurityConfig, ServiceAccountRef,
 };
 use modelexpress_operator::deployment::render;
 
@@ -94,6 +94,19 @@ fn full_spec() -> ModelExpressServerSpec {
                     .collect(),
             ),
             annotations: None,
+        }),
+        image_pull_secrets: Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
+            name: "quay-pull".into(),
+        }]),
+        image_pull_policy: Some(ImagePullPolicy::Always),
+        probes: Some(ProbeConfig {
+            startup: Some(ProbeTiming {
+                initial_delay_seconds: None,
+                period_seconds: Some(10),
+                failure_threshold: Some(60),
+            }),
+            readiness: None,
+            liveness: None,
         }),
         node_selector: Some(
             [("kubernetes.io/arch".to_string(), "arm64".to_string())]

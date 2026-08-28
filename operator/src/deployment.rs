@@ -3,7 +3,7 @@
 
 //! Renders the Deployment and Service for a ModelExpressServer CR.
 
-use crate::crd::ModelExpressServerSpec;
+use crate::crd::{ModelExpressServerSpec, ProbeTiming};
 use crate::env::render_env;
 use crate::labels::{managed_labels, selector_labels};
 use crate::volume::{CacheVolume, render_cache_volume};
@@ -47,9 +47,12 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
     // The server wires tonic_health, so use real gRPC probes instead of the
     // chart's TCP socket checks. Liveness is deliberately laxer than
     // readiness: a slow backend should pull the pod from rotation, not
-    // restart it.
-    let readiness = grpc_probe(spec.port, 5, 10);
-    let liveness = grpc_probe(spec.port, 15, 30);
+    // restart it. Startup covers the cold start, during which the other two
+    // are suspended, so a slow cache scan cannot trip liveness.
+    let probes = spec.probes.unwrap_or_default();
+    let startup = grpc_probe(spec.port, timing(5, 5, 30), probes.startup);
+    let readiness = grpc_probe(spec.port, timing(5, 10, 3), probes.readiness);
+    let liveness = grpc_probe(spec.port, timing(15, 30, 3), probes.liveness);
 
     let container = Container {
         name: CONTAINER_NAME.to_string(),
@@ -61,8 +64,10 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
         }]),
         env: Some(render_env(spec)),
         volume_mounts: Some(vec![mount]),
+        startup_probe: Some(startup),
         readiness_probe: Some(readiness),
         liveness_probe: Some(liveness),
+        image_pull_policy: spec.image_pull_policy.map(Into::into),
         security_context: Some(container_security_context()),
         resources: Some(spec.resources.clone().unwrap_or_else(default_resources)),
         ..Container::default()
@@ -92,6 +97,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
                     security_context: Some(pod_security_context()),
                     volumes: Some(vec![volume]),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
+                    image_pull_secrets: spec.image_pull_secrets.clone(),
                     node_selector: spec.node_selector.clone(),
                     tolerations: spec.tolerations.clone(),
                     affinity: spec.affinity.clone(),
@@ -226,15 +232,27 @@ fn default_resources() -> ResourceRequirements {
     }
 }
 
-fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
+fn grpc_probe(port: i32, defaults: ProbeTiming, overrides: Option<ProbeTiming>) -> Probe {
+    let timing = overrides.unwrap_or_default();
     Probe {
         grpc: Some(GRPCAction {
             port,
             service: None,
         }),
+        initial_delay_seconds: timing
+            .initial_delay_seconds
+            .or(defaults.initial_delay_seconds),
+        period_seconds: timing.period_seconds.or(defaults.period_seconds),
+        failure_threshold: timing.failure_threshold.or(defaults.failure_threshold),
+        ..Probe::default()
+    }
+}
+
+const fn timing(initial_delay: i32, period: i32, failure_threshold: i32) -> ProbeTiming {
+    ProbeTiming {
         initial_delay_seconds: Some(initial_delay),
         period_seconds: Some(period),
-        ..Probe::default()
+        failure_threshold: Some(failure_threshold),
     }
 }
 
@@ -242,10 +260,13 @@ fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::crd::{CacheConfig, CacheStorage, ManagedPvcStorage, MetadataBackend, RedisBackend};
+    use crate::crd::{
+        CacheConfig, CacheStorage, ImagePullPolicy, ManagedPvcStorage, MetadataBackend,
+        ProbeConfig, RedisBackend,
+    };
     use k8s_openapi::api::core::v1::{
-        Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-        PersistentVolumeClaimSpec, Toleration, VolumeResourceRequirements,
+        Affinity, LocalObjectReference, NodeAffinity, NodeSelector, NodeSelectorRequirement,
+        NodeSelectorTerm, PersistentVolumeClaimSpec, Toleration, VolumeResourceRequirements,
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -265,6 +286,9 @@ mod tests {
             credentials: None,
             pod_metadata: None,
             resources: None,
+            image_pull_secrets: None,
+            image_pull_policy: None,
+            probes: None,
             node_selector: None,
             tolerations: None,
             affinity: None,
@@ -397,6 +421,75 @@ mod tests {
                 .node_affinity
                 .is_some()
         );
+    }
+
+    #[test]
+    fn startup_probe_covers_the_cold_start() {
+        let state = render("mx", &base_spec());
+        let startup = container(&state).startup_probe.as_ref().expect("startup");
+        // liveness must not be able to fire before startup has given up
+        assert_eq!(startup.initial_delay_seconds, Some(5));
+        assert_eq!(startup.period_seconds, Some(5));
+        assert_eq!(startup.failure_threshold, Some(30));
+        assert_eq!(startup.grpc.as_ref().expect("grpc").port, 8001);
+    }
+
+    #[test]
+    fn probe_timings_are_overridable_per_probe() {
+        let mut spec = base_spec();
+        spec.probes = Some(ProbeConfig {
+            startup: Some(ProbeTiming {
+                initial_delay_seconds: None,
+                period_seconds: Some(10),
+                failure_threshold: Some(60),
+            }),
+            readiness: None,
+            liveness: None,
+        });
+        let state = render("mx", &spec);
+        let c = container(&state);
+        let startup = c.startup_probe.as_ref().expect("startup");
+        assert_eq!(startup.period_seconds, Some(10));
+        assert_eq!(startup.failure_threshold, Some(60));
+        // unset entries fall back to the operator default
+        assert_eq!(startup.initial_delay_seconds, Some(5));
+        // an override on one probe must not touch the others
+        assert_eq!(
+            c.liveness_probe
+                .as_ref()
+                .expect("liveness")
+                .initial_delay_seconds,
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn pull_secrets_and_policy_reach_the_pod() {
+        let mut spec = base_spec();
+        spec.image_pull_secrets = Some(vec![LocalObjectReference {
+            name: "quay-pull".into(),
+        }]);
+        spec.image_pull_policy = Some(ImagePullPolicy::Always);
+        let state = render("mx", &spec);
+        assert_eq!(
+            pod_spec(&state)
+                .image_pull_secrets
+                .as_ref()
+                .expect("secrets")[0]
+                .name,
+            "quay-pull"
+        );
+        assert_eq!(
+            container(&state).image_pull_policy.as_deref(),
+            Some("Always")
+        );
+    }
+
+    #[test]
+    fn pull_policy_is_unset_by_default() {
+        let state = render("mx", &base_spec());
+        assert!(container(&state).image_pull_policy.is_none());
+        assert!(pod_spec(&state).image_pull_secrets.is_none());
     }
 
     #[test]

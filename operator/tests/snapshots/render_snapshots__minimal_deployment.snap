@@ -39,6 +39,7 @@ spec:
               value: /var/cache/modelexpress
           image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0"
           livenessProbe:
+            failureThreshold: 3
             grpc:
               port: 8001
             initialDelaySeconds: 15
@@ -48,6 +49,7 @@ spec:
             - containerPort: 8001
               name: grpc
           readinessProbe:
+            failureThreshold: 3
             grpc:
               port: 8001
             initialDelaySeconds: 5
@@ -62,6 +64,12 @@ spec:
               drop:
                 - ALL
             runAsNonRoot: true
+          startupProbe:
+            failureThreshold: 30
+            grpc:
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 5
           volumeMounts:
             - mountPath: /var/cache/modelexpress
               name: model-cache
