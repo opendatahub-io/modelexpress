@@ -30,13 +30,13 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 
 | Field | Example | Purpose |
 |-------|---------|---------|
-| `mx_version` | `"0.5.0"` | Format compatibility across upgrades |
+| `mx_version` | `"0.5.1"` | Format compatibility across upgrades |
 | `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE`, `TILELANG_CACHE`, `CUTE_DSL_CACHE`, `FLASHINFER_CACHE` | Type of source metadata being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
 | `pipeline_parallel_size` | `2` | PP degree |
-| `expert_parallel_size` | `4` | EP degree (MoE models) |
+| `expert_parallel_size` | `4` | EP world size, `1` when expert parallelism is off (MoE models) |
 | `dtype` | `"bfloat16"` | Weight data type |
 | `quantization` | `"fp8"`, `""` | Quantization method |
 | `extra_parameters` | `{}` | Framework-specific config |
@@ -264,7 +264,7 @@ No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by 
 ```
 # Source index -- identity stored once, workers as presence markers
 mx:source:a1b2c3d4e5f67890
-  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.5.0",...}
+  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.5.1",...}
   f3a2b1c4        ->  "0"    # worker_id f3a2b1c4, global rank 0
   e7d6c5b8        ->  "1"    # worker_id e7d6c5b8, global rank 1
 
@@ -354,7 +354,9 @@ without a Pod owner reference. This preserves behavior for older clients and
 non-Kubernetes environments; the server-side stale metadata reaper remains the
 cleanup path in those cases.
 
-**Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
+**Model lifecycle CRD name format**: `mx-cache-{provider}--{sanitized-model-name}-{hash}`
+
+The name is `mx-cache-` followed by `sanitize("{provider}/{model_name}")`, so each `/` becomes `--` and the sha256 suffix binds the pair `(provider, name)`. For provider `HuggingFace` and model `deepseek-ai/DeepSeek-V3` the CR is named `mx-cache-huggingface--deepseek-ai--deepseek-v3-{hash}`. Pre-0.5.0 deployments carry name-only CRs (`mx-cache-{sanitized-model-name}-{hash}`), which the server still looks up so those records migrate.
 
 `ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
 
@@ -439,14 +441,14 @@ status:
 
 ```bash
 kubectl get modelcacheentries -n <namespace>
-kubectl get modelcacheentry mx-cache-deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
+kubectl get modelcacheentry mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
 ```
 
 ```yaml
 apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelCacheEntry
 metadata:
-  name: mx-cache-deepseek-ai--deepseek-v3-<hash>
+  name: mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash>
 spec:
   modelName: deepseek-ai/DeepSeek-V3
   provider: HuggingFace
