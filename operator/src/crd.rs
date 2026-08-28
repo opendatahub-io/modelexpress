@@ -97,6 +97,21 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
 
+    /// Node labels the server pods must match. Required on clusters whose
+    /// nodes are not interchangeable, e.g. a mixed-architecture cluster where
+    /// `spec.image` only runs on one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<std::collections::BTreeMap<String, String>>,
+
+    /// Taints the server pods tolerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerations: Option<Vec<k8s_openapi::api::core::v1::Toleration>>,
+
+    /// Node and pod affinity rules for the server pods, for placement that
+    /// `nodeSelector` cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
+
     /// Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane
     /// only; worker-to-worker RDMA never crosses the CNI.
     #[serde(default, skip_serializing_if = "Option::is_none")]

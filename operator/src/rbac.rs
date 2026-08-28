@@ -160,6 +160,9 @@ mod tests {
             credentials: None,
             pod_metadata: None,
             resources: None,
+            node_selector: None,
+            tolerations: None,
+            affinity: None,
             network_policy: None,
             service_account_name: sa.map(String::from),
         }
