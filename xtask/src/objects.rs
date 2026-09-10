@@ -134,9 +134,10 @@ pub fn cluster_role_binding() -> ClusterRoleBinding {
         subjects: Some(vec![Subject {
             kind: "ServiceAccount".to_string(),
             name: NAME.to_string(),
-            // placeholder; the kustomize namespace transformer sets the
-            // real install namespace
-            namespace: Some("modelexpress-operator-system".to_string()),
+            // Unset so kustomize resolves it by nameReference against the
+            // ServiceAccount below; a literal blocks that, and unset also
+            // fails closed (the apiserver rejects a subject with no namespace).
+            namespace: None,
             ..Subject::default()
         }]),
     }
@@ -253,5 +254,36 @@ pub fn deployment(image: &str) -> Deployment {
             ..DeploymentSpec::default()
         }),
         status: None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// nameReference only resolves if both hold: subject namespace unset, and
+    /// the referenced ServiceAccount free to follow the overlay.
+    #[test]
+    fn cluster_role_binding_subject_resolves_against_the_service_account() {
+        let subjects = cluster_role_binding()
+            .subjects
+            .expect("binding has subjects");
+        assert_eq!(subjects.len(), 1);
+
+        let sa = service_account();
+        assert_eq!(
+            Some(&subjects[0].name),
+            sa.metadata.name.as_ref(),
+            "subject must name the ServiceAccount it is meant to resolve against"
+        );
+        assert_eq!(
+            subjects[0].namespace, None,
+            "a literal namespace blocks nameReference resolution"
+        );
+        assert_eq!(
+            sa.metadata.namespace, None,
+            "the referent must stay free to follow the overlay namespace"
+        );
     }
 }
