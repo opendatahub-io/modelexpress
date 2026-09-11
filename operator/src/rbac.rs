@@ -68,6 +68,18 @@ pub fn server_policy_rules() -> Vec<PolicyRule> {
             verbs: status,
             ..PolicyRule::default()
         },
+        // blockOwnerDeletion on a tensor-descriptor ConfigMap's ownerReference
+        // is an ownership write against the owning CR, so the API server also
+        // requires update on that CR's finalizers subresource.
+        PolicyRule {
+            api_groups: Some(vec![UPSTREAM_API_GROUP.to_string()]),
+            resources: Some(vec![
+                "modelmetadatas/finalizers".to_string(),
+                "modelcacheentries/finalizers".to_string(),
+            ]),
+            verbs: vec!["update".to_string()],
+            ..PolicyRule::default()
+        },
         // Tensor descriptors are stored as ConfigMaps; upstream needs the
         // whole namespace, so run MX in a dedicated one on shared clusters.
         PolicyRule {
@@ -187,6 +199,36 @@ mod tests {
         }));
         let binding = rbac.role_binding.expect("binding");
         assert_eq!(binding.subjects.expect("subjects")[0].name, "mx-server");
+    }
+
+    /// P2P metadata publishing sets blockOwnerDeletion on tensor-descriptor
+    /// ConfigMaps, which the API server rejects without update on the owning
+    /// CRs' finalizers subresource.
+    #[test]
+    fn finalizers_subresource_gets_update_only() {
+        let rule = server_policy_rules()
+            .into_iter()
+            .find(|r| {
+                r.resources
+                    .as_ref()
+                    .is_some_and(|res| res.contains(&"modelmetadatas/finalizers".to_string()))
+            })
+            .expect("finalizers rule");
+        assert_eq!(
+            rule.api_groups.as_deref(),
+            Some([UPSTREAM_API_GROUP.to_string()].as_slice())
+        );
+        assert_eq!(
+            rule.resources.as_deref(),
+            Some(
+                [
+                    "modelmetadatas/finalizers".to_string(),
+                    "modelcacheentries/finalizers".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(rule.verbs, vec!["update".to_string()]);
     }
 
     #[test]
