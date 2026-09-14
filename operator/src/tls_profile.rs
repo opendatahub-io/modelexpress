@@ -315,6 +315,36 @@ pub async fn change_stream(client: &Client, config: watcher::Config) -> Option<R
     Some(ReceiverStream::new(rx))
 }
 
+/// The profile to follow, re-read on every change to the cluster APIServer
+/// object and yielded only when it differs from the last one, starting from
+/// `initial`. A deleted object yields the Intermediate default. The stream
+/// ends at once off OpenShift.
+pub async fn profile_updates(client: Client, initial: TlsProfile) -> ReceiverStream<TlsProfile> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let Some(mut changes) = change_stream(&client, watcher::Config::default()).await else {
+        return ReceiverStream::new(rx);
+    };
+    tokio::spawn(async move {
+        let mut current = initial;
+        while changes.next().await.is_some() {
+            match fetch(&client).await {
+                Ok(profile) => {
+                    let profile = profile.unwrap_or_default();
+                    if profile == current {
+                        continue;
+                    }
+                    current = profile.clone();
+                    if tx.send(profile).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => tracing::warn!("re-reading cluster TLS profile after a change: {e}"),
+            }
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

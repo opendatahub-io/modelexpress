@@ -23,6 +23,7 @@ kube = { workspace = true }
 modelexpress-server = { workspace = true, features = ["tls-rustls"] }
 k8s-openapi = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_norway = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
