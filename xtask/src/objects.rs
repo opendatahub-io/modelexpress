@@ -91,6 +91,12 @@ pub fn cluster_role_rules() -> Vec<PolicyRule> {
             verbs: crud(),
             ..PolicyRule::default()
         },
+        PolicyRule {
+            api_groups: Some(vec!["config.openshift.io".to_string()]),
+            resources: Some(vec!["apiservers".to_string()]),
+            verbs: ["get", "list", "watch"].map(String::from).to_vec(),
+            ..PolicyRule::default()
+        },
     ];
     rules.extend(modelexpress_operator::rbac::server_policy_rules());
     rules
