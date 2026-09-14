@@ -9,6 +9,7 @@ use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, HTTPGetAction, PodSecurityContext, PodSpec,
     PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
 };
+use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -16,6 +17,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use modelexpress_operator::crd::API_GROUP;
 use modelexpress_operator::telemetry;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 pub const NAME: &str = "modelexpress-operator";
@@ -91,6 +93,24 @@ pub fn cluster_role_rules() -> Vec<PolicyRule> {
             verbs: crud(),
             ..PolicyRule::default()
         },
+        PolicyRule {
+            api_groups: Some(vec!["config.openshift.io".to_string()]),
+            resources: Some(vec!["apiservers".to_string()]),
+            verbs: ["get", "list", "watch"].map(String::from).to_vec(),
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["authentication.k8s.io".to_string()]),
+            resources: Some(vec!["tokenreviews".to_string()]),
+            verbs: vec!["create".to_string()],
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["authorization.k8s.io".to_string()]),
+            resources: Some(vec!["subjectaccessreviews".to_string()]),
+            verbs: vec!["create".to_string()],
+            ..PolicyRule::default()
+        },
     ];
     rules.extend(modelexpress_operator::rbac::server_policy_rules());
     rules
@@ -147,7 +167,7 @@ fn http_probe(path: &str) -> Probe {
     Probe {
         http_get: Some(HTTPGetAction {
             path: Some(path.to_string()),
-            port: IntOrString::String(telemetry::PORT_NAME.to_string()),
+            port: IntOrString::String(telemetry::HEALTH_PORT_NAME.to_string()),
             ..HTTPGetAction::default()
         }),
         initial_delay_seconds: Some(5),
@@ -208,7 +228,7 @@ pub fn deployment(image: &str) -> Deployment {
                             ("prometheus.io/scrape".to_string(), "true".to_string()),
                             (
                                 "prometheus.io/port".to_string(),
-                                telemetry::PORT.to_string(),
+                                telemetry::METRICS_PORT.to_string(),
                             ),
                         ]
                         .into_iter()
@@ -223,11 +243,18 @@ pub fn deployment(image: &str) -> Deployment {
                         name: "operator".to_string(),
                         image: Some(image.to_string()),
                         security_context: Some(container_security_context()),
-                        ports: Some(vec![ContainerPort {
-                            name: Some(telemetry::PORT_NAME.to_string()),
-                            container_port: telemetry::PORT,
-                            ..ContainerPort::default()
-                        }]),
+                        ports: Some(vec![
+                            ContainerPort {
+                                name: Some(telemetry::HEALTH_PORT_NAME.to_string()),
+                                container_port: telemetry::HEALTH_PORT,
+                                ..ContainerPort::default()
+                            },
+                            ContainerPort {
+                                name: Some(telemetry::METRICS_PORT_NAME.to_string()),
+                                container_port: telemetry::METRICS_PORT,
+                                ..ContainerPort::default()
+                            },
+                        ]),
                         liveness_probe: Some(http_probe("/healthz")),
                         readiness_probe: Some(http_probe("/readyz")),
                         resources: Some(ResourceRequirements {
@@ -255,6 +282,133 @@ pub fn deployment(image: &str) -> Deployment {
         }),
         status: None,
     }
+}
+
+pub const METRICS_SERVICE_NAME: &str = "modelexpress-operator-metrics";
+pub const METRICS_TLS_SECRET: &str = "modelexpress-operator-metrics-tls";
+pub const METRICS_TLS_MOUNT: &str = "/etc/modelexpress-operator/metrics-tls";
+pub const SERVICE_CA_CONFIGMAP: &str = "openshift-service-ca.crt";
+/// The namespace `config/manifests/default` installs into; the ServiceMonitor
+/// needs it spelled out for TLS server-name verification.
+pub const DEFAULT_NAMESPACE: &str = "modelexpress-operator-system";
+
+/// Plaintext metrics Service for the base manifests. The OpenShift overlay
+/// patches it to the TLS port and asks service-ca for a certificate.
+pub fn metrics_service() -> Service {
+    Service {
+        metadata: ObjectMeta {
+            name: Some(METRICS_SERVICE_NAME.to_string()),
+            labels: Some(labels()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(
+                [("app.kubernetes.io/name".to_string(), NAME.to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ports: Some(vec![ServicePort {
+                name: Some(telemetry::METRICS_PORT_NAME.to_string()),
+                port: telemetry::METRICS_PORT,
+                target_port: Some(IntOrString::String(
+                    telemetry::METRICS_PORT_NAME.to_string(),
+                )),
+                ..ServicePort::default()
+            }]),
+            ..ServiceSpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// OpenShift overlay: strategic-merge patches and extra objects that turn the
+/// metrics endpoint into service-ca TLS with the cluster profile applied.
+pub fn openshift_overlay() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "kustomization.yaml",
+            json!({
+                "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                "kind": "Kustomization",
+                "resources": ["../default", "service-ca-configmap.yaml", "servicemonitor.yaml"],
+                "patches": [
+                    {"path": "deployment-patch.yaml", "target": {"kind": "Deployment", "name": NAME}},
+                    {"path": "service-patch.yaml", "target": {"kind": "Service", "name": METRICS_SERVICE_NAME}},
+                ],
+            }),
+        ),
+        (
+            "deployment-patch.yaml",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": NAME},
+                "spec": {"template": {
+                    "metadata": {"annotations": {"prometheus.io/port": telemetry::METRICS_TLS_PORT.to_string(), "prometheus.io/scheme": "https"}},
+                    "spec": {
+                        "containers": [{
+                            "name": "operator",
+                            "env": [{"name": telemetry::METRICS_TLS_DIR_ENV, "value": METRICS_TLS_MOUNT}],
+                            "ports": [
+                                {"name": telemetry::HEALTH_PORT_NAME, "containerPort": telemetry::HEALTH_PORT},
+                                {"name": telemetry::METRICS_TLS_PORT_NAME, "containerPort": telemetry::METRICS_TLS_PORT},
+                            ],
+                            "volumeMounts": [{"name": "metrics-tls", "mountPath": METRICS_TLS_MOUNT, "readOnly": true}],
+                        }],
+                        "volumes": [{"name": "metrics-tls", "secret": {"secretName": METRICS_TLS_SECRET}}],
+                    },
+                }},
+            }),
+        ),
+        (
+            "service-patch.yaml",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": METRICS_SERVICE_NAME,
+                    "annotations": {"service.beta.openshift.io/serving-cert-secret-name": METRICS_TLS_SECRET},
+                },
+                "spec": {"ports": [{
+                    "name": telemetry::METRICS_TLS_PORT_NAME,
+                    "port": telemetry::METRICS_TLS_PORT,
+                    "targetPort": telemetry::METRICS_TLS_PORT_NAME,
+                }]},
+            }),
+        ),
+        (
+            "service-ca-configmap.yaml",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": SERVICE_CA_CONFIGMAP,
+                    "labels": labels(),
+                    "annotations": {"service.beta.openshift.io/inject-cabundle": "true"},
+                },
+            }),
+        ),
+        (
+            "servicemonitor.yaml",
+            json!({
+                "apiVersion": "monitoring.coreos.com/v1",
+                "kind": "ServiceMonitor",
+                "metadata": {"name": NAME, "labels": labels()},
+                "spec": {
+                    "selector": {"matchLabels": {"app.kubernetes.io/name": NAME}},
+                    "endpoints": [{
+                        "port": telemetry::METRICS_TLS_PORT_NAME,
+                        "scheme": "https",
+                        "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+                        "tlsConfig": {
+                            "ca": {"configMap": {"name": SERVICE_CA_CONFIGMAP, "key": "service-ca.crt"}},
+                            "serverName": format!("{METRICS_SERVICE_NAME}.{DEFAULT_NAMESPACE}.svc"),
+                        },
+                    }],
+                },
+            }),
+        ),
+    ]
 }
 
 #[cfg(test)]

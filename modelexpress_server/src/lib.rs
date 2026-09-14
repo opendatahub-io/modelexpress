@@ -11,6 +11,8 @@ pub mod refit;
 pub mod registry;
 pub mod server;
 pub mod services;
+#[cfg(feature = "tls-openssl")]
+pub mod tls;
 
 // Re-export for testing
 pub use cache::*;

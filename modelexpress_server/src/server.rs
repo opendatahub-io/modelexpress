@@ -413,7 +413,7 @@ pub async fn run_server(
             .add_service(p2p)
             .add_optional_service(refit),
     };
-    let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
+    let server_result = serve(router, addr, &config.tls, shutdown_signal).await;
 
     // Wait for background services to complete
     if let Some(handle) = cache_handle
@@ -438,5 +438,46 @@ pub async fn run_server(
 
     server_result?;
     info!("Server shutdown complete");
+    Ok(())
+}
+
+type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The router as built above: tonic's router under the gRPC metrics layer.
+type GrpcRouter = tonic::transport::server::Router<
+    tower::layer::util::Stack<metrics::grpc::GrpcMetricsLayer, tower::layer::util::Identity>,
+>;
+
+#[cfg(feature = "tls-openssl")]
+async fn serve(
+    router: GrpcRouter,
+    addr: std::net::SocketAddr,
+    tls: &crate::config::TlsConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServeError> {
+    match crate::tls::build_context(tls)? {
+        Some(context) => {
+            info!("gRPC listener is serving TLS");
+            let incoming = crate::tls::incoming(addr, context).await?;
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await?;
+        }
+        None => router.serve_with_shutdown(addr, shutdown).await?,
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "tls-openssl"))]
+async fn serve(
+    router: GrpcRouter,
+    addr: std::net::SocketAddr,
+    tls: &crate::config::TlsConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServeError> {
+    if tls.is_enabled() {
+        return Err("TLS termination requires the openssl build (--features openssl)".into());
+    }
+    router.serve_with_shutdown(addr, shutdown).await?;
     Ok(())
 }
