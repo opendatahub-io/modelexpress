@@ -78,6 +78,14 @@ rules:
   - patch
   - delete
 - apiGroups:
+  - config.openshift.io
+  resources:
+  - apiservers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - modelexpress.nvidia.com
   resources:
   - modelmetadatas
