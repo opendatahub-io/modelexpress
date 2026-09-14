@@ -102,6 +102,17 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<NetworkPolicyConfig>,
 
+    /// Pod-level securityContext for the server pods. What is set here wins;
+    /// runAsNonRoot and a RuntimeDefault seccompProfile are filled in when
+    /// left unset.
+    ///
+    /// OpenShift assigns runAsUser and fsGroup from the namespace range, so
+    /// leaving this unset is correct there. Elsewhere a server image with no
+    /// USER of its own needs runAsUser set here, plus fsGroup for the cache
+    /// mount to be writable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+
     /// Run the server as an existing ServiceAccount instead of the generated
     /// `<cr-name>-server`. Binding the metadata Role to it becomes your job.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -89,7 +89,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
-                    security_context: Some(pod_security_context()),
+                    security_context: Some(pod_security_context(spec)),
                     volumes: Some(vec![volume]),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
                     ..PodSpec::default()
@@ -163,18 +163,18 @@ fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, 
     labels
 }
 
-/// runAsUser and fsGroup are deliberately absent: OpenShift's restricted-v2
-/// SCC assigns both from the namespace range, and pinning them would conflict
-/// with that while buying nothing on vanilla Kubernetes.
-fn pod_security_context() -> PodSecurityContext {
-    PodSecurityContext {
-        run_as_non_root: Some(true),
-        seccomp_profile: Some(SeccompProfile {
+fn pod_security_context(spec: &ModelExpressServerSpec) -> PodSecurityContext {
+    let mut context = spec.pod_security_context.clone().unwrap_or_default();
+    if context.run_as_non_root.is_none() {
+        context.run_as_non_root = Some(true);
+    }
+    if context.seccomp_profile.is_none() {
+        context.seccomp_profile = Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
             localhost_profile: None,
-        }),
-        ..PodSecurityContext::default()
+        });
     }
+    context
 }
 
 /// No readOnlyRootFilesystem: unlike the controller, the server unpacks
@@ -260,6 +260,7 @@ mod tests {
             pod_metadata: None,
             resources: None,
             network_policy: None,
+            pod_security_context: None,
             service_account_name: None,
         }
     }
@@ -548,6 +549,74 @@ mod tests {
                 .get(MANAGED_BY_LABEL)
                 .map(String::as_str),
             Some(MANAGED_BY)
+        );
+    }
+
+    fn pod_context(spec: &ModelExpressServerSpec) -> PodSecurityContext {
+        render("mx", spec)
+            .deployment
+            .spec
+            .expect("spec")
+            .template
+            .spec
+            .expect("pod")
+            .security_context
+            .expect("pod security context")
+    }
+
+    #[test]
+    fn pod_security_context_defaults_stay_restricted() {
+        let context = pod_context(&base_spec());
+        assert_eq!(context.run_as_non_root, Some(true));
+        assert_eq!(
+            context.seccomp_profile.expect("seccomp").type_,
+            "RuntimeDefault"
+        );
+        assert_eq!(
+            context.run_as_user, None,
+            "OpenShift assigns this from the namespace range"
+        );
+        assert_eq!(context.fs_group, None);
+    }
+
+    #[test]
+    fn run_as_user_and_fs_group_pass_through() {
+        let mut spec = base_spec();
+        spec.pod_security_context = Some(PodSecurityContext {
+            run_as_user: Some(65532),
+            fs_group: Some(65532),
+            ..PodSecurityContext::default()
+        });
+        let context = pod_context(&spec);
+        assert_eq!(context.run_as_user, Some(65532));
+        assert_eq!(context.fs_group, Some(65532));
+        assert_eq!(
+            context.run_as_non_root,
+            Some(true),
+            "an unset field still gets the restricted default"
+        );
+        assert_eq!(
+            context.seccomp_profile.expect("seccomp").type_,
+            "RuntimeDefault"
+        );
+    }
+
+    #[test]
+    fn an_explicit_value_wins_over_the_default() {
+        let mut spec = base_spec();
+        spec.pod_security_context = Some(PodSecurityContext {
+            run_as_non_root: Some(false),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..PodSecurityContext::default()
+        });
+        let context = pod_context(&spec);
+        assert_eq!(context.run_as_non_root, Some(false));
+        assert_eq!(
+            context.seccomp_profile.expect("seccomp").type_,
+            "Unconfined"
         );
     }
 

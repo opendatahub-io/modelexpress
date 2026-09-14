@@ -151,6 +151,7 @@ mod tests {
             pod_metadata: None,
             resources: None,
             network_policy: None,
+            pod_security_context: None,
             service_account_name: None,
         }
     }

@@ -91,7 +91,9 @@ spec:
             - mountPath: /cache
               name: model-cache
       securityContext:
+        fsGroup: 65532
         runAsNonRoot: true
+        runAsUser: 65532
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: mx-full-server
