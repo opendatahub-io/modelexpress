@@ -266,6 +266,31 @@ pub async fn change_stream(client: &Client, config: watcher::Config) -> Option<R
     Some(ReceiverStream::new(rx))
 }
 
+/// Exit the process when the cluster profile no longer matches `initial`.
+///
+/// The operator's own TLS listener bakes the profile in at startup, so the
+/// way to pick up a change is a restart, the same as controller-runtime's
+/// SecurityProfileWatcher. Returns immediately off OpenShift.
+pub async fn exit_on_change(client: Client, initial: TlsProfile) {
+    let Some(mut changes) = change_stream(&client, watcher::Config::default()).await else {
+        return;
+    };
+    while changes.next().await.is_some() {
+        match fetch(&client).await {
+            Ok(Some(current)) if current != initial => {
+                tracing::info!(
+                    from = %initial.min_version,
+                    to = %current.min_version,
+                    "cluster TLS profile changed; exiting so the metrics listener restarts with it"
+                );
+                std::process::exit(0);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("re-reading cluster TLS profile after a change: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
