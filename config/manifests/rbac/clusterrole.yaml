@@ -78,6 +78,13 @@ rules:
   - patch
   - delete
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - modelexpress.nvidia.com
   resources:
   - modelmetadatas
