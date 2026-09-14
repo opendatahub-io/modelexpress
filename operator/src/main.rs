@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use modelexpress_operator::tls::NoDefaults;
 use modelexpress_operator::{controller, telemetry};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 enum MainError {
@@ -35,7 +37,7 @@ async fn main() -> Result<(), MainError> {
     // probes, which should restart the pod rather than linger half-alive
     tokio::select! {
         res = telemetry::serve(addr, handle) => res?,
-        res = controller::run(client) => res?,
+        res = controller::run(client, Arc::new(NoDefaults)) => res?,
     }
     Ok(())
 }

@@ -8,4 +8,5 @@ pub mod env;
 pub mod labels;
 pub mod rbac;
 pub mod telemetry;
+pub mod tls;
 pub mod volume;

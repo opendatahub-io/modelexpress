@@ -76,6 +76,10 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
 
+    /// TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+
     /// Stale-worker reaper timings, MX_REAPER_* / MX_HEARTBEAT_* / MX_GC_*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaper: Option<ReaperConfig>,
@@ -89,6 +93,11 @@ pub struct ModelExpressServerSpec {
     /// Operator-owned selector labels win on conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_metadata: Option<MetadataOverrides>,
+
+    /// Extra labels/annotations for the Service, e.g. a certificate issuer's
+    /// annotation for tls.secretName. Operator-owned labels win on conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_metadata: Option<MetadataOverrides>,
 
     /// Compute resources for the server container. Defaults to modest
     /// requests and no limits; unset entirely would put the pod in BestEffort,
@@ -331,6 +340,34 @@ pub struct SecurityConfig {
     /// MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS (upstream default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_secs: Option<u32>,
+}
+
+/// Serve TLS from a kubernetes.io/tls Secret. Version, ciphers and groups left
+/// unset take the platform's defaults, or the server's own when there are
+/// none. Kubernetes gRPC probes cannot speak TLS, so the probes switch to TCP
+/// when this is set.
+#[derive(CELSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// Secret holding tls.crt and tls.key, mounted read-only.
+    #[cel_validate(rule = Rule::new("self != ''").message("secretName must not be empty"))]
+    #[schemars(length(max = 253))]
+    pub secret_name: String,
+    /// MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 16))]
+    #[cel_validate(rule = Rule::new("self.matches('^(VersionTLS1[0-3]|TLS1[.][0-3])$')")
+        .message("minVersion must be VersionTLS10..13 or TLS1.0..1.3"))]
+    pub min_version: Option<String>,
+    /// MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub cipher_suites: Vec<String>,
+    /// MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order
+    /// (rendered comma-separated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub groups: Vec<String>,
 }
 
 /// Mirrors upstream AuthMode, but the CRD value is `disabled` rather than

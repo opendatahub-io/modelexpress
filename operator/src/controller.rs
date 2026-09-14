@@ -7,6 +7,7 @@ use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
 use crate::labels;
 use crate::rbac::{ServerRbac, render_rbac, role_name, service_account_name};
+use crate::tls::{self, TlsDefaults, TlsDefaultsError, TlsSettings};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service, ServiceAccount};
@@ -30,6 +31,8 @@ const WATCH_TIMEOUT_SECS: u32 = 290;
 pub enum Error {
     #[error("kube api: {0}")]
     Kube(#[from] kube::Error),
+    #[error("TLS defaults: {0}")]
+    TlsDefaults(TlsDefaultsError),
     #[error("CR has no namespace")]
     MissingNamespace,
     #[error("CR has no uid")]
@@ -49,9 +52,10 @@ pub enum Error {
 
 pub struct Ctx {
     pub client: Client,
+    pub tls_defaults: Arc<dyn TlsDefaults>,
 }
 
-pub async fn run(client: Client) -> Result<(), kube::Error> {
+pub async fn run(client: Client, tls_defaults: Arc<dyn TlsDefaults>) -> Result<(), kube::Error> {
     let servers = Api::<ModelExpressServer>::all(client.clone());
     let deployments = Api::<Deployment>::all(client.clone());
     let services = Api::<Service>::all(client.clone());
@@ -68,7 +72,7 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
         .labels(labels::MANAGED_BY_SELECTOR)
         .timeout(WATCH_TIMEOUT_SECS);
 
-    Controller::new(
+    let controller = Controller::new(
         servers,
         watcher::Config::default().timeout(WATCH_TIMEOUT_SECS),
     )
@@ -78,16 +82,30 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     .owns_stream(owned_meta(netpols, owned.clone()))
     .owns_stream(owned_meta(sas, owned.clone()))
     .owns_stream(owned_meta(roles, owned.clone()))
-    .owns_stream(owned_meta(bindings, owned))
-    .shutdown_on_signal()
-    .run(reconcile, error_policy, Arc::new(Ctx { client }))
-    .for_each(|result| async move {
-        match result {
-            Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
-            Err(err) => tracing::warn!(%err, "reconcile failed"),
-        }
-    })
-    .await;
+    .owns_stream(owned_meta(bindings, owned));
+
+    // A change to the TLS defaults re-renders every server that relies on
+    // them. They are global, so a full requeue is the cheapest correct mapping.
+    let defaults_changed = tls_defaults.updates().await.map(|_| ());
+    let controller = controller.reconcile_all_on(defaults_changed);
+
+    controller
+        .shutdown_on_signal()
+        .run(
+            reconcile,
+            error_policy,
+            Arc::new(Ctx {
+                client,
+                tls_defaults,
+            }),
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
+                Err(err) => tracing::warn!(%err, "reconcile failed"),
+            }
+        })
+        .await;
     Ok(())
 }
 
@@ -158,12 +176,20 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     check_existing_claim(cr, ns, ctx).await?;
     let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
+    let tls_defaults = match &cr.spec.tls {
+        Some(config) if tls::needs_defaults(config) => ctx
+            .tls_defaults
+            .current()
+            .await
+            .map_err(Error::TlsDefaults)?,
+        _ => TlsSettings::default(),
+    };
     let DesiredState {
         mut deployment,
         mut service,
         pvc,
         network_policy,
-    } = render(name, &cr.spec);
+    } = render(name, &cr.spec, &tls_defaults);
 
     let owner = cr.controller_owner_ref(&());
     stamp(&mut deployment.metadata, ns, owner.clone());
@@ -334,6 +360,7 @@ fn stamp(
 fn reason(err: &Error) -> &'static str {
     match err {
         Error::Kube(_) => "ApplyFailed",
+        Error::TlsDefaults(_) => "TlsDefaultsUnavailable",
         Error::MissingNamespace => "MissingNamespace",
         Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
@@ -435,9 +462,11 @@ mod tests {
                 log: None,
                 cache: None,
                 security: None,
+                tls: None,
                 reaper: None,
                 credentials: None,
                 pod_metadata: None,
+                service_metadata: None,
                 resources: None,
                 node_selector: None,
                 tolerations: None,
