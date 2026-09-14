@@ -42,6 +42,16 @@ security:
   allowedServiceAccounts: []
   # cacheTtlSecs: 60
 
+# TLS termination on the gRPC listener. Off by default. Needs the OpenSSL image
+# build (the published images). The Secret holds tls.crt and tls.key; on OpenShift
+# set serviceCA to have service-ca issue it via the Service annotation.
+tls:
+  enabled: false
+  secretName: ""
+  serviceCA: false
+  # minVersion: TLS1.2
+  # cipherSuites: []
+
 podAnnotations: {}
 
 podLabels: {}

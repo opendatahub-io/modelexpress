@@ -4,6 +4,7 @@
 use clap::Parser;
 use config::ConfigError;
 use modelexpress_common::config::{LogFormat, LogLevel, load_layered_config};
+use modelexpress_common::tls::TlsVersion;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
@@ -158,6 +159,78 @@ pub struct SecurityArgs {
     pub cache_ttl_secs: Option<u64>,
 }
 
+/// TLS termination for the gRPC listener. Off unless a certificate is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// PEM certificate chain to serve.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key for `cert_file`.
+    pub key_file: Option<PathBuf>,
+    /// Lowest protocol version accepted. OpenSSL's default when unset.
+    pub min_version: Option<TlsVersion>,
+    /// OpenSSL cipher names to offer, TLS 1.2 and 1.3 names mixed as in an
+    /// OpenShift `tlsSecurityProfile`. OpenSSL's default when empty.
+    pub cipher_suites: Vec<String>,
+}
+
+impl TlsConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.cert_file.is_some() || self.key_file.is_some()
+    }
+
+    /// Certificate and key paths when TLS is on.
+    pub fn key_pair(&self) -> Result<Option<(&PathBuf, &PathBuf)>, String> {
+        match (&self.cert_file, &self.key_file) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("tls.cert_file is set without tls.key_file".to_string()),
+            (None, Some(_)) => Err("tls.key_file is set without tls.cert_file".to_string()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let Some((cert, key)) = self.key_pair()? else {
+            if self.min_version.is_some() || !self.cipher_suites.is_empty() {
+                return Err(
+                    "tls.min_version and tls.cipher_suites need tls.cert_file and tls.key_file"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        };
+        for (name, path) in [("tls.cert_file", cert), ("tls.key_file", key)] {
+            if !path.is_file() {
+                return Err(format!("{name} does not exist: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct TlsArgs {
+    /// PEM certificate chain for the gRPC listener. Enables TLS.
+    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CERT_FILE)]
+    pub cert_file: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert-file.
+    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_KEY_FILE)]
+    pub key_file: Option<PathBuf>,
+
+    /// Minimum TLS version (TLS1.2, TLS1.3, or the OpenShift VersionTLS12 spelling).
+    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_MIN_VERSION)]
+    pub min_version: Option<TlsVersion>,
+
+    /// Comma-separated OpenSSL cipher names, TLS 1.2 and 1.3 names mixed.
+    #[arg(
+        long = "tls-cipher-suites",
+        env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CIPHER_SUITES
+    )]
+    pub cipher_suites: Option<CommaList<String>>,
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -205,6 +278,9 @@ pub struct ServerArgs {
     #[command(flatten)]
     pub security: SecurityArgs,
 
+    #[command(flatten)]
+    pub tls: TlsArgs,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -221,6 +297,8 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 /// Server-specific settings
@@ -386,6 +464,20 @@ impl ServerConfig {
             config.security.cache_ttl_secs = cache_ttl_secs;
         }
 
+        // Apply TLS overrides
+        if let Some(cert_file) = args.tls.cert_file {
+            config.tls.cert_file = Some(cert_file);
+        }
+        if let Some(key_file) = args.tls.key_file {
+            config.tls.key_file = Some(key_file);
+        }
+        if let Some(min_version) = args.tls.min_version {
+            config.tls.min_version = Some(min_version);
+        }
+        if let Some(cipher_suites) = args.tls.cipher_suites {
+            config.tls.cipher_suites = cipher_suites.into_inner();
+        }
+
         // Validate the final configuration
         config.validate()?;
 
@@ -408,6 +500,8 @@ impl ServerConfig {
         self.security
             .validate_resolved(mode)
             .map_err(ConfigError::Message)?;
+
+        self.tls.validate().map_err(ConfigError::Message)?;
 
         Ok(())
     }
@@ -482,6 +576,25 @@ impl ServerConfig {
                 .join(", ")
         );
         info!("  Cache TTL: {}s", self.security.cache_ttl_secs);
+
+        info!("TLS Configuration:");
+        match self.tls.key_pair() {
+            Ok(Some((cert, key))) => {
+                info!("  Certificate: {}", cert.display());
+                info!("  Key: {}", key.display());
+                match self.tls.min_version {
+                    Some(version) => info!("  Min version: {version}"),
+                    None => info!("  Min version: OpenSSL default"),
+                }
+                if self.tls.cipher_suites.is_empty() {
+                    info!("  Cipher suites: OpenSSL default");
+                } else {
+                    info!("  Cipher suites: {}", self.tls.cipher_suites.join(":"));
+                }
+            }
+            Ok(None) => info!("  Disabled (plaintext gRPC)"),
+            Err(e) => info!("  Invalid: {e}"),
+        }
     }
 }
 
@@ -748,6 +861,7 @@ mod tests {
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -789,6 +903,7 @@ mod tests {
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -836,6 +951,7 @@ mod tests {
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -865,6 +981,7 @@ mod tests {
             cache_directory: None,
             cache_eviction_enabled: None,
             security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
             validate_config: false,
         };
 
@@ -997,6 +1114,7 @@ mod tests {
                 cache_directory: None,
                 cache_eviction_enabled: None,
                 security: SecurityArgs::default(),
+                tls: TlsArgs::default(),
                 validate_config: false,
             };
             let config = ServerConfig::load(args).expect("config should load");
