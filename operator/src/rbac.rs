@@ -168,6 +168,7 @@ mod tests {
             log: None,
             cache: None,
             security: None,
+            tls: None,
             reaper: None,
             credentials: None,
             pod_metadata: None,

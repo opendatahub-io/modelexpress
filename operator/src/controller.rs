@@ -7,6 +7,7 @@ use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
 use crate::labels;
 use crate::rbac::{ServerRbac, render_rbac, role_name, service_account_name};
+use crate::tls_profile::{self, FetchError, ProfileError, TlsProfile};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service, ServiceAccount};
@@ -30,6 +31,8 @@ const WATCH_TIMEOUT_SECS: u32 = 290;
 pub enum Error {
     #[error("kube api: {0}")]
     Kube(#[from] kube::Error),
+    #[error("cluster TLS profile: {0}")]
+    TlsProfile(#[from] ProfileError),
     #[error("CR has no namespace")]
     MissingNamespace,
     #[error("CR has no uid")]
@@ -68,7 +71,7 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
         .labels(labels::MANAGED_BY_SELECTOR)
         .timeout(WATCH_TIMEOUT_SECS);
 
-    Controller::new(
+    let controller = Controller::new(
         servers,
         watcher::Config::default().timeout(WATCH_TIMEOUT_SECS),
     )
@@ -78,16 +81,39 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     .owns_stream(owned_meta(netpols, owned.clone()))
     .owns_stream(owned_meta(sas, owned.clone()))
     .owns_stream(owned_meta(roles, owned.clone()))
-    .owns_stream(owned_meta(bindings, owned))
-    .shutdown_on_signal()
-    .run(reconcile, error_policy, Arc::new(Ctx { client }))
-    .for_each(|result| async move {
-        match result {
-            Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
-            Err(err) => tracing::warn!(%err, "reconcile failed"),
-        }
-    })
+    .owns_stream(owned_meta(bindings, owned));
+
+    // A cluster TLS profile change has to re-render every server that follows
+    // it. The object is cluster-scoped and singular, so a full requeue is the
+    // cheapest correct mapping.
+    let profile_changes = tls_profile::change_stream(
+        &client,
+        watcher::Config::default().timeout(WATCH_TIMEOUT_SECS),
+    )
     .await;
+    let controller = match profile_changes {
+        Some(stream) => {
+            tracing::info!(
+                "watching apiservers.config.openshift.io/cluster for TLS profile changes"
+            );
+            controller.reconcile_all_on(stream)
+        }
+        None => {
+            tracing::info!("config.openshift.io not served; TLS follows the Intermediate profile");
+            controller
+        }
+    };
+
+    controller
+        .shutdown_on_signal()
+        .run(reconcile, error_policy, Arc::new(Ctx { client }))
+        .for_each(|result| async move {
+            match result {
+                Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
+                Err(err) => tracing::warn!(%err, "reconcile failed"),
+            }
+        })
+        .await;
     Ok(())
 }
 
@@ -158,12 +184,22 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     check_existing_claim(cr, ns, ctx).await?;
     let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
+    let cluster_tls = match &cr.spec.tls {
+        Some(tls) if tls_profile::needs_cluster_profile(tls) => tls_profile::fetch(&ctx.client)
+            .await
+            .map_err(|e| match e {
+                FetchError::Kube(e) => Error::Kube(e),
+                FetchError::Profile(e) => Error::TlsProfile(e),
+            })?
+            .unwrap_or_default(),
+        _ => TlsProfile::default(),
+    };
     let DesiredState {
         mut deployment,
         mut service,
         pvc,
         network_policy,
-    } = render(name, &cr.spec);
+    } = render(name, &cr.spec, &cluster_tls);
 
     let owner = cr.controller_owner_ref(&());
     stamp(&mut deployment.metadata, ns, owner.clone());
@@ -334,6 +370,7 @@ fn stamp(
 fn reason(err: &Error) -> &'static str {
     match err {
         Error::Kube(_) => "ApplyFailed",
+        Error::TlsProfile(_) => "InvalidClusterTlsProfile",
         Error::MissingNamespace => "MissingNamespace",
         Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
@@ -435,6 +472,7 @@ mod tests {
                 log: None,
                 cache: None,
                 security: None,
+                tls: None,
                 reaper: None,
                 credentials: None,
                 pod_metadata: None,
