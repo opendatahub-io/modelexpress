@@ -92,6 +92,9 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
                     security_context: Some(pod_security_context()),
                     volumes: Some(vec![volume]),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
+                    node_selector: spec.node_selector.clone(),
+                    tolerations: spec.tolerations.clone(),
+                    affinity: spec.affinity.clone(),
                     ..PodSpec::default()
                 }),
             },
@@ -240,7 +243,10 @@ fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
 mod tests {
     use super::*;
     use crate::crd::{CacheConfig, CacheStorage, ManagedPvcStorage, MetadataBackend, RedisBackend};
-    use k8s_openapi::api::core::v1::{PersistentVolumeClaimSpec, VolumeResourceRequirements};
+    use k8s_openapi::api::core::v1::{
+        Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+        PersistentVolumeClaimSpec, Toleration, VolumeResourceRequirements,
+    };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
     fn base_spec() -> ModelExpressServerSpec {
@@ -259,9 +265,24 @@ mod tests {
             credentials: None,
             pod_metadata: None,
             resources: None,
+            node_selector: None,
+            tolerations: None,
+            affinity: None,
             network_policy: None,
             service_account_name: None,
         }
+    }
+
+    fn pod_spec(state: &DesiredState) -> &PodSpec {
+        state
+            .deployment
+            .spec
+            .as_ref()
+            .expect("deployment spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec")
     }
 
     fn container(state: &DesiredState) -> &Container {
@@ -321,6 +342,70 @@ mod tests {
             Some("nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0")
         );
         assert_eq!(c.ports.as_ref().expect("ports")[0].container_port, 8001);
+    }
+
+    #[test]
+    fn scheduling_fields_reach_the_pod_spec() {
+        let mut spec = base_spec();
+        spec.node_selector = Some(BTreeMap::from([(
+            "kubernetes.io/arch".to_string(),
+            "arm64".to_string(),
+        )]));
+        spec.tolerations = Some(vec![Toleration {
+            key: Some("nvidia.com/gpu".into()),
+            operator: Some("Exists".into()),
+            effect: Some("NoSchedule".into()),
+            ..Toleration::default()
+        }]);
+        spec.affinity = Some(Affinity {
+            node_affinity: Some(NodeAffinity {
+                required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                    node_selector_terms: vec![NodeSelectorTerm {
+                        match_expressions: Some(vec![NodeSelectorRequirement {
+                            key: "kubernetes.io/os".into(),
+                            operator: "In".into(),
+                            values: Some(vec!["linux".into()]),
+                        }]),
+                        ..NodeSelectorTerm::default()
+                    }],
+                }),
+                ..NodeAffinity::default()
+            }),
+            ..Affinity::default()
+        });
+
+        let state = render("mx", &spec);
+        let pod = pod_spec(&state);
+        assert_eq!(
+            pod.node_selector
+                .as_ref()
+                .expect("node selector")
+                .get("kubernetes.io/arch")
+                .map(String::as_str),
+            Some("arm64")
+        );
+        assert_eq!(
+            pod.tolerations.as_ref().expect("tolerations")[0]
+                .key
+                .as_deref(),
+            Some("nvidia.com/gpu")
+        );
+        assert!(
+            pod.affinity
+                .as_ref()
+                .expect("affinity")
+                .node_affinity
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scheduling_fields_are_unset_by_default() {
+        let pod_owned = render("mx", &base_spec());
+        let pod = pod_spec(&pod_owned);
+        assert!(pod.node_selector.is_none());
+        assert!(pod.tolerations.is_none());
+        assert!(pod.affinity.is_none());
     }
 
     #[test]
