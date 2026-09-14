@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: modelexpress-operator-system
+patches:
+- path: deployment-patch.yaml
+  target:
+    kind: Deployment
+    name: modelexpress-operator
+- path: service-patch.yaml
+  target:
+    kind: Service
+    name: modelexpress-operator-metrics
+- path: namespace-patch.yaml
+  target:
+    kind: Namespace
+    name: modelexpress-operator-system
+resources:
+- ../default
+- service-ca-configmap.yaml
+- servicemonitor.yaml

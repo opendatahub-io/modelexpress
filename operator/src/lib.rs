@@ -6,6 +6,9 @@ pub mod crd;
 pub mod deployment;
 pub mod env;
 pub mod labels;
+pub mod metrics_auth;
+#[cfg(feature = "tls-openssl")]
+pub mod metrics_tls;
 pub mod rbac;
 pub mod telemetry;
 pub mod tls_profile;
