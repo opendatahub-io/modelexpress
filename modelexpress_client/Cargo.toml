@@ -14,9 +14,16 @@ keywords.workspace = true
 
 [features]
 default = ["modelexpress-common/default"]
-openssl = ["modelexpress-common/openssl"]
+openssl = ["tls-native"]
 gcs = ["modelexpress-common/gcs"]
-tls-native = ["modelexpress-common/tls-native"]
+tls-native = [
+    "modelexpress-common/tls-native",
+    "dep:openssl",
+    "dep:tokio-openssl",
+    "dep:hyper-util",
+    "dep:tower",
+    "dep:http",
+]
 tls-rustls = ["modelexpress-common/tls-rustls"]
 
 [dependencies]
@@ -33,6 +40,11 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+tower = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
