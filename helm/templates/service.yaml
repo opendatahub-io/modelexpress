@@ -8,6 +8,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
+  {{- if and .Values.tls.enabled .Values.tls.serviceCA }}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{ .Values.tls.secretName }}
+  {{- end }}
 spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:

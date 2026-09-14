@@ -312,6 +312,66 @@ volumes:
 | `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
 
+## TLS
+
+The gRPC listener serves plaintext by default. Point it at a certificate to terminate TLS
+in the server. This needs the OpenSSL build of the binaries (`--no-default-features
+--features openssl`, the one the container images ship); the rustls development build
+rejects a TLS configuration at startup.
+
+### Server configuration
+
+| Env Var | Flag | Description |
+|---------|------|-------------|
+| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+
+Certificate and key must be set together. Version and cipher settings without a
+certificate fail config validation. A cipher name OpenSSL does not know fails startup.
+
+On OpenShift the cluster TLS profile from `apiservers.config.openshift.io/cluster` maps
+straight onto the last three variables: `spec.tlsSecurityProfile.intermediate` resolves to
+`minTLSVersion: VersionTLS12`, a `ciphers` list and a `groups` list, all accepted verbatim. Leaving both
+unset on RHEL-based images follows the system crypto policy instead.
+
+The same file also configures it:
+
+```yaml
+tls:
+  cert_file: /etc/tls/private/tls.crt
+  key_file: /etc/tls/private/tls.key
+  min_version: TLS1.2
+  cipher_suites:
+    - TLS_AES_128_GCM_SHA256
+    - TLS_AES_256_GCM_SHA384
+    - ECDHE-ECDSA-AES128-GCM-SHA256
+    - ECDHE-RSA-AES128-GCM-SHA256
+  groups:
+    - X25519MLKEM768
+    - X25519
+    - secp256r1
+```
+
+Kubernetes gRPC probes do not speak TLS, so switch the liveness and readiness probes to
+`tcpSocket` when enabling it.
+
+### Client configuration
+
+An `https://` endpoint turns TLS on in both clients. The Rust client and CLI take the
+endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
+`MX_SERVER_ADDRESS` (or the older `MODEL_EXPRESS_URL`).
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+
+On OpenShift a service-ca signed certificate verifies against the bundle injected into any
+ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the
+worker pod and point the variable at `service-ca.crt`.
+
 ## Docker
 
 ### Production Image
