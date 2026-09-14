@@ -100,6 +100,13 @@ rules:
   - update
   - patch
 - apiGroups:
+  - modelexpress.nvidia.com
+  resources:
+  - modelmetadatas/finalizers
+  - modelcacheentries/finalizers
+  verbs:
+  - update
+- apiGroups:
   - ''
   resources:
   - configmaps
