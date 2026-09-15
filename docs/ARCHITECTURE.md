@@ -383,12 +383,14 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
 | `GetTensorManifest` | `GetTensorManifestRequest` | `GetTensorManifestResponse` | Fetch tensor descriptors directly from a source worker |
+| `PrepareTensorRead` | `PrepareTensorReadRequest` | `PrepareTensorReadResponse` | Prepare a bounded read lease and exact manifest for generator-to-generator RL active refit |
+| `ReleaseTensorRead` | `ReleaseTensorReadRequest` | `ReleaseTensorReadResponse` | Confirm transfer completion and release the donor read lease |
 | `GetArtifactManifestHeader` | `GetArtifactManifestHeaderRequest` | `GetArtifactManifestHeaderResponse` | Fetch artifact identity, counts, file table, and worker endpoints |
 | `GetArtifactManifestChunks` | `GetArtifactManifestChunksRequest` | `GetArtifactManifestChunksResponse` | Fetch artifact chunk metadata pages by `chunk_index` |
 | `PrepareArtifactChunk` | `PrepareArtifactChunkRequest` | `PrepareArtifactChunkResponse` | Read one artifact range into source registered DRAM and return a NIXL descriptor lease |
 | `ReleaseArtifactChunk` | `ReleaseArtifactChunkRequest` | `ReleaseArtifactChunkResponse` | Release a prepared artifact chunk lease |
 
-Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. `GetTensorManifest` validates both `mx_source_id` and the selected runtime `worker_id` to catch stale discovery records whose endpoint has been reused by a new process. The `worker_id` handshake fields are optional for rolling-upgrade compatibility; generation validation takes effect when the source supports them.
+Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. An RL generator-to-generator active refit target calls `PrepareTensorRead` while preparing the update and holds the returned lease through transfer completion or staged-handle release. The donor owns the bounded lease lifetime, rejects new leases, and drains existing ones before mutating its published storage. Normal completion and transfer failures release immediately. A retry after a pre-transfer failure reacquires and revalidates the exact source version and worker; a consumed lease is never reused. If a target process disappears before release, the donor expires the abandoned lease automatically; no target shutdown hook is required. If the bounded drain fails before that expiry, refit fails before mutation. An expired lease makes `ReleaseTensorRead` fail, so the target discards the transfer instead of accepting potentially mixed bytes. Ordinary inference loading continues to use `GetTensorManifest` without the RL mutation fence. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. Tensor RPCs require `mx_source_id` and validate the selected runtime `worker_id` when present to catch stale discovery records whose endpoint has been reused by a new process.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
@@ -522,10 +524,13 @@ Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
 
 `GeneratorRuntime` composes three independent seams. Source resolvers discover
-candidate locations without moving bytes; update methods transfer and verify a
-typed artifact without mutating the live engine; the engine installer commits
-that artifact at the caller's safe point. Source fallback and retry limits live
-in the planner/session rather than in engine integrations.
+candidate locations without moving bytes; update methods prepare a typed update;
+the engine installer commits it at the caller's safe point. Trainer and S3
+methods transfer or reconstruct private artifacts during preparation. The
+generator-peer method instead validates the peer and exact runtime tensor catalog
+during preparation, then transfers directly into live storage at the safe point.
+Source fallback and retry limits live in the planner/session rather than in
+engine integrations.
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
@@ -572,8 +577,12 @@ generator queries `P2pService.ListSources` with the same engine-compatible
 identity and selects a READY source for its worker rank before falling back to
 trainer shard publications. Applied generators publish their complete post-load
 runtime tensors, including registered runtime buffers. An identical-rank peer
-pulls that exact runtime representation into private staging buffers, then
-copies it into the existing live tensor storage at the engine safe point.
+validates that exact runtime representation before mutation, then pulls it
+directly into the existing live tensor storage at the engine safe point. This
+avoids a second model-sized GPU allocation and copy.
+The peer holds a donor read lease through NIXL completion. Before the donor's
+next active refit, it rejects new reads and waits for all leases to drain; a
+drain timeout aborts before any live tensor is overwritten.
 Trainer NIXL inputs remain a separate load-time representation that runs through
 vLLM's normal post-weight-load processing.
 
@@ -581,9 +590,11 @@ The vLLM inference loader discovers this post-load tensor set once and retains
 the device-local mapping. The RL runtime reuses that mapping for peer layout
 validation, publication, and in-place installation instead of walking the model
 again after warmup or compilation. It also borrows the loader-owned NIXL agent:
-live tensors and private receive buffers are separate registrations on one
-rank-local transport, and the loader retains responsibility for shutting it
-down. This warm-copy path is currently unavailable for quantized models and FP8
+the already-registered live tensors are the peer receive destination, and the
+loader retains responsibility for shutting down the rank-local transport. A
+failure after the direct transfer starts leaves the engine state uncertain, so
+MX fences it rather than attempting in-process source fallback. This warm-copy
+path is currently unavailable for quantized models and FP8
 KV caches because their derived host state cannot be safely refreshed in place.
 Those workers skip generator P2P and use the canonical S3 path before any
 live-engine mutation.
@@ -1073,6 +1084,18 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+Geometry capture passes all lazy source weights through the engine loader in
+one call, amortizing model-wide parameter and expert-map construction. Each
+lazy tensor retains its original source identity, including native-to-HF view
+conversions. If an unsupported operation interrupts the bulk attempt, the
+recorder rolls every accumulator it advanced back to the attempt's starting
+state before retrying each source individually for precise diagnostics, so bulk
+capture still never produces an incorrect partial plan. The bulk cause is logged
+even when the per-source retry then succeeds for every source, because bulk order
+can trip a loader that per-source order does not. Unexpected engine errors
+propagate, and parameter loader hooks are restored on every exit. This optimizes
+the first capture without caching layouts across model or source changes.
+
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
 publication replaces that worker record. The shared `PublisherThread` sends a
@@ -1084,11 +1107,12 @@ their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
 
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
-registered staging buffers, transfer, and verification. The vLLM-specific
+trainer staging buffers, direct generator-peer transfer, and verification. The
+vLLM-specific
 `installer.py` captures trainer load-time geometry through layerwise reload and
 installs it through `process_weights_after_loading`. Generator peers instead
-transfer the complete post-load runtime tensor set and copy it into existing
-live storage without re-running PWAL. The adapter rebuilds a trainer plan when
+transfer the complete post-load runtime tensor set directly into existing live
+storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout
 requires an engine restart.
 
@@ -1304,8 +1328,8 @@ graph TD
 2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). `WorkerMetadata.accelerator` records runtime accelerator family for compatibility filtering; it is not part of `SourceIdentity` or the source-id hash. In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
 3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, which returns only READY workers whose `updated_at` is still within `MX_HEARTBEAT_TIMEOUT_SECS`, then filters by `worker_rank` and compatible runtime `accelerator`
-5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Accelerator-incompatible sources were already dropped using `SourceInstanceRef.accelerator`; this step re-checks the authoritative `WorkerMetadata.accelerator` as defense-in-depth. Empty accelerator metadata is accepted for backward compatibility. If `worker_grpc_endpoint` is populated, the target fetches the tensor manifest before target preparation and requires the endpoint to confirm the selected runtime `worker_id`. The prefetched manifest is reused during transfer; NIXL metadata is fetched via the source listen thread.
-6. **Target transfers**: Executes RDMA reads from source; for cache artifacts, it prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
+5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Accelerator-incompatible sources were already dropped using `SourceInstanceRef.accelerator`; this step re-checks the authoritative `WorkerMetadata.accelerator` as defense-in-depth. Empty accelerator metadata is accepted for backward compatibility. If `worker_grpc_endpoint` is populated, the target fetches and retains a version-validated tensor manifest before target preparation.
+6. **Target transfers**: Executes the NIXL reads using the prefetched manifest. An RL generator-to-generator active refit validates the manifest and reserves the donor while the engine is unchanged. It holds that bounded lease until staged-handle release or, at the apply safe point, writes directly into the already-registered live runtime tensors and synchronizes the target. This prevents donor mutation without allocating another model-sized GPU buffer. Preparation failures may select the next configured source. A failure after direct mutation starts fences the target as uncertain and requires engine reset or restart; a failure before the first transfer remains retryable. For cache artifacts, the target prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
