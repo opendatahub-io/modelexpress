@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The OpenShift overlay as shipped, on kind: no ServiceMonitor CRD there, and
+# the operator image comes from test_tls_kind.sh instead of quay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../../config/manifests/openshift
+- apiservers.config.openshift.io.crd.json
+images:
+- name: quay.io/opendatahub/odh-modelexpress-operator
+  newName: mx-e2e/operator
+  newTag: kind
+patches:
+- patch: |-
+    $patch: delete
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: modelexpress-operator
+      namespace: modelexpress-operator-system

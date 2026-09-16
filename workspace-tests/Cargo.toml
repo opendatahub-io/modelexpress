@@ -48,6 +48,9 @@ tonic-health = { workspace = true }
 kube = { workspace = true, features = ["ws"] }
 k8s-openapi = { workspace = true }
 anyhow = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }

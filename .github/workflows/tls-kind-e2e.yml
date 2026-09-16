@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The cluster TLS profile e2e (workspace-tests/tests/tls_kind.rs) on kind:
+# tlsAdherence and tlsSecurityProfile changes reaching both server TLS backends
+# and the operator's metrics listener, without restarts.
+
+name: TLS kind e2e
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/tls-kind-e2e.yml"
+      - "Cargo.lock"
+      - "config/manifests/**"
+      - "docker/Dockerfile.e2e"
+      - "modelexpress_client/**"
+      - "modelexpress_common/**"
+      - "modelexpress_server/**"
+      - "operator/**"
+      - "test_tls_kind.sh"
+      - "workspace-tests/tests/tls_kind.rs"
+      - "workspace-tests/tests/tls_kind/**"
+  push:
+    branches: [main]
+
+jobs:
+  tls-kind-e2e:
+    name: Cluster TLS profile on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KIND_VERSION: v0.31.0
+      KIND_SHA256: eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install kind
+        run: |
+          curl -fsSL -o /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum -c -
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-tls-kind-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tls-kind-
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build e2e images
+        run: |
+          for image in operator server-openssl server-rustls; do
+            docker buildx build --load \
+              --cache-from "type=gha,scope=tls-kind-e2e" \
+              --cache-to "type=gha,scope=tls-kind-e2e,mode=max" \
+              -f docker/Dockerfile.e2e --target "${image}" -t "mx-e2e/${image}:kind" .
+          done
+
+      - name: Run the e2e
+        run: ./test_tls_kind.sh --skip-build
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kind get kubeconfig --name mx-tls-e2e > /tmp/kubeconfig 2>/dev/null || exit 0
+          export KUBECONFIG=/tmp/kubeconfig
+          kubectl get apiservers.config.openshift.io cluster -o yaml || true
+          kubectl get pods -A -o wide || true
+          kubectl -n modelexpress-operator-system logs -l app.kubernetes.io/name=modelexpress-operator --tail=200 || true
+          for ns in mx-tls-kind-openssl mx-tls-kind-rustls; do
+            kubectl -n "$ns" get deploy,pods -o wide || true
+            kubectl -n "$ns" logs -l app.kubernetes.io/instance=mx --tail=100 || true
+          done
