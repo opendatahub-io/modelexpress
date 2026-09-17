@@ -45,9 +45,11 @@ pub const API_GROUP: &str = "modelexpress.opendatahub.io";
 pub struct ModelExpressServerSpec {
     /// Server image ref. The tag pins the mx version; mx_source_id embeds it,
     /// so a rolling image change cold-starts P2P discovery between old and new
-    /// workers.
+    /// workers. Unset follows the default server image the operator was
+    /// started with, and a change to that default rolls the server.
     #[cel_validate(rule = Rule::new("self != ''").message("image must not be empty"))]
-    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 
     /// Replicas are stateless and share no locks; safe to scale as long as the
     /// cache volume is RWX or per-replica.
@@ -632,7 +634,8 @@ mod tests {
     fn required_fields_marked_in_schema() {
         let json = crd_json();
         assert!(json.contains("metadataBackend"));
-        // spec-level required list must include the backend and image
+        // spec-level required list must include the backend; image may be
+        // left to the operator's default
         let crd = generate_crd();
         let schema = serde_json::to_value(&crd).expect("crd to json");
         let required = schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
@@ -642,7 +645,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
-        assert!(required.contains(&"image"));
+        assert!(!required.contains(&"image"));
         assert!(required.contains(&"metadataBackend"));
     }
 

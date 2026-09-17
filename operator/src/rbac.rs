@@ -161,7 +161,7 @@ mod tests {
 
     fn spec(backend: MetadataBackend, sa: Option<&str>) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "img".into(),
+            image: Some("img".into()),
             replicas: 1,
             metadata_backend: backend,
             port: 8001,

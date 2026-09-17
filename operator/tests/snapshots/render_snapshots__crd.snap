@@ -759,7 +759,8 @@ spec:
                       x-kubernetes-validations: []
                   type: object
                 image:
-                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it, so a rolling image change cold-starts P2P discovery between old and new workers."
+                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it, so a rolling image change cold-starts P2P discovery between old and new workers. Unset follows the default server image the operator was started with, and a change to that default rolls the server."
+                  nullable: true
                   type: string
                   x-kubernetes-validations:
                     - message: image must not be empty
@@ -1160,7 +1161,6 @@ spec:
                   nullable: true
                   type: array
               required:
-                - image
                 - metadataBackend
               type: object
               x-kubernetes-validations:

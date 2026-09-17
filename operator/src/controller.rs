@@ -33,6 +33,8 @@ pub enum Error {
     Kube(#[from] kube::Error),
     #[error("TLS defaults: {0}")]
     TlsDefaults(TlsDefaultsError),
+    #[error("spec.image is unset and the operator has no default server image")]
+    ServerImageUnset,
     #[error("CR has no namespace")]
     MissingNamespace,
     #[error("CR has no uid")]
@@ -53,9 +55,15 @@ pub enum Error {
 pub struct Ctx {
     pub client: Client,
     pub tls_defaults: Arc<dyn TlsDefaults>,
+    /// The server image for CRs that leave spec.image unset.
+    pub default_server_image: Option<String>,
 }
 
-pub async fn run(client: Client, tls_defaults: Arc<dyn TlsDefaults>) -> Result<(), kube::Error> {
+pub async fn run(
+    client: Client,
+    tls_defaults: Arc<dyn TlsDefaults>,
+    default_server_image: Option<String>,
+) -> Result<(), kube::Error> {
     let servers = Api::<ModelExpressServer>::all(client.clone());
     let deployments = Api::<Deployment>::all(client.clone());
     let services = Api::<Service>::all(client.clone());
@@ -97,6 +105,7 @@ pub async fn run(client: Client, tls_defaults: Arc<dyn TlsDefaults>) -> Result<(
             Arc::new(Ctx {
                 client,
                 tls_defaults,
+                default_server_image,
             }),
         )
         .for_each(|result| async move {
@@ -171,6 +180,17 @@ pub fn endpoint(name: &str, ns: &str, port: i32) -> String {
     format!("grpc://{name}.{ns}.svc.cluster.local:{port}")
 }
 
+/// The CR's image, else the operator's default.
+fn server_image<'a>(
+    spec: &'a crate::crd::ModelExpressServerSpec,
+    default: Option<&'a str>,
+) -> Result<&'a str, Error> {
+    spec.image
+        .as_deref()
+        .or(default)
+        .ok_or(Error::ServerImageUnset)
+}
+
 #[tracing::instrument(skip_all)]
 async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Result<(), Error> {
     check_existing_claim(cr, ns, ctx).await?;
@@ -189,7 +209,12 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
         mut service,
         pvc,
         network_policy,
-    } = render(name, &cr.spec, &tls_defaults);
+    } = render(
+        name,
+        &cr.spec,
+        server_image(&cr.spec, ctx.default_server_image.as_deref())?,
+        &tls_defaults,
+    );
 
     let owner = cr.controller_owner_ref(&());
     stamp(&mut deployment.metadata, ns, owner.clone());
@@ -361,6 +386,7 @@ fn reason(err: &Error) -> &'static str {
     match err {
         Error::Kube(_) => "ApplyFailed",
         Error::TlsDefaults(_) => "TlsDefaultsUnavailable",
+        Error::ServerImageUnset => "ServerImageUnset",
         Error::MissingNamespace => "MissingNamespace",
         Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
@@ -434,7 +460,7 @@ async fn write_status(
 fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Action {
     match err {
         // user-fixable config problems: no point hammering the apiserver
-        Error::MissingClaim { .. } | Error::SingleNodeClaim { .. } => {
+        Error::MissingClaim { .. } | Error::SingleNodeClaim { .. } | Error::ServerImageUnset => {
             Action::requeue(Duration::from_secs(120))
         }
         _ => Action::requeue(Duration::from_secs(15)),
@@ -444,7 +470,7 @@ fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Ac
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use crate::controller::*;
     use crate::crd::{MetadataBackend, ModelExpressServerSpec, RedisBackend};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 
@@ -452,7 +478,7 @@ mod tests {
         let mut cr = ModelExpressServer::new(
             "mx",
             ModelExpressServerSpec {
-                image: "img".into(),
+                image: Some("img".into()),
                 replicas: 1,
                 metadata_backend: MetadataBackend::Redis(RedisBackend {
                     url: Some("redis://mx-redis:6379".into()),
@@ -497,6 +523,35 @@ mod tests {
             conditions: vec![condition],
             endpoint: None,
         })
+    }
+
+    #[test]
+    fn server_image_prefers_the_cr() {
+        let mut spec = server(None).spec;
+        spec.image = Some("cr-image".into());
+        assert_eq!(
+            server_image(&spec, Some("default-image")).ok(),
+            Some("cr-image")
+        );
+    }
+
+    #[test]
+    fn server_image_falls_back_to_the_default() {
+        let mut spec = server(None).spec;
+        spec.image = None;
+        assert_eq!(
+            server_image(&spec, Some("default-image")).ok(),
+            Some("default-image")
+        );
+    }
+
+    #[test]
+    fn server_image_without_either_is_a_user_fixable_error() {
+        let mut spec = server(None).spec;
+        spec.image = None;
+        let err = server_image(&spec, None).expect_err("no image anywhere");
+        assert!(matches!(err, Error::ServerImageUnset));
+        assert_eq!(reason(&err), "ServerImageUnset");
     }
 
     #[test]

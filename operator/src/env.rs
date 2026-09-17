@@ -277,7 +277,7 @@ mod tests {
 
     fn base_spec(backend: MetadataBackend) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
+            image: Some("nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into()),
             replicas: 1,
             metadata_backend: backend,
             port: 8001,

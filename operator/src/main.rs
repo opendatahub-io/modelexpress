@@ -7,5 +7,5 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), RunError> {
-    app::run(|_| Arc::new(NoDefaults)).await
+    app::run(None, |_| Arc::new(NoDefaults)).await
 }

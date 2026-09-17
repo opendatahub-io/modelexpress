@@ -42,8 +42,10 @@ fn listen_addr(port: i32) -> Result<SocketAddr, RunError> {
 }
 
 /// Run the operator until a listener or the controller exits.
+/// `default_server_image` serves CRs that leave spec.image unset, and
 /// `tls_defaults` builds the TLS defaults source from the cluster client.
 pub async fn run(
+    default_server_image: Option<String>,
     tls_defaults: impl FnOnce(Client) -> Arc<dyn TlsDefaults>,
 ) -> Result<(), RunError> {
     telemetry::init_tracing(telemetry::LogFormat::from_env())?;
@@ -74,7 +76,7 @@ pub async fn run(
     tokio::select! {
         res = telemetry::serve_plain(health_addr, telemetry::health_router()) => res?,
         res = metrics => res?,
-        res = controller::run(client, tls_defaults) => res?,
+        res = controller::run(client, tls_defaults, default_server_image) => res?,
     }
     Ok(())
 }

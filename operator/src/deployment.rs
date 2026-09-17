@@ -39,9 +39,12 @@ pub struct DesiredState {
 
 /// `tls_defaults` fill in what `spec.tls` leaves unset; they only matter when
 /// `spec.tls` is set.
+/// `image` is the server image the reconciler resolved from `spec.image` and
+/// the operator's default.
 pub fn render(
     cr_name: &str,
     spec: &ModelExpressServerSpec,
+    image: &str,
     tls_defaults: &TlsSettings,
 ) -> DesiredState {
     let CacheVolume { volume, mount, pvc } = render_cache_volume(cr_name, spec);
@@ -88,7 +91,7 @@ pub fn render(
 
     let container = Container {
         name: CONTAINER_NAME.to_string(),
-        image: Some(spec.image.clone()),
+        image: Some(image.to_string()),
         ports: Some(vec![ContainerPort {
             name: Some(PORT_NAME.to_string()),
             container_port: spec.port,
@@ -316,7 +319,7 @@ mod tests {
 
     fn base_spec() -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
+            image: Some("nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into()),
             replicas: 2,
             metadata_backend: MetadataBackend::Redis(RedisBackend {
                 url: Some("redis://mx-redis:6379".into()),
@@ -367,7 +370,7 @@ mod tests {
 
     #[test]
     fn selector_matches_pod_labels() {
-        let state = render("mx", &base_spec(), &TlsSettings::default());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let dep_spec = state.deployment.spec.as_ref().expect("spec");
         let selector = dep_spec
             .selector
@@ -398,7 +401,12 @@ mod tests {
 
     #[test]
     fn replicas_image_and_port_propagate() {
-        let state = render("mx", &base_spec(), &TlsSettings::default());
+        let state = render(
+            "mx",
+            &base_spec(),
+            "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0",
+            &TlsSettings::default(),
+        );
         assert_eq!(
             state.deployment.spec.as_ref().expect("spec").replicas,
             Some(2)
@@ -441,7 +449,7 @@ mod tests {
             ..Affinity::default()
         });
 
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let pod = pod_spec(&state);
         assert_eq!(
             pod.node_selector
@@ -468,7 +476,7 @@ mod tests {
 
     #[test]
     fn scheduling_fields_are_unset_by_default() {
-        let pod_owned = render("mx", &base_spec(), &TlsSettings::default());
+        let pod_owned = render("mx", &base_spec(), "img", &TlsSettings::default());
         let pod = pod_spec(&pod_owned);
         assert!(pod.node_selector.is_none());
         assert!(pod.tolerations.is_none());
@@ -479,7 +487,7 @@ mod tests {
     fn grpc_probes_target_the_server_port() {
         let mut spec = base_spec();
         spec.port = 9000;
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let c = container(&state);
         let readiness = c.readiness_probe.as_ref().expect("readiness");
         let liveness = c.liveness_probe.as_ref().expect("liveness");
@@ -489,7 +497,7 @@ mod tests {
 
     #[test]
     fn env_and_volume_are_wired_into_the_pod() {
-        let state = render("mx", &base_spec(), &TlsSettings::default());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let c = container(&state);
         let env = c.env.as_ref().expect("env");
         assert!(env.iter().any(|e| e.name == "MX_METADATA_BACKEND"));
@@ -514,7 +522,7 @@ mod tests {
 
     #[test]
     fn service_targets_named_port() {
-        let state = render("mx", &base_spec(), &TlsSettings::default());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let port = &state
             .service
             .spec
@@ -551,7 +559,7 @@ mod tests {
                 .collect(),
             ),
         });
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let meta = &state.service.metadata;
         let labels = meta.labels.as_ref().expect("labels");
         assert_eq!(labels.get("team").map(String::as_str), Some("inference"));
@@ -574,7 +582,7 @@ mod tests {
 
     #[test]
     fn service_without_service_metadata_has_no_annotations() {
-        let state = render("mx", &base_spec(), &TlsSettings::default());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         assert!(state.service.metadata.annotations.is_none());
     }
 
@@ -597,7 +605,7 @@ mod tests {
                     .collect(),
             ),
         });
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let template_meta = state
             .deployment
             .spec
@@ -630,7 +638,7 @@ mod tests {
     #[test]
     fn ephemeral_cache_rolls_but_pvc_cache_recreates() {
         let strategy = |spec: &ModelExpressServerSpec| {
-            render("mx", spec, &TlsSettings::default())
+            render("mx", spec, "img", &TlsSettings::default())
                 .deployment
                 .spec
                 .expect("spec")
@@ -691,7 +699,7 @@ mod tests {
             allow_from: vec![NetworkPolicyPeer::default()],
         });
 
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let rbac = crate::rbac::render_rbac("mx", &spec);
 
         let mut checked = 0;
@@ -754,7 +762,7 @@ mod tests {
     #[test]
     fn network_policy_absent_by_default() {
         assert!(
-            render("mx", &base_spec(), &TlsSettings::default())
+            render("mx", &base_spec(), "img", &TlsSettings::default())
                 .network_policy
                 .is_none()
         );
@@ -778,7 +786,7 @@ mod tests {
                 ..NetworkPolicyPeer::default()
             }],
         });
-        let netpol = render("mx", &spec, &TlsSettings::default())
+        let netpol = render("mx", &spec, "img", &TlsSettings::default())
             .network_policy
             .expect("netpol");
         let np_spec = netpol.spec.expect("spec");
@@ -819,7 +827,7 @@ mod tests {
             }))),
             ..CacheConfig::default()
         });
-        let state = render("mx", &spec, &TlsSettings::default());
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let pvc = state.pvc.expect("pvc");
         assert_eq!(pvc.metadata.name.as_deref(), Some("mx-model-cache"));
     }

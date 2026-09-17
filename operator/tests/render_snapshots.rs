@@ -16,6 +16,8 @@ use modelexpress_operator::deployment::render;
 use modelexpress_operator::tls::TlsSettings;
 use std::collections::BTreeMap;
 
+const SERVER_IMAGE: &str = "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0";
+
 fn minimal_spec() -> ModelExpressServerSpec {
     serde_json::from_value(serde_json::json!({
         "image": "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0",
@@ -26,7 +28,7 @@ fn minimal_spec() -> ModelExpressServerSpec {
 
 fn full_spec() -> ModelExpressServerSpec {
     ModelExpressServerSpec {
-        image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
+        image: Some(SERVER_IMAGE.into()),
         replicas: 3,
         metadata_backend: MetadataBackend::Redis(RedisBackend {
             url: Some("redis://mx-redis:6379".into()),
@@ -142,7 +144,12 @@ fn full_spec() -> ModelExpressServerSpec {
 
 #[test]
 fn minimal_kubernetes_backend() {
-    let state = render("mx-min", &minimal_spec(), &TlsSettings::default());
+    let state = render(
+        "mx-min",
+        &minimal_spec(),
+        SERVER_IMAGE,
+        &TlsSettings::default(),
+    );
     insta::assert_yaml_snapshot!("minimal_deployment", state.deployment);
     insta::assert_yaml_snapshot!("minimal_service", state.service);
     assert!(state.pvc.is_none());
@@ -150,7 +157,12 @@ fn minimal_kubernetes_backend() {
 
 #[test]
 fn full_redis_backend() {
-    let state = render("mx-full", &full_spec(), &TlsSettings::default());
+    let state = render(
+        "mx-full",
+        &full_spec(),
+        SERVER_IMAGE,
+        &TlsSettings::default(),
+    );
     insta::assert_yaml_snapshot!("full_deployment", state.deployment);
     insta::assert_yaml_snapshot!("full_service", state.service);
     insta::assert_yaml_snapshot!("full_pvc", state.pvc.expect("managed pvc"));
@@ -169,7 +181,7 @@ fn empty_dir_with_limit_and_existing_claim() {
         })),
         ..CacheConfig::default()
     });
-    let state = render("mx-scratch", &spec, &TlsSettings::default());
+    let state = render("mx-scratch", &spec, SERVER_IMAGE, &TlsSettings::default());
     insta::assert_yaml_snapshot!("empty_dir_pod_volumes", volumes(&state));
 
     spec.cache = Some(CacheConfig {
@@ -178,7 +190,7 @@ fn empty_dir_with_limit_and_existing_claim() {
         })),
         ..CacheConfig::default()
     });
-    let state = render("mx-shared", &spec, &TlsSettings::default());
+    let state = render("mx-shared", &spec, SERVER_IMAGE, &TlsSettings::default());
     insta::assert_yaml_snapshot!("existing_claim_pod_volumes", volumes(&state));
 }
 
@@ -257,7 +269,7 @@ fn tls_from_platform_defaults() {
             "mx-tls".into(),
         )])),
     });
-    let state = render("mx-tls", &spec, &platform_defaults());
+    let state = render("mx-tls", &spec, SERVER_IMAGE, &platform_defaults());
     insta::assert_yaml_snapshot!("tls_deployment", state.deployment);
     insta::assert_yaml_snapshot!("tls_service", state.service);
 }
@@ -271,7 +283,7 @@ fn tls_without_defaults_renders_only_what_the_cr_pins() {
         cipher_suites: Vec::new(),
         groups: Vec::new(),
     });
-    let state = render("mx-plain", &spec, &TlsSettings::default());
+    let state = render("mx-plain", &spec, SERVER_IMAGE, &TlsSettings::default());
     let names: Vec<String> = tls_env(&state).into_iter().map(|(name, _)| name).collect();
     assert_eq!(
         names,
@@ -293,7 +305,12 @@ fn tls_pinned_in_cr() {
         cipher_suites: vec!["ECDHE-RSA-AES256-GCM-SHA384".into()],
         groups: vec!["secp256r1".into()],
     });
-    let env = tls_env(&render("mx-pinned", &spec, &platform_defaults()));
+    let env = tls_env(&render(
+        "mx-pinned",
+        &spec,
+        SERVER_IMAGE,
+        &platform_defaults(),
+    ));
     let value = |name: &str| {
         env.iter()
             .find(|(n, _)| n == name)

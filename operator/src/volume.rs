@@ -139,7 +139,7 @@ mod tests {
 
     fn spec_with_cache(cache: Option<CacheConfig>) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "img".into(),
+            image: Some("img".into()),
             replicas: 1,
             metadata_backend: MetadataBackend::Kubernetes {},
             port: 8001,
