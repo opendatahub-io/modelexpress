@@ -26,17 +26,19 @@ spec:
         livenessProbe:
           httpGet:
             path: /healthz
-            port: http-metrics
+            port: http-health
           initialDelaySeconds: 5
           periodSeconds: 10
         name: operator
         ports:
+        - containerPort: 8081
+          name: http-health
         - containerPort: 8080
           name: http-metrics
         readinessProbe:
           httpGet:
             path: /readyz
-            port: http-metrics
+            port: http-health
           initialDelaySeconds: 5
           periodSeconds: 10
         resources:

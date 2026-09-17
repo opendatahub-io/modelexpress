@@ -167,6 +167,10 @@ fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
             config.join("manager/deployment.yaml"),
             to_yaml(&objects::deployment(image))?,
         ),
+        (
+            config.join("manager/service.yaml"),
+            to_yaml(&objects::metrics_service())?,
+        ),
         (config.join("base/params.env"), params),
     ])
 }
