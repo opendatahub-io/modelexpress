@@ -6,18 +6,30 @@
 # Multi-stage build that compiles the operator from source on UBI9.
 # Runtime stage uses ubi-minimal for a small footprint with microdnf
 # available if additional packages are ever needed.
+#
+# Hermetic: every input is prefetched by Hermeto (cargo, rpm, generic) per
+# docker/konflux/operator/. Local build: ./docker/konflux/build-local.sh operator
 
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae604b5f072e1833b2bde417a0ffd4afd938b96 AS build
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        rust cargo gcc openssl-devel \
+        rust cargo gcc binutils openssl-devel tar xz \
     && dnf clean all
+
+# Embeds the dependency tree in the binary for cargo audit bin and SBOM scanners
+ARG CARGO_AUDITABLE_VERSION=0.7.5
+RUN tar xJf /cachi2/output/deps/generic/cargo-auditable-${CARGO_AUDITABLE_VERSION}-$(uname -m).tar.xz \
+        -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-auditable' \
+    && cargo auditable --version
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release --package modelexpress-operator \
+RUN __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly CARGO_BUILD_SBOM=true \
+    cargo auditable build -Z sbom --release --package modelexpress-operator \
         --no-default-features --features openssl \
+    && objdump -h target/release/modelexpress-operator | grep -q '\.dep-v0' \
+    && ci/check-fips-crypto.sh target/release/modelexpress-operator \
     && cp target/release/modelexpress-operator /modelexpress-operator
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
