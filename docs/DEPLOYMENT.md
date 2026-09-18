@@ -276,7 +276,9 @@ The server's ServiceAccount needs permission to create `TokenReview`s (a cluster
 subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
 The Helm chart creates this automatically when it also creates the ServiceAccount
 (`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
-existing ServiceAccount, create the equivalent binding separately:
+existing ServiceAccount, create the equivalent binding separately. The operator creates
+it for any `ModelExpressServer` with `spec.security.mode: enforce`, including one using
+`spec.serviceAccountName`, and deletes it when the mode changes or the CR goes away:
 
 ```yaml
 security:

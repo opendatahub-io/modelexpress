@@ -6,13 +6,16 @@
 use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
 use crate::labels;
-use crate::rbac::{ServerRbac, render_rbac, role_name, service_account_name};
+use crate::rbac::{
+    ServerRbac, auth_delegator_binding_name, render_auth_delegator_binding, render_rbac, role_name,
+    service_account_name,
+};
 use crate::tls::{self, TlsDefaults, TlsDefaultsError, TlsSettings};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{Api, ObjectMeta, PartialObjectMeta, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
@@ -24,6 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const FIELD_MANAGER: &str = "modelexpress-operator";
+
+/// Carried only by CRs that own a ClusterRoleBinding. Cluster-scoped objects
+/// cannot be garbage collected through a namespaced owner, so enforce mode
+/// needs the operator to delete the binding itself.
+pub const AUTH_DELEGATOR_FINALIZER: &str = "modelexpress.opendatahub.io/auth-delegator";
 
 const WATCH_TIMEOUT_SECS: u32 = 290;
 
@@ -154,11 +162,16 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     let ns = cr.namespace().ok_or(Error::MissingNamespace)?;
     let name = cr.name_any();
 
+    if cr.metadata.deletion_timestamp.is_some() {
+        release_auth_delegator(&cr, &ns, &name, &ctx).await?;
+        return Ok(Action::await_change());
+    }
+
     let result = apply(&cr, &ns, &name, &ctx).await;
     let (condition, endpoint, observed_generation) = match &result {
         Ok(()) => (
             ready_condition(&cr, "True", "Applied", "resources applied"),
-            Some(endpoint(&name, &ns, cr.spec.port)),
+            Some(endpoint(&name, &ns, cr.spec.port, cr.spec.tls.is_some())),
             cr.metadata.generation,
         ),
         Err(err) => (
@@ -175,9 +188,12 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
 }
 
 /// What clients set MODEL_EXPRESS_ENDPOINT to. The Service is always named
-/// after the CR.
-pub fn endpoint(name: &str, ns: &str, port: i32) -> String {
-    format!("grpc://{name}.{ns}.svc.cluster.local:{port}")
+/// after the CR. The scheme is what the clients parse: the Rust client
+/// negotiates TLS for `https` only, and the Python client strips `http://`
+/// and `https://` and nothing else.
+pub fn endpoint(name: &str, ns: &str, port: i32, tls: bool) -> String {
+    let scheme = if tls { "https" } else { "http" };
+    format!("{scheme}://{name}.{ns}.svc.cluster.local:{port}")
 }
 
 /// The CR's image, else the operator's default.
@@ -301,7 +317,106 @@ async fn apply_rbac(
             delete_if_owned(&role_api, &rname, uid).await?;
         }
     }
+
+    apply_auth_delegator(cr, ns, &name, ctx, params).await
+}
+
+/// The binding outlives the CR unless the operator deletes it, so the
+/// finalizer goes on before the binding is created.
+#[tracing::instrument(skip_all)]
+async fn apply_auth_delegator(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+    params: &PatchParams,
+) -> Result<(), Error> {
+    let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
+    let binding_name = auth_delegator_binding_name(name, ns);
+    match render_auth_delegator_binding(name, ns, &cr.spec) {
+        Some(binding) => {
+            set_finalizer(cr, ns, name, ctx, true).await?;
+            api.patch(&binding_name, params, &Patch::Apply(&binding))
+                .await?;
+        }
+        None => {
+            delete_if_managed(&api, &binding_name, name).await?;
+            set_finalizer(cr, ns, name, ctx, false).await?;
+        }
+    }
     Ok(())
+}
+
+/// Runs on a CR that is going away: drop the binding, then the finalizer that
+/// held the CR open for it.
+#[tracing::instrument(skip_all)]
+async fn release_auth_delegator(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+) -> Result<(), Error> {
+    let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
+    delete_if_managed(&api, &auth_delegator_binding_name(name, ns), name).await?;
+    set_finalizer(cr, ns, name, ctx, false).await
+}
+
+async fn set_finalizer(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+    present: bool,
+) -> Result<(), Error> {
+    let current = cr.finalizers();
+    let held = current.iter().any(|f| f == AUTH_DELEGATOR_FINALIZER);
+    if held == present {
+        return Ok(());
+    }
+    let mut finalizers: Vec<String> = current
+        .iter()
+        .filter(|f| f.as_str() != AUTH_DELEGATOR_FINALIZER)
+        .cloned()
+        .collect();
+    if present {
+        finalizers.push(AUTH_DELEGATOR_FINALIZER.to_string());
+    }
+    let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
+    let patch = serde_json::json!({ "metadata": { "finalizers": finalizers } });
+    match api
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        // the CR is already gone; nothing left to hold open
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Cluster-scoped objects carry no ownerReference back to a namespaced CR, so
+/// the managed labels are the only proof the operator created this one.
+async fn delete_if_managed(
+    api: &Api<ClusterRoleBinding>,
+    name: &str,
+    cr_name: &str,
+) -> Result<(), Error> {
+    let Some(existing) = api.get_opt(name).await? else {
+        return Ok(());
+    };
+    let labels = existing.labels();
+    let managed = labels.get(labels::MANAGED_BY_LABEL).map(String::as_str)
+        == Some(labels::MANAGED_BY)
+        && labels.get(labels::INSTANCE_LABEL).map(String::as_str) == Some(cr_name);
+    if !managed {
+        tracing::debug!(name, "not operator-owned, leaving in place");
+        return Ok(());
+    }
+    match api.delete(name, &Default::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Cleanup targets names derived from the CR, not names the operator can prove

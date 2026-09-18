@@ -8,13 +8,18 @@
 //! exits at startup with a 403. Rules mirror upstream's
 //! ci/k8s/server/rbac-modelmetadata.yaml.
 
-use crate::crd::{MetadataBackend, ModelExpressServerSpec};
+use crate::crd::{AuthMode, MetadataBackend, ModelExpressServerSpec};
 use crate::labels::managed_labels;
 use k8s_openapi::api::core::v1::ServiceAccount;
-use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
+use k8s_openapi::api::rbac::v1::{
+    ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
+};
 use kube::api::ObjectMeta;
 
 pub const UPSTREAM_API_GROUP: &str = "modelexpress.nvidia.com";
+
+/// Built-in ClusterRole granting tokenreviews and subjectaccessreviews create.
+pub const AUTH_DELEGATOR_CLUSTER_ROLE: &str = "system:auth-delegator";
 
 /// SA the server pod runs as. Users can bring their own via
 /// spec.serviceAccountName; then nothing here is created and binding the
@@ -27,6 +32,44 @@ pub fn service_account_name(cr_name: &str, spec: &ModelExpressServerSpec) -> Str
 
 pub fn role_name(cr_name: &str) -> String {
     format!("{cr_name}-metadata")
+}
+
+/// ClusterRoleBindings share one namespace-less name space, so the name
+/// carries the CR's namespace as well as its name.
+pub fn auth_delegator_binding_name(cr_name: &str, ns: &str) -> String {
+    format!("modelexpress-{ns}-{cr_name}-auth-delegator")
+}
+
+/// Enforce mode validates client tokens with TokenReview, which is a
+/// cluster-scoped API: a namespaced Role cannot grant it. Returns None for
+/// every other mode, and the caller then deletes a binding left over from a
+/// CR that used to enforce.
+pub fn render_auth_delegator_binding(
+    cr_name: &str,
+    ns: &str,
+    spec: &ModelExpressServerSpec,
+) -> Option<ClusterRoleBinding> {
+    if spec.security.as_ref().map(|s| s.mode) != Some(AuthMode::Enforce) {
+        return None;
+    }
+    Some(ClusterRoleBinding {
+        metadata: ObjectMeta {
+            name: Some(auth_delegator_binding_name(cr_name, ns)),
+            labels: Some(managed_labels(cr_name)),
+            ..ObjectMeta::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: AUTH_DELEGATOR_CLUSTER_ROLE.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: service_account_name(cr_name, spec),
+            namespace: Some(ns.to_string()),
+            ..Subject::default()
+        }]),
+    })
 }
 
 pub struct ServerRbac {
@@ -157,7 +200,7 @@ pub fn render_rbac(cr_name: &str, spec: &ModelExpressServerSpec) -> ServerRbac {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::crd::RedisBackend;
+    use crate::crd::{RedisBackend, SecurityConfig};
 
     fn spec(backend: MetadataBackend, sa: Option<&str>) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
@@ -251,6 +294,66 @@ mod tests {
         assert!(rbac.service_account.is_some());
         assert!(rbac.role.is_none());
         assert!(rbac.role_binding.is_none());
+    }
+
+    #[test]
+    fn enforce_mode_binds_the_server_sa_to_auth_delegator() {
+        let mut spec = spec(MetadataBackend::Kubernetes {}, None);
+        spec.security = Some(SecurityConfig {
+            mode: AuthMode::Enforce,
+            token_audiences: vec!["modelexpress".into()],
+            allowed_service_accounts: vec![],
+            cache_ttl_secs: None,
+        });
+        let binding = render_auth_delegator_binding("mx", "mx-system", &spec).expect("binding");
+        assert_eq!(
+            binding.metadata.name.as_deref(),
+            Some("modelexpress-mx-system-mx-auth-delegator")
+        );
+        assert_eq!(binding.role_ref.kind, "ClusterRole");
+        assert_eq!(binding.role_ref.name, AUTH_DELEGATOR_CLUSTER_ROLE);
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects[0].name, "mx-server");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("mx-system"));
+        assert_eq!(
+            binding.metadata.labels.expect("labels"),
+            managed_labels("mx"),
+            "delete_if_managed proves ownership from these labels alone"
+        );
+    }
+
+    #[test]
+    fn enforce_mode_binds_a_user_supplied_sa() {
+        let mut spec = spec(MetadataBackend::Kubernetes {}, Some("my-sa"));
+        spec.security = Some(SecurityConfig {
+            mode: AuthMode::Enforce,
+            token_audiences: vec!["modelexpress".into()],
+            allowed_service_accounts: vec![],
+            cache_ttl_secs: None,
+        });
+        let binding = render_auth_delegator_binding("mx", "mx-system", &spec).expect("binding");
+        assert_eq!(binding.subjects.expect("subjects")[0].name, "my-sa");
+    }
+
+    #[test]
+    fn non_enforce_modes_get_no_cluster_binding() {
+        let mut spec = spec(MetadataBackend::Kubernetes {}, None);
+        assert!(render_auth_delegator_binding("mx", "mx-system", &spec).is_none());
+        spec.security = Some(SecurityConfig {
+            mode: AuthMode::Disabled,
+            token_audiences: vec![],
+            allowed_service_accounts: vec![],
+            cache_ttl_secs: None,
+        });
+        assert!(render_auth_delegator_binding("mx", "mx-system", &spec).is_none());
+    }
+
+    #[test]
+    fn binding_names_are_unique_per_namespace() {
+        assert_ne!(
+            auth_delegator_binding_name("mx", "team-a"),
+            auth_delegator_binding_name("mx", "team-b")
+        );
     }
 
     #[test]

@@ -92,6 +92,16 @@ pub fn cluster_role_rules() -> Vec<PolicyRule> {
             verbs: crud(),
             ..PolicyRule::default()
         },
+        // Enforce mode binds the server SA to system:auth-delegator. Granting
+        // that role needs the tokenreviews and subjectaccessreviews rules
+        // below, which the operator already holds for its own metrics auth,
+        // so RBAC escalation prevention lets the binding through.
+        PolicyRule {
+            api_groups: Some(vec!["rbac.authorization.k8s.io".to_string()]),
+            resources: Some(vec!["clusterrolebindings".to_string()]),
+            verbs: crud(),
+            ..PolicyRule::default()
+        },
         PolicyRule {
             api_groups: Some(vec!["authentication.k8s.io".to_string()]),
             resources: Some(vec!["tokenreviews".to_string()]),

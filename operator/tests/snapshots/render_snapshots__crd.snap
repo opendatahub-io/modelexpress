@@ -1203,7 +1203,7 @@ spec:
                     type: object
                   type: array
                 endpoint:
-                  description: gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to.
+                  description: "gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as `http://host:port`, or `https://host:port` when spec.tls is set."
                   nullable: true
                   type: string
                 observedGeneration:

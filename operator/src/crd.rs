@@ -462,7 +462,8 @@ pub struct ModelExpressServerStatus {
     /// Standard conditions; Ready is the rollup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
-    /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to.
+    /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as
+    /// `http://host:port`, or `https://host:port` when spec.tls is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 }
@@ -605,8 +606,16 @@ mod tests {
     #[test]
     fn endpoint_format_is_service_dns() {
         assert_eq!(
-            crate::controller::endpoint("mx", "weaton-dev", 8001),
-            "grpc://mx.weaton-dev.svc.cluster.local:8001"
+            crate::controller::endpoint("mx", "weaton-dev", 8001, false),
+            "http://mx.weaton-dev.svc.cluster.local:8001"
+        );
+    }
+
+    #[test]
+    fn tls_endpoint_uses_https() {
+        assert_eq!(
+            crate::controller::endpoint("mx", "weaton-dev", 8001, true),
+            "https://mx.weaton-dev.svc.cluster.local:8001"
         );
     }
 
