@@ -36,7 +36,6 @@ replacements:
       name: modelexpress-operator
 resources:
 - ../default
-- apiservers-clusterrole.yaml
-- apiservers-clusterrolebinding.yaml
+- openshift-clusterrole.yaml
+- openshift-clusterrolebinding.yaml
 - service-ca-configmap.yaml
-- servicemonitor.yaml

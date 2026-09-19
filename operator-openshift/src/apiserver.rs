@@ -21,6 +21,7 @@ use kube::runtime::watcher;
 use kube::runtime::watcher::metadata_watcher;
 use modelexpress_operator::tls::{TlsDefaults, TlsDefaultsError, TlsSettings, TlsUpdates};
 use serde::Deserialize;
+use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub const API_GROUP: &str = "config.openshift.io";
@@ -228,6 +229,34 @@ pub async fn fetch(client: &Client) -> Result<TlsSettings, FetchError> {
     }
 }
 
+/// How long to wait before asking again when discovery could not answer.
+const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether the cluster serves the OpenShift config API.
+enum Served {
+    Yes,
+    No,
+    Unknown(kube::Error),
+}
+
+async fn served(client: &Client) -> Served {
+    match kube::discovery::oneshot::pinned_kind(client, &gvk()).await {
+        Ok(_) => Served::Yes,
+        Err(e) if absent(&e) => Served::No,
+        Err(e) => Served::Unknown(e),
+    }
+}
+
+/// A definite "this cluster has no such API", as opposed to an apiserver that
+/// could not be asked.
+fn absent(error: &kube::Error) -> bool {
+    match error {
+        kube::Error::Discovery(_) => true,
+        kube::Error::Api(response) => response.code == 404,
+        _ => false,
+    }
+}
+
 /// [`TlsDefaults`] backed by `apiservers.config.openshift.io/cluster`.
 #[derive(Clone)]
 pub struct ApiServerTlsDefaults {
@@ -248,37 +277,69 @@ impl TlsDefaults for ApiServerTlsDefaults {
     }
 
     /// Re-reads the object on every change and yields only when the settings
-    /// to follow differ from the last ones. Stays pending off OpenShift.
+    /// to follow differ from the last ones. The first read is always yielded,
+    /// so a change between a caller's `current()` and this one is not lost.
+    ///
+    /// Discovery says whether the API is there: a definite no ends the stream
+    /// (any non-OpenShift cluster), while an apiserver that is merely
+    /// unreachable is retried, since giving up would pin the caller to the
+    /// settings it started with until the process restarts.
     async fn updates(&self) -> TlsUpdates {
-        if kube::discovery::oneshot::pinned_kind(&self.client, &gvk())
-            .await
-            .is_err()
-        {
-            tracing::info!("config.openshift.io not served; TLS follows the Intermediate profile");
-            return Box::pin(futures::stream::pending());
-        }
-        tracing::info!("watching apiservers.config.openshift.io/cluster for TLS profile changes");
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let client = self.client.clone();
-        let mut last = fetch(&client).await.ok();
-        let api = Api::<DynamicObject>::all_with(client.clone(), &api_resource());
         tokio::spawn(async move {
-            let config = watcher::Config::default().timeout(WATCH_TIMEOUT_SECS);
-            let mut events = metadata_watcher(api, config).touched_objects().boxed();
-            while let Some(event) = events.next().await {
-                if let Err(e) = event {
-                    tracing::warn!("APIServer watch error: {e}");
-                    continue;
+            let mut last: Option<TlsSettings> = None;
+            loop {
+                match served(&client).await {
+                    Served::No => {
+                        tracing::info!(
+                            "{API_GROUP} not served; TLS follows the Intermediate profile"
+                        );
+                        return;
+                    }
+                    Served::Unknown(e) => {
+                        tracing::warn!(
+                            "checking whether {API_GROUP} is served: {e}; retrying in {}s",
+                            DISCOVERY_RETRY.as_secs()
+                        );
+                        tokio::time::sleep(DISCOVERY_RETRY).await;
+                        continue;
+                    }
+                    Served::Yes => {}
                 }
-                match fetch(&client).await {
-                    Ok(settings) if last.as_ref() == Some(&settings) => {}
-                    Ok(settings) => {
-                        last = Some(settings.clone());
-                        if tx.send(settings).await.is_err() {
-                            break;
+                tracing::info!(
+                    "watching apiservers.{API_GROUP}/{CLUSTER_OBJECT} for TLS profile changes"
+                );
+                let api = Api::<DynamicObject>::all_with(client.clone(), &api_resource());
+                let config = watcher::Config::default().timeout(WATCH_TIMEOUT_SECS);
+                let mut events = metadata_watcher(api, config).touched_objects().boxed();
+                // The first pass through has no event to wait for: read now so
+                // the caller starts from what the cluster says.
+                let mut read_now = true;
+                loop {
+                    if !read_now {
+                        match events.next().await {
+                            None => break,
+                            Some(Err(e)) => {
+                                tracing::warn!("APIServer watch error: {e}");
+                                continue;
+                            }
+                            Some(Ok(_)) => {}
                         }
                     }
-                    Err(e) => tracing::warn!("re-reading cluster TLS profile after a change: {e}"),
+                    read_now = false;
+                    match fetch(&client).await {
+                        Ok(settings) if last.as_ref() == Some(&settings) => {}
+                        Ok(settings) => {
+                            last = Some(settings.clone());
+                            if tx.send(settings).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("re-reading cluster TLS profile after a change: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -290,14 +351,39 @@ impl TlsDefaults for ApiServerTlsDefaults {
 #[allow(clippy::expect_used)]
 mod tests {
     use crate::apiserver::{
-        ProfileError, TlsAdherence, from_apiserver_spec, from_security_profile, intermediate,
-        modern, old,
+        ProfileError, TlsAdherence, absent, from_apiserver_spec, from_security_profile,
+        intermediate, modern, old,
     };
     use modelexpress_operator::tls::TlsSettings;
     use serde_json::json;
 
     fn profile(value: serde_json::Value) -> TlsSettings {
         from_security_profile(&value).expect("valid profile")
+    }
+
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "boom".to_string(),
+            reason: "Boom".to_string(),
+            code,
+        })
+    }
+
+    #[test]
+    fn a_missing_api_is_absent() {
+        assert!(absent(&kube::Error::Discovery(
+            kube::error::DiscoveryError::MissingApiGroup("config.openshift.io".to_string())
+        )));
+        assert!(absent(&api_error(404)));
+    }
+
+    #[test]
+    fn an_unreachable_apiserver_is_not_absent() {
+        assert!(!absent(&api_error(503)));
+        assert!(!absent(&api_error(500)));
+        assert!(!absent(&api_error(403)));
+        assert!(!absent(&kube::Error::LinesCodecMaxLineLengthExceeded));
     }
 
     #[test]

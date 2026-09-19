@@ -3,3 +3,4 @@
 
 pub mod apiserver;
 pub mod images;
+pub mod servicemonitor;

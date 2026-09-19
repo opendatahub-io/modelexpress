@@ -7,11 +7,11 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: xtask
     app.kubernetes.io/name: modelexpress-operator
-  name: modelexpress-operator-apiservers
+  name: modelexpress-operator-openshift
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: modelexpress-operator-apiservers
+  name: modelexpress-operator-openshift
 subjects:
 - kind: ServiceAccount
   name: modelexpress-operator

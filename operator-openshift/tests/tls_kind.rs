@@ -19,7 +19,11 @@
 //!   (metrics certificate rotated)                new cert served, no restart
 //! ```
 //!
-//! The CRD is openshift/api's TechPreviewNoUpgrade variant, the one carrying
+//! The prometheus-operator API is installed too, as a schemaless CRD for the
+//! same group and kind, so the ServiceMonitor the operator applies for its own
+//! metrics can be checked without running prometheus-operator.
+//!
+//! The APIServer CRD is openshift/api's TechPreviewNoUpgrade variant, the one carrying
 //! `spec.tlsAdherence`, stored as JSON: config/v1/zz_generated.crd-manifests/
 //! 0000_10_config-operator_01_apiservers-TechPreviewNoUpgrade.crd.yaml at
 //! openshift/api fba11a566839afbcdab1162978eb836ad8b86cad.
@@ -42,6 +46,7 @@ use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch,
     PatchParams, PostParams,
 };
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, ResourceExt};
 use modelexpress_client::Client as MxClient;
 use modelexpress_common::client_config::ClientConfig;
@@ -60,6 +65,12 @@ use rustls::{
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
+
+/// Set by test_tls_kind.sh: this test is destructive, so it does not run
+/// against whatever cluster happens to be current.
+const OPT_IN_ENV: &str = "MX_TLS_KIND_E2E";
+const CONTEXT_ENV: &str = "MX_TLS_KIND_CONTEXT";
+const DEFAULT_CONTEXT: &str = "kind-mx-tls-e2e";
 
 const OPERATOR_NS: &str = "modelexpress-operator-system";
 const OPERATOR_SELECTOR: &str = "app.kubernetes.io/name=modelexpress-operator";
@@ -411,10 +422,30 @@ async fn http_status(stream: &mut Stream, path: &str) -> Result<String> {
 // Cluster objects
 // ---------------------------------------------------------------------------
 
+/// This test deletes apiservers/cluster, the operator's pods and its own
+/// namespaces, so it refuses to run until it has been told to and the
+/// kubeconfig points at the throwaway cluster. `#[ignore]` only keeps it out
+/// of a plain `cargo test`.
 async fn kube_client() -> Result<Client> {
-    Client::try_default()
+    if std::env::var(OPT_IN_ENV).ok().as_deref() != Some("1") {
+        bail!(
+            "{OPT_IN_ENV}=1 is required: this test deletes apiservers/cluster, \
+             the operator's pods and the namespaces it uses. ./test_tls_kind.sh sets it."
+        );
+    }
+    let expected = std::env::var(CONTEXT_ENV).unwrap_or_else(|_| DEFAULT_CONTEXT.to_string());
+    let kubeconfig = Kubeconfig::read().context("reading the kubeconfig")?;
+    let current = kubeconfig.current_context.clone().unwrap_or_default();
+    if current != expected {
+        bail!(
+            "kubeconfig context is {current:?}, expected {expected:?}; \
+             refusing to touch another cluster (set {CONTEXT_ENV} to override)"
+        );
+    }
+    let config = kube::Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default())
         .await
-        .context("kube client (KUBECONFIG or ~/.kube/config)")
+        .context("building a client for {expected}")?;
+    Ok(Client::try_from(config)?)
 }
 
 fn apiservers(client: &Client) -> Api<DynamicObject> {
@@ -928,6 +959,30 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     .await?;
     let operator = OperatorPod::current(&client).await?;
     let metrics = operator.metrics();
+
+    println!("setup: the operator applies its own ServiceMonitor");
+    let monitors = Api::<DynamicObject>::namespaced_with(
+        client.clone(),
+        OPERATOR_NS,
+        &ApiResource::from_gvk(&GroupVersionKind::gvk(
+            "monitoring.coreos.com",
+            "v1",
+            "ServiceMonitor",
+        )),
+    );
+    eventually("the metrics ServiceMonitor", CONVERGE, || async {
+        let monitor = monitors
+            .get_opt("modelexpress-operator")
+            .await?
+            .context("not applied yet")?;
+        let server_name = monitor.data["spec"]["endpoints"][0]["tlsConfig"]["serverName"].as_str();
+        let want = format!("modelexpress-operator-metrics.{OPERATOR_NS}.svc");
+        if server_name != Some(want.as_str()) {
+            bail!("serverName is {server_name:?}, want {want}");
+        }
+        Ok(())
+    })
+    .await?;
 
     println!("setup: one ModelExpressServer per server TLS backend");
     for backend in Backend::ALL {

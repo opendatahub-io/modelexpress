@@ -42,18 +42,26 @@ fn listen_addr(port: i32) -> Result<SocketAddr, RunError> {
 }
 
 /// Run the operator until a listener or the controller exits.
-/// `default_server_image` serves CRs that leave spec.image unset, and
-/// `tls_defaults` builds the TLS defaults source from the cluster client.
-pub async fn run(
+/// `default_server_image` serves CRs that leave spec.image unset,
+/// `tls_defaults` builds the TLS defaults source from the cluster client, and
+/// `on_start` runs once the client and tracing are up, for whatever the
+/// platform has to put in place.
+pub async fn run<S, F>(
     default_server_image: Option<String>,
     tls_defaults: impl FnOnce(Client) -> Arc<dyn TlsDefaults>,
-) -> Result<(), RunError> {
+    on_start: S,
+) -> Result<(), RunError>
+where
+    S: FnOnce(Client) -> F,
+    F: std::future::Future<Output = ()>,
+{
     telemetry::init_tracing(telemetry::LogFormat::from_env())?;
 
     let handle = telemetry::install_recorder()?;
     let health_addr = listen_addr(telemetry::HEALTH_PORT)?;
     let client = Client::try_default().await?;
     let tls_defaults = tls_defaults(client.clone());
+    on_start(client.clone()).await;
     let tls_dir = std::env::var_os(telemetry::METRICS_TLS_DIR_ENV).map(PathBuf::from);
 
     let metrics = match tls_dir {

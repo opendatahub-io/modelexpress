@@ -54,6 +54,9 @@ if ! kind get clusters | grep -qx "${CLUSTER}"; then
 fi
 kind get kubeconfig --name "${CLUSTER}" > "${KUBECONFIG_FILE}"
 export KUBECONFIG="${KUBECONFIG_FILE}"
+# the test refuses to touch a cluster it was not pointed at
+export MX_TLS_KIND_E2E=1
+export MX_TLS_KIND_CONTEXT="kind-${CLUSTER}"
 
 if [ "${SKIP_BUILD}" = false ]; then
     for image in "${IMAGES[@]}"; do

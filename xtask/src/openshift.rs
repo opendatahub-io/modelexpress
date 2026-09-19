@@ -6,10 +6,12 @@
 use crate::objects::{METRICS_SERVICE_NAME, NAME, labels};
 use modelexpress_operator::telemetry;
 use modelexpress_operator_openshift::images::SERVER_IMAGE_ENV;
+use modelexpress_operator_openshift::servicemonitor;
 use serde_json::json;
 
-/// Lets the operator read apiservers.config.openshift.io/cluster.
-pub const APISERVERS_ROLE: &str = "modelexpress-operator-apiservers";
+/// Lets the operator read the cluster TLS profile and keep its own
+/// ServiceMonitor, neither of which the base manifests need.
+pub const OPENSHIFT_ROLE: &str = "modelexpress-operator-openshift";
 
 /// The overlay's image parameters, overridable like the base params.env.
 pub const PARAMS_ENV: &str =
@@ -35,20 +37,21 @@ pub fn overlay() -> Vec<(&'static str, serde_json::Value)> {
                 "namespace": DEFAULT_NAMESPACE,
                 "resources": [
                     "../default",
-                    "apiservers-clusterrole.yaml",
-                    "apiservers-clusterrolebinding.yaml",
+                    "openshift-clusterrole.yaml",
+                    "openshift-clusterrolebinding.yaml",
                     "service-ca-configmap.yaml",
-                    "servicemonitor.yaml",
                 ],
                 "generatorOptions": {"disableNameSuffixHash": true},
                 "configMapGenerator": [{"name": PARAMS_CONFIGMAP, "envs": ["params.env"]}],
-                "replacements": [{
-                    "source": {"kind": "ConfigMap", "name": PARAMS_CONFIGMAP, "fieldPath": "data.MODELEXPRESS_SERVER_IMAGE"},
-                    "targets": [{
-                        "select": {"kind": "Deployment", "name": NAME},
-                        "fieldPaths": [format!("spec.template.spec.containers.[name=operator].env.[name={SERVER_IMAGE_ENV}].value")],
-                    }],
-                }],
+                "replacements": [
+                    {
+                        "source": {"kind": "ConfigMap", "name": PARAMS_CONFIGMAP, "fieldPath": "data.MODELEXPRESS_SERVER_IMAGE"},
+                        "targets": [{
+                            "select": {"kind": "Deployment", "name": NAME},
+                            "fieldPaths": [format!("spec.template.spec.containers.[name=operator].env.[name={SERVER_IMAGE_ENV}].value")],
+                        }],
+                    },
+                ],
                 "patches": [
                     {"path": "deployment-patch.yaml", "target": {"kind": "Deployment", "name": NAME}},
                     {"path": "service-patch.yaml", "target": {"kind": "Service", "name": METRICS_SERVICE_NAME}},
@@ -70,6 +73,10 @@ pub fn overlay() -> Vec<(&'static str, serde_json::Value)> {
                             "env": [
                                 {"name": telemetry::METRICS_TLS_DIR_ENV, "value": METRICS_TLS_MOUNT},
                                 {"name": SERVER_IMAGE_ENV, "value": "set from params.env"},
+                                {
+                                    "name": servicemonitor::NAMESPACE_ENV,
+                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+                                },
                             ],
                             "ports": [
                                 {"name": telemetry::HEALTH_PORT_NAME, "containerPort": telemetry::HEALTH_PORT},
@@ -122,48 +129,35 @@ pub fn overlay() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
         (
-            "servicemonitor.yaml",
-            json!({
-                "apiVersion": "monitoring.coreos.com/v1",
-                "kind": "ServiceMonitor",
-                "metadata": {"name": NAME, "labels": labels()},
-                "spec": {
-                    "selector": {"matchLabels": {"app.kubernetes.io/name": NAME}},
-                    "endpoints": [{
-                        "port": telemetry::METRICS_TLS_PORT_NAME,
-                        "scheme": "https",
-                        "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
-                        "tlsConfig": {
-                            "ca": {"configMap": {"name": SERVICE_CA_CONFIGMAP, "key": "service-ca.crt"}},
-                            "serverName": format!("{METRICS_SERVICE_NAME}.{DEFAULT_NAMESPACE}.svc"),
-                        },
-                    }],
-                },
-            }),
-        ),
-        (
-            "apiservers-clusterrole.yaml",
+            "openshift-clusterrole.yaml",
             json!({
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "ClusterRole",
-                "metadata": {"name": APISERVERS_ROLE, "labels": labels()},
-                "rules": [{
-                    "apiGroups": ["config.openshift.io"],
-                    "resources": ["apiservers"],
-                    "verbs": ["get", "list", "watch"],
-                }],
+                "metadata": {"name": OPENSHIFT_ROLE, "labels": labels()},
+                "rules": [
+                    {
+                        "apiGroups": ["config.openshift.io"],
+                        "resources": ["apiservers"],
+                        "verbs": ["get", "list", "watch"],
+                    },
+                    {
+                        "apiGroups": [servicemonitor::API_GROUP],
+                        "resources": [servicemonitor::PLURAL],
+                        "verbs": ["get", "create", "patch", "update"],
+                    },
+                ],
             }),
         ),
         (
-            "apiservers-clusterrolebinding.yaml",
+            "openshift-clusterrolebinding.yaml",
             json!({
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "ClusterRoleBinding",
-                "metadata": {"name": APISERVERS_ROLE, "labels": labels()},
+                "metadata": {"name": OPENSHIFT_ROLE, "labels": labels()},
                 "roleRef": {
                     "apiGroup": "rbac.authorization.k8s.io",
                     "kind": "ClusterRole",
-                    "name": APISERVERS_ROLE,
+                    "name": OPENSHIFT_ROLE,
                 },
                 // Namespace unset so kustomize resolves the ServiceAccount by
                 // nameReference, as the base ClusterRoleBinding does.
