@@ -4,6 +4,7 @@
 //! Renders a ModelExpressServerSpec into the server container's env vars.
 
 use crate::crd::{MetadataBackend, ModelExpressServerSpec, SecretKeyRef};
+use crate::tls::{MOUNT_PATH, ResolvedTls};
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, ObjectFieldSelector, SecretKeySelector};
 
 // The subset of the server's env vars the operator sets. Declared here rather
@@ -21,6 +22,11 @@ pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_
 pub const MODEL_EXPRESS_SECURITY_MODE: &str = "MODEL_EXPRESS_SECURITY_MODE";
 pub const MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES: &str = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES";
 pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
+pub const MODEL_EXPRESS_TLS_CERT_FILE: &str = "MODEL_EXPRESS_TLS_CERT_FILE";
+pub const MODEL_EXPRESS_TLS_CIPHER_SUITES: &str = "MODEL_EXPRESS_TLS_CIPHER_SUITES";
+pub const MODEL_EXPRESS_TLS_GROUPS: &str = "MODEL_EXPRESS_TLS_GROUPS";
+pub const MODEL_EXPRESS_TLS_KEY_FILE: &str = "MODEL_EXPRESS_TLS_KEY_FILE";
+pub const MODEL_EXPRESS_TLS_MIN_VERSION: &str = "MODEL_EXPRESS_TLS_MIN_VERSION";
 pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
 pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
@@ -67,7 +73,7 @@ fn downward_namespace(name: &str) -> EnvVar {
 }
 
 /// The server binds 0.0.0.0 by default, so no host var is set.
-pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
+pub fn render_env(spec: &ModelExpressServerSpec, tls: Option<&ResolvedTls>) -> Vec<EnvVar> {
     let mut env = Vec::new();
 
     match &spec.metadata_backend {
@@ -141,6 +147,30 @@ pub fn render_env(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
         }
     }
 
+    if let Some(tls) = tls {
+        env.push(literal(
+            MODEL_EXPRESS_TLS_CERT_FILE,
+            format!("{MOUNT_PATH}/tls.crt"),
+        ));
+        env.push(literal(
+            MODEL_EXPRESS_TLS_KEY_FILE,
+            format!("{MOUNT_PATH}/tls.key"),
+        ));
+        let settings = &tls.settings;
+        if let Some(min_version) = &settings.min_version {
+            env.push(literal(MODEL_EXPRESS_TLS_MIN_VERSION, min_version.clone()));
+        }
+        if !settings.ciphers.is_empty() {
+            env.push(literal(
+                MODEL_EXPRESS_TLS_CIPHER_SUITES,
+                settings.ciphers.join(","),
+            ));
+        }
+        if !settings.groups.is_empty() {
+            env.push(literal(MODEL_EXPRESS_TLS_GROUPS, settings.groups.join(",")));
+        }
+    }
+
     if let Some(reaper) = &spec.reaper {
         if let Some(secs) = reaper.scan_interval_secs {
             env.push(literal(MX_REAPER_SCAN_INTERVAL_SECS, secs.to_string()));
@@ -209,6 +239,23 @@ mod tests {
                 server::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
             ),
             (MODEL_EXPRESS_SERVER_PORT, server::MODEL_EXPRESS_SERVER_PORT),
+            (
+                MODEL_EXPRESS_TLS_CERT_FILE,
+                server::MODEL_EXPRESS_TLS_CERT_FILE,
+            ),
+            (
+                MODEL_EXPRESS_TLS_CIPHER_SUITES,
+                server::MODEL_EXPRESS_TLS_CIPHER_SUITES,
+            ),
+            (MODEL_EXPRESS_TLS_GROUPS, server::MODEL_EXPRESS_TLS_GROUPS),
+            (
+                MODEL_EXPRESS_TLS_KEY_FILE,
+                server::MODEL_EXPRESS_TLS_KEY_FILE,
+            ),
+            (
+                MODEL_EXPRESS_TLS_MIN_VERSION,
+                server::MODEL_EXPRESS_TLS_MIN_VERSION,
+            ),
             (MX_GC_TIMEOUT_SECS, server::MX_GC_TIMEOUT_SECS),
             (MX_HEARTBEAT_TIMEOUT_SECS, server::MX_HEARTBEAT_TIMEOUT_SECS),
             (MX_METADATA_BACKEND, server::MX_METADATA_BACKEND),
@@ -224,18 +271,24 @@ mod tests {
         }
     }
 
+    fn render_env_plain(spec: &ModelExpressServerSpec) -> Vec<EnvVar> {
+        render_env(spec, None)
+    }
+
     fn base_spec(backend: MetadataBackend) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
+            image: Some("nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into()),
             replicas: 1,
             metadata_backend: backend,
             port: 8001,
             log: None,
             cache: None,
             security: None,
+            tls: None,
             reaper: None,
             credentials: None,
             pod_metadata: None,
+            service_metadata: None,
             resources: None,
             node_selector: None,
             tolerations: None,
@@ -253,7 +306,7 @@ mod tests {
 
     #[test]
     fn redis_backend_sets_backend_and_url() {
-        let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
+        let env = render_env_plain(&base_spec(MetadataBackend::Redis(RedisBackend {
             url: Some("redis://mx-redis:6379".into()),
             url_secret: None,
         })));
@@ -264,7 +317,7 @@ mod tests {
 
     #[test]
     fn kubernetes_backend_uses_downward_namespace() {
-        let env = render_env(&base_spec(MetadataBackend::Kubernetes {}));
+        let env = render_env_plain(&base_spec(MetadataBackend::Kubernetes {}));
         assert_eq!(value_of(&env, MX_METADATA_BACKEND), Some("kubernetes"));
         let ns = env
             .iter()
@@ -280,7 +333,7 @@ mod tests {
 
     #[test]
     fn minimal_spec_renders_no_optional_vars() {
-        let env = render_env(&base_spec(MetadataBackend::Kubernetes {}));
+        let env = render_env_plain(&base_spec(MetadataBackend::Kubernetes {}));
         assert_eq!(value_of(&env, MODEL_EXPRESS_SERVER_PORT), Some("8001"));
         for name in [
             MODEL_EXPRESS_LOG_LEVEL,
@@ -294,7 +347,7 @@ mod tests {
 
     #[test]
     fn redis_url_renders_from_a_secret_when_set() {
-        let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
+        let env = render_env_plain(&base_spec(MetadataBackend::Redis(RedisBackend {
             url: None,
             url_secret: Some(crate::crd::SecretKeyRef {
                 name: "mx-redis".into(),
@@ -321,7 +374,7 @@ mod tests {
     #[test]
     fn redis_url_secret_wins_over_a_literal() {
         // admission rejects both being set; this pins the render if it slips
-        let env = render_env(&base_spec(MetadataBackend::Redis(RedisBackend {
+        let env = render_env_plain(&base_spec(MetadataBackend::Redis(RedisBackend {
             url: Some("redis://plain:6379".into()),
             url_secret: Some(crate::crd::SecretKeyRef {
                 name: "mx-redis".into(),
@@ -337,7 +390,7 @@ mod tests {
     fn cache_directory_always_matches_the_mount_path() {
         let spec = base_spec(MetadataBackend::Kubernetes {});
         assert_eq!(
-            value_of(&render_env(&spec), MODEL_EXPRESS_CACHE_DIRECTORY),
+            value_of(&render_env(&spec, None), MODEL_EXPRESS_CACHE_DIRECTORY),
             Some(crate::volume::DEFAULT_MOUNT_PATH),
             "unset means the server falls back to HOME and misses the volume"
         );
@@ -348,7 +401,7 @@ mod tests {
             ..crate::crd::CacheConfig::default()
         });
         assert_eq!(
-            value_of(&render_env(&spec), MODEL_EXPRESS_CACHE_DIRECTORY),
+            value_of(&render_env(&spec, None), MODEL_EXPRESS_CACHE_DIRECTORY),
             Some("/cache")
         );
         assert_eq!(
@@ -403,7 +456,7 @@ mod tests {
             ngc_api_key_secret: None,
         });
 
-        let env = render_env(&spec);
+        let env = render_env(&spec, None);
         assert_eq!(value_of(&env, MODEL_EXPRESS_SERVER_PORT), Some("9000"));
         assert_eq!(value_of(&env, MODEL_EXPRESS_LOG_LEVEL), Some("debug"));
         assert_eq!(value_of(&env, MODEL_EXPRESS_LOG_FORMAT), Some("json"));
@@ -449,7 +502,7 @@ mod tests {
             level: Some(LogLevel::Info),
             format: Some(LogFormat::Compact),
         });
-        let env = render_env(&spec);
+        let env = render_env(&spec, None);
         let mut names: Vec<_> = env.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();

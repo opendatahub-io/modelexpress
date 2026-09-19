@@ -9,6 +9,7 @@ use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, HTTPGetAction, PodSecurityContext, PodSpec,
     PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
 };
+use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -91,6 +92,28 @@ pub fn cluster_role_rules() -> Vec<PolicyRule> {
             verbs: crud(),
             ..PolicyRule::default()
         },
+        // Enforce mode binds the server SA to system:auth-delegator. Granting
+        // that role needs the tokenreviews and subjectaccessreviews rules
+        // below, which the operator already holds for its own metrics auth,
+        // so RBAC escalation prevention lets the binding through.
+        PolicyRule {
+            api_groups: Some(vec!["rbac.authorization.k8s.io".to_string()]),
+            resources: Some(vec!["clusterrolebindings".to_string()]),
+            verbs: crud(),
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["authentication.k8s.io".to_string()]),
+            resources: Some(vec!["tokenreviews".to_string()]),
+            verbs: vec!["create".to_string()],
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["authorization.k8s.io".to_string()]),
+            resources: Some(vec!["subjectaccessreviews".to_string()]),
+            verbs: vec!["create".to_string()],
+            ..PolicyRule::default()
+        },
     ];
     rules.extend(modelexpress_operator::rbac::server_policy_rules());
     rules
@@ -147,7 +170,7 @@ fn http_probe(path: &str) -> Probe {
     Probe {
         http_get: Some(HTTPGetAction {
             path: Some(path.to_string()),
-            port: IntOrString::String(telemetry::PORT_NAME.to_string()),
+            port: IntOrString::String(telemetry::HEALTH_PORT_NAME.to_string()),
             ..HTTPGetAction::default()
         }),
         initial_delay_seconds: Some(5),
@@ -208,7 +231,7 @@ pub fn deployment(image: &str) -> Deployment {
                             ("prometheus.io/scrape".to_string(), "true".to_string()),
                             (
                                 "prometheus.io/port".to_string(),
-                                telemetry::PORT.to_string(),
+                                telemetry::METRICS_PORT.to_string(),
                             ),
                         ]
                         .into_iter()
@@ -223,11 +246,18 @@ pub fn deployment(image: &str) -> Deployment {
                         name: "operator".to_string(),
                         image: Some(image.to_string()),
                         security_context: Some(container_security_context()),
-                        ports: Some(vec![ContainerPort {
-                            name: Some(telemetry::PORT_NAME.to_string()),
-                            container_port: telemetry::PORT,
-                            ..ContainerPort::default()
-                        }]),
+                        ports: Some(vec![
+                            ContainerPort {
+                                name: Some(telemetry::HEALTH_PORT_NAME.to_string()),
+                                container_port: telemetry::HEALTH_PORT,
+                                ..ContainerPort::default()
+                            },
+                            ContainerPort {
+                                name: Some(telemetry::METRICS_PORT_NAME.to_string()),
+                                container_port: telemetry::METRICS_PORT,
+                                ..ContainerPort::default()
+                            },
+                        ]),
                         liveness_probe: Some(http_probe("/healthz")),
                         readiness_probe: Some(http_probe("/readyz")),
                         resources: Some(ResourceRequirements {
@@ -252,6 +282,37 @@ pub fn deployment(image: &str) -> Deployment {
                 }),
             },
             ..DeploymentSpec::default()
+        }),
+        status: None,
+    }
+}
+
+pub const METRICS_SERVICE_NAME: &str = "modelexpress-operator-metrics";
+
+/// Plaintext metrics Service for the base manifests. An overlay that serves
+/// metrics over TLS patches it to the TLS port.
+pub fn metrics_service() -> Service {
+    Service {
+        metadata: ObjectMeta {
+            name: Some(METRICS_SERVICE_NAME.to_string()),
+            labels: Some(labels()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(
+                [("app.kubernetes.io/name".to_string(), NAME.to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ports: Some(vec![ServicePort {
+                name: Some(telemetry::METRICS_PORT_NAME.to_string()),
+                port: telemetry::METRICS_PORT,
+                target_port: Some(IntOrString::String(
+                    telemetry::METRICS_PORT_NAME.to_string(),
+                )),
+                ..ServicePort::default()
+            }]),
+            ..ServiceSpec::default()
         }),
         status: None,
     }

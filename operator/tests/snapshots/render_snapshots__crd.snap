@@ -759,7 +759,8 @@ spec:
                       x-kubernetes-validations: []
                   type: object
                 image:
-                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it, so a rolling image change cold-starts P2P discovery between old and new workers."
+                  description: "Server image ref. The tag pins the mx version; mx_source_id embeds it, so a rolling image change cold-starts P2P discovery between old and new workers. Unset follows the default server image the operator was started with, and a change to that default rolls the server."
+                  nullable: true
                   type: string
                   x-kubernetes-validations:
                     - message: image must not be empty
@@ -1085,6 +1086,56 @@ spec:
                   maxLength: 253
                   nullable: true
                   type: string
+                serviceMetadata:
+                  description: "Extra labels/annotations for the Service, e.g. a certificate issuer's annotation for tls.secretName. Operator-owned labels win on conflict."
+                  nullable: true
+                  properties:
+                    annotations:
+                      additionalProperties:
+                        type: string
+                      nullable: true
+                      type: object
+                    labels:
+                      additionalProperties:
+                        type: string
+                      nullable: true
+                      type: object
+                  type: object
+                tls:
+                  description: "TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*."
+                  nullable: true
+                  properties:
+                    cipherSuites:
+                      description: "MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated)."
+                      items:
+                        type: string
+                      maxItems: 64
+                      type: array
+                    groups:
+                      description: "MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order (rendered comma-separated)."
+                      items:
+                        type: string
+                      maxItems: 16
+                      type: array
+                    minVersion:
+                      description: "MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style."
+                      maxLength: 16
+                      nullable: true
+                      type: string
+                      x-kubernetes-validations:
+                        - message: minVersion must be VersionTLS10..13 or TLS1.0..1.3
+                          rule: "self.matches('^(VersionTLS1[0-3]|TLS1[.][0-3])$')"
+                    secretName:
+                      description: "Secret holding tls.crt and tls.key, mounted read-only."
+                      maxLength: 253
+                      type: string
+                      x-kubernetes-validations:
+                        - message: secretName must not be empty
+                          rule: "self != ''"
+                  required:
+                    - secretName
+                  type: object
+                  x-kubernetes-validations: []
                 tolerations:
                   description: Taints the server pods tolerate.
                   items:
@@ -1110,7 +1161,6 @@ spec:
                   nullable: true
                   type: array
               required:
-                - image
                 - metadataBackend
               type: object
               x-kubernetes-validations:
@@ -1153,7 +1203,7 @@ spec:
                     type: object
                   type: array
                 endpoint:
-                  description: gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to.
+                  description: "gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as `http://host:port`, or `https://host:port` when spec.tls is set."
                   nullable: true
                   type: string
                 observedGeneration:

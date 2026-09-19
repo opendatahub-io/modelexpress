@@ -6,12 +6,13 @@
 use crate::crd::ModelExpressServerSpec;
 use crate::env::render_env;
 use crate::labels::{managed_labels, selector_labels};
+use crate::tls::{MOUNT_PATH, TlsSettings, resolve};
 use crate::volume::{CacheVolume, render_cache_volume};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, GRPCAction, PersistentVolumeClaim, PodSecurityContext,
-    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext,
-    Service, ServicePort, ServiceSpec, Volume,
+    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource,
+    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
@@ -24,6 +25,7 @@ use std::collections::BTreeMap;
 
 pub const CONTAINER_NAME: &str = "server";
 pub const PORT_NAME: &str = "grpc";
+pub const TLS_VOLUME_NAME: &str = "tls";
 
 /// Everything the reconciler applies for one CR. ownerReferences and
 /// namespaces are its job, not the renderer's.
@@ -35,7 +37,16 @@ pub struct DesiredState {
     pub network_policy: Option<NetworkPolicy>,
 }
 
-pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
+/// `tls_defaults` fill in what `spec.tls` leaves unset; they only matter when
+/// `spec.tls` is set.
+/// `image` is the server image the reconciler resolved from `spec.image` and
+/// the operator's default.
+pub fn render(
+    cr_name: &str,
+    spec: &ModelExpressServerSpec,
+    image: &str,
+    tls_defaults: &TlsSettings,
+) -> DesiredState {
     let CacheVolume { volume, mount, pvc } = render_cache_volume(cr_name, spec);
     let strategy = rollout_strategy(&volume);
     let labels = pod_labels(cr_name, spec);
@@ -43,24 +54,51 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
         .pod_metadata
         .as_ref()
         .and_then(|meta| meta.annotations.clone());
+    let tls = spec
+        .tls
+        .as_ref()
+        .map(|config| resolve(config, tls_defaults));
 
     // The server wires tonic_health, so use real gRPC probes instead of the
     // chart's TCP socket checks. Liveness is deliberately laxer than
     // readiness: a slow backend should pull the pod from rotation, not
-    // restart it.
-    let readiness = grpc_probe(spec.port, 5, 10);
-    let liveness = grpc_probe(spec.port, 15, 30);
+    // restart it. kubelet's gRPC probe is plaintext only, so a TLS listener
+    // gets TCP probes instead.
+    let (readiness, liveness) = if tls.is_some() {
+        (tcp_probe(spec.port, 5, 10), tcp_probe(spec.port, 15, 30))
+    } else {
+        (grpc_probe(spec.port, 5, 10), grpc_probe(spec.port, 15, 30))
+    };
+
+    let mut volume_mounts = vec![mount];
+    let mut volumes = vec![volume];
+    if let Some(tls) = &tls {
+        volume_mounts.push(VolumeMount {
+            name: TLS_VOLUME_NAME.to_string(),
+            mount_path: MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        });
+        volumes.push(Volume {
+            name: TLS_VOLUME_NAME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(tls.secret_name.clone()),
+                ..SecretVolumeSource::default()
+            }),
+            ..Volume::default()
+        });
+    }
 
     let container = Container {
         name: CONTAINER_NAME.to_string(),
-        image: Some(spec.image.clone()),
+        image: Some(image.to_string()),
         ports: Some(vec![ContainerPort {
             name: Some(PORT_NAME.to_string()),
             container_port: spec.port,
             ..ContainerPort::default()
         }]),
-        env: Some(render_env(spec)),
-        volume_mounts: Some(vec![mount]),
+        env: Some(render_env(spec, tls.as_ref())),
+        volume_mounts: Some(volume_mounts),
         readiness_probe: Some(readiness),
         liveness_probe: Some(liveness),
         security_context: Some(container_security_context()),
@@ -90,7 +128,7 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
                 spec: Some(PodSpec {
                     containers: vec![container],
                     security_context: Some(pod_security_context()),
-                    volumes: Some(vec![volume]),
+                    volumes: Some(volumes),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
                     node_selector: spec.node_selector.clone(),
                     tolerations: spec.tolerations.clone(),
@@ -106,7 +144,11 @@ pub fn render(cr_name: &str, spec: &ModelExpressServerSpec) -> DesiredState {
     let service = Service {
         metadata: ObjectMeta {
             name: Some(cr_name.to_string()),
-            labels: Some(labels),
+            labels: Some(service_labels(cr_name, spec)),
+            annotations: spec
+                .service_metadata
+                .as_ref()
+                .and_then(|meta| meta.annotations.clone()),
             ..ObjectMeta::default()
         },
         spec: Some(ServiceSpec {
@@ -162,6 +204,20 @@ fn pod_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, 
         .as_ref()
         .and_then(|meta| meta.labels.clone())
         .unwrap_or_default();
+    labels.extend(managed_labels(cr_name));
+    labels
+}
+
+/// Pod labels, then serviceMetadata labels, then operator labels on top.
+fn service_labels(cr_name: &str, spec: &ModelExpressServerSpec) -> BTreeMap<String, String> {
+    let mut labels = pod_labels(cr_name, spec);
+    if let Some(extra) = spec
+        .service_metadata
+        .as_ref()
+        .and_then(|meta| meta.labels.as_ref())
+    {
+        labels.extend(extra.clone());
+    }
     labels.extend(managed_labels(cr_name));
     labels
 }
@@ -226,6 +282,18 @@ fn default_resources() -> ResourceRequirements {
     }
 }
 
+fn tcp_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
+    Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(port),
+            host: None,
+        }),
+        initial_delay_seconds: Some(initial_delay),
+        period_seconds: Some(period),
+        ..Probe::default()
+    }
+}
+
 fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
     Probe {
         grpc: Some(GRPCAction {
@@ -251,7 +319,7 @@ mod tests {
 
     fn base_spec() -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into(),
+            image: Some("nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0".into()),
             replicas: 2,
             metadata_backend: MetadataBackend::Redis(RedisBackend {
                 url: Some("redis://mx-redis:6379".into()),
@@ -261,9 +329,11 @@ mod tests {
             log: None,
             cache: None,
             security: None,
+            tls: None,
             reaper: None,
             credentials: None,
             pod_metadata: None,
+            service_metadata: None,
             resources: None,
             node_selector: None,
             tolerations: None,
@@ -300,7 +370,7 @@ mod tests {
 
     #[test]
     fn selector_matches_pod_labels() {
-        let state = render("mx", &base_spec());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let dep_spec = state.deployment.spec.as_ref().expect("spec");
         let selector = dep_spec
             .selector
@@ -331,7 +401,12 @@ mod tests {
 
     #[test]
     fn replicas_image_and_port_propagate() {
-        let state = render("mx", &base_spec());
+        let state = render(
+            "mx",
+            &base_spec(),
+            "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0",
+            &TlsSettings::default(),
+        );
         assert_eq!(
             state.deployment.spec.as_ref().expect("spec").replicas,
             Some(2)
@@ -374,7 +449,7 @@ mod tests {
             ..Affinity::default()
         });
 
-        let state = render("mx", &spec);
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let pod = pod_spec(&state);
         assert_eq!(
             pod.node_selector
@@ -401,7 +476,7 @@ mod tests {
 
     #[test]
     fn scheduling_fields_are_unset_by_default() {
-        let pod_owned = render("mx", &base_spec());
+        let pod_owned = render("mx", &base_spec(), "img", &TlsSettings::default());
         let pod = pod_spec(&pod_owned);
         assert!(pod.node_selector.is_none());
         assert!(pod.tolerations.is_none());
@@ -412,7 +487,7 @@ mod tests {
     fn grpc_probes_target_the_server_port() {
         let mut spec = base_spec();
         spec.port = 9000;
-        let state = render("mx", &spec);
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let c = container(&state);
         let readiness = c.readiness_probe.as_ref().expect("readiness");
         let liveness = c.liveness_probe.as_ref().expect("liveness");
@@ -422,7 +497,7 @@ mod tests {
 
     #[test]
     fn env_and_volume_are_wired_into_the_pod() {
-        let state = render("mx", &base_spec());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let c = container(&state);
         let env = c.env.as_ref().expect("env");
         assert!(env.iter().any(|e| e.name == "MX_METADATA_BACKEND"));
@@ -447,7 +522,7 @@ mod tests {
 
     #[test]
     fn service_targets_named_port() {
-        let state = render("mx", &base_spec());
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
         let port = &state
             .service
             .spec
@@ -461,6 +536,54 @@ mod tests {
             port.target_port,
             Some(IntOrString::String("grpc".to_string()))
         );
+    }
+
+    #[test]
+    fn service_metadata_merges_but_cannot_override_operator_labels() {
+        let mut spec = base_spec();
+        spec.service_metadata = Some(crate::crd::MetadataOverrides {
+            labels: Some(
+                [
+                    ("team".to_string(), "inference".to_string()),
+                    ("app.kubernetes.io/name".to_string(), "evil".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            annotations: Some(
+                [(
+                    "certs.example.com/secret-name".to_string(),
+                    "mx-tls".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        });
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let meta = &state.service.metadata;
+        let labels = meta.labels.as_ref().expect("labels");
+        assert_eq!(labels.get("team").map(String::as_str), Some("inference"));
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").map(String::as_str),
+            Some("modelexpress-server")
+        );
+        assert_eq!(
+            meta.annotations
+                .as_ref()
+                .and_then(|a| a.get("certs.example.com/secret-name"))
+                .map(String::as_str),
+            Some("mx-tls")
+        );
+        assert_eq!(
+            state.service.spec.as_ref().expect("spec").selector,
+            Some(selector_labels("mx"))
+        );
+    }
+
+    #[test]
+    fn service_without_service_metadata_has_no_annotations() {
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
+        assert!(state.service.metadata.annotations.is_none());
     }
 
     #[test]
@@ -482,7 +605,7 @@ mod tests {
                     .collect(),
             ),
         });
-        let state = render("mx", &spec);
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let template_meta = state
             .deployment
             .spec
@@ -515,7 +638,7 @@ mod tests {
     #[test]
     fn ephemeral_cache_rolls_but_pvc_cache_recreates() {
         let strategy = |spec: &ModelExpressServerSpec| {
-            render("mx", spec)
+            render("mx", spec, "img", &TlsSettings::default())
                 .deployment
                 .spec
                 .expect("spec")
@@ -576,7 +699,7 @@ mod tests {
             allow_from: vec![NetworkPolicyPeer::default()],
         });
 
-        let state = render("mx", &spec);
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let rbac = crate::rbac::render_rbac("mx", &spec);
 
         let mut checked = 0;
@@ -638,7 +761,11 @@ mod tests {
 
     #[test]
     fn network_policy_absent_by_default() {
-        assert!(render("mx", &base_spec()).network_policy.is_none());
+        assert!(
+            render("mx", &base_spec(), "img", &TlsSettings::default())
+                .network_policy
+                .is_none()
+        );
     }
 
     #[test]
@@ -659,7 +786,9 @@ mod tests {
                 ..NetworkPolicyPeer::default()
             }],
         });
-        let netpol = render("mx", &spec).network_policy.expect("netpol");
+        let netpol = render("mx", &spec, "img", &TlsSettings::default())
+            .network_policy
+            .expect("netpol");
         let np_spec = netpol.spec.expect("spec");
         assert_eq!(
             np_spec
@@ -698,7 +827,7 @@ mod tests {
             }))),
             ..CacheConfig::default()
         });
-        let state = render("mx", &spec);
+        let state = render("mx", &spec, "img", &TlsSettings::default());
         let pvc = state.pvc.expect("pvc");
         assert_eq!(pvc.metadata.name.as_deref(), Some("mx-model-cache"));
     }

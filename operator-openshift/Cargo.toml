@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The operator for OpenShift: TLS defaults follow the cluster's
+# apiservers.config.openshift.io/cluster profile and tlsAdherence.
+
+[package]
+name = "modelexpress-operator-openshift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["tls-rustls"]
+openssl = ["tls-openssl"]
+tls-openssl = ["modelexpress-operator/tls-openssl", "kube/openssl-tls"]
+tls-rustls = ["modelexpress-operator/tls-rustls", "kube/rustls-tls"]
+
+[dependencies]
+modelexpress-operator = { path = "../operator", default-features = false }
+async-trait = { workspace = true }
+futures = { workspace = true }
+kube = { workspace = true, features = ["unstable-runtime"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true, features = ["ws"] }
+modelexpress-client = { workspace = true, features = ["tls-rustls"] }
+modelexpress-common = { workspace = true, features = ["tls-rustls"] }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
