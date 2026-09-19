@@ -17,15 +17,24 @@ use k8s_openapi::api::authorization::v1::{
 };
 use kube::Client;
 use kube::api::{Api, PostParams};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use moka::future::Cache;
+use std::time::Duration;
 
 /// How long a decision for one token is reused before the apiserver is
 /// asked again. Prometheus scrapes every 30s, so this keeps the review
 /// traffic at a few requests a minute per scraper.
 pub const DECISION_TTL: Duration = Duration::from_secs(60);
+
+/// Cached decisions kept at once. Entries expire with the TTL, but a caller
+/// sending a fresh invalid token every request would otherwise grow the map
+/// until they do; real scrapers need a handful.
+pub const MAX_DECISIONS: u64 = 1024;
+
+/// SHA-256 of the bearer token, the cache key, so tokens are not held in
+/// memory.
+fn token_key(token: &str) -> [u8; 32] {
+    crate::digest::sha256(token.as_bytes())
+}
 
 pub const METRICS_PATH: &str = "/metrics";
 
@@ -52,13 +61,11 @@ impl AuthError {
 }
 
 /// Cached outcome for one token, keyed by the token's SHA-256.
-type Decisions = HashMap<[u8; 32], (Instant, Result<(), Denied>)>;
 
 #[derive(Clone)]
 pub struct MetricsAuth {
     client: Client,
-    ttl: Duration,
-    cache: Arc<Mutex<Decisions>>,
+    cache: Cache<[u8; 32], Result<(), Denied>>,
 }
 
 /// A cached negative decision; transport errors are never cached.
@@ -78,15 +85,17 @@ impl MetricsAuth {
     pub fn with_ttl(client: Client, ttl: Duration) -> Self {
         Self {
             client,
-            ttl,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Cache::builder()
+                .max_capacity(MAX_DECISIONS)
+                .time_to_live(ttl)
+                .build(),
         }
     }
 
     /// Decide for a bearer token, consulting the cache first.
     pub async fn authorize(&self, token: &str) -> Result<(), AuthError> {
-        let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        if let Some(decision) = self.cached(&key) {
+        let key = token_key(token);
+        if let Some(decision) = self.cache.get(&key).await {
             return decision.map_err(|denied| match denied {
                 Denied::Unauthenticated => AuthError::Unauthenticated,
                 Denied::Forbidden => AuthError::Forbidden,
@@ -99,18 +108,10 @@ impl MetricsAuth {
             Err(AuthError::Forbidden) => Some(Err(Denied::Forbidden)),
             Err(_) => None,
         };
-        if let Some(decision) = cacheable
-            && let Ok(mut cache) = self.cache.lock()
-        {
-            cache.insert(key, (Instant::now(), decision));
+        if let Some(decision) = cacheable {
+            self.cache.insert(key, decision).await;
         }
         result
-    }
-
-    fn cached(&self, key: &[u8; 32]) -> Option<Result<(), Denied>> {
-        let cache = self.cache.lock().ok()?;
-        let (at, decision) = cache.get(key)?;
-        (at.elapsed() < self.ttl).then_some(*decision)
     }
 
     async fn review(&self, token: &str) -> Result<(), AuthError> {
@@ -201,12 +202,13 @@ pub async fn require_metrics_access(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use crate::metrics_auth::*;
     use axum::Router;
     use axum::routing::get;
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
     use k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus;
     use kube::client::Body as KubeBody;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -338,6 +340,21 @@ mod tests {
             calls.load(Ordering::SeqCst),
             6,
             "expired entry is reviewed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_stays_bounded_under_unique_tokens() {
+        let (client, _calls) = fake_client(false, false);
+        let auth = MetricsAuth::new(client);
+        for i in 0..(MAX_DECISIONS + 200) {
+            let _ = auth.authorize(&format!("token-{i}")).await;
+        }
+        auth.cache.run_pending_tasks().await;
+        assert!(
+            auth.cache.entry_count() <= MAX_DECISIONS,
+            "cache holds {} entries, cap is {MAX_DECISIONS}",
+            auth.cache.entry_count()
         );
     }
 

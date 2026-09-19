@@ -2854,6 +2854,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "modelexpress-common",
+ "moka",
  "openssl",
  "schemars 0.8.22",
  "serde",
@@ -2864,6 +2865,31 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "modelexpress-operator-openshift"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "modelexpress-client",
+ "modelexpress-common",
+ "modelexpress-operator",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5995,8 +6021,10 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "modelexpress-operator",
+ "modelexpress-operator-openshift",
  "modelexpress-server",
  "serde",
+ "serde_json",
  "serde_norway",
  "thiserror 2.0.16",
 ]

@@ -40,6 +40,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 http = { workspace = true }
 sha2 = { workspace = true }
+moka = { workspace = true }
 openssl = { workspace = true, optional = true }
 axum-server = { version = "0.8", default-features = false, optional = true }
 

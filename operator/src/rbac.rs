@@ -35,9 +35,21 @@ pub fn role_name(cr_name: &str) -> String {
 }
 
 /// ClusterRoleBindings share one namespace-less name space, so the name
-/// carries the CR's namespace as well as its name.
+/// carries the CR's namespace and its name. Joining them with a separator
+/// they may both contain is ambiguous (team-a/mx and team/a-mx read alike),
+/// and either can be long enough to overrun a name, so the readable part is
+/// truncated and a digest of the pair decides the name.
 pub fn auth_delegator_binding_name(cr_name: &str, ns: &str) -> String {
-    format!("modelexpress-{ns}-{cr_name}-auth-delegator")
+    /// Leaves room for the suffix inside the 253 a name allows.
+    const READABLE: usize = 100;
+    const DIGEST: usize = 16;
+
+    let digest = crate::digest::hex(&crate::digest::sha256(format!("{ns}/{cr_name}").as_bytes()));
+    let mut readable = format!("modelexpress-{ns}-{cr_name}");
+    readable.truncate(READABLE);
+    let readable = readable.trim_end_matches('-');
+    let digest = digest.get(..DIGEST).unwrap_or(digest.as_str());
+    format!("{readable}-auth-delegator-{digest}")
 }
 
 /// Enforce mode validates client tokens with TokenReview, which is a
@@ -199,6 +211,33 @@ pub fn render_rbac(cr_name: &str, spec: &ModelExpressServerSpec) -> ServerRbac {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use crate::rbac::auth_delegator_binding_name;
+
+    #[test]
+    fn binding_names_cannot_collide_across_namespaces() {
+        assert_ne!(
+            auth_delegator_binding_name("mx", "team-a"),
+            auth_delegator_binding_name("a-mx", "team")
+        );
+        assert_eq!(
+            auth_delegator_binding_name("mx", "team-a"),
+            auth_delegator_binding_name("mx", "team-a"),
+            "the name has to be stable for the same CR"
+        );
+    }
+
+    #[test]
+    fn binding_names_stay_within_a_kubernetes_name() {
+        let name = auth_delegator_binding_name(&"c".repeat(253), &"n".repeat(63));
+        assert!(name.len() <= 253, "{} chars", name.len());
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{name}"
+        );
+        assert!(!name.contains("--auth-delegator"), "{name}");
+    }
+
     use super::*;
     use crate::crd::{RedisBackend, SecurityConfig};
 
@@ -308,7 +347,7 @@ mod tests {
         let binding = render_auth_delegator_binding("mx", "mx-system", &spec).expect("binding");
         assert_eq!(
             binding.metadata.name.as_deref(),
-            Some("modelexpress-mx-system-mx-auth-delegator")
+            Some(auth_delegator_binding_name("mx", "mx-system").as_str())
         );
         assert_eq!(binding.role_ref.kind, "ClusterRole");
         assert_eq!(binding.role_ref.name, AUTH_DELEGATOR_CLUSTER_ROLE);

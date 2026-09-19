@@ -373,18 +373,27 @@ async fn set_finalizer(
     if held == present {
         return Ok(());
     }
-    let mut finalizers: Vec<String> = current
-        .iter()
-        .filter(|f| f.as_str() != AUTH_DELEGATOR_FINALIZER)
-        .cloned()
-        .collect();
-    if present {
-        finalizers.push(AUTH_DELEGATOR_FINALIZER.to_string());
-    }
+    // Server-side apply: metadata.finalizers is a set, so applying only this
+    // one leaves finalizers other controllers own alone, and applying none
+    // removes just this one. A merge patch would write back the whole array
+    // from a snapshot that may already be stale.
+    let held: &[&str] = if present {
+        &[AUTH_DELEGATOR_FINALIZER]
+    } else {
+        &[]
+    };
     let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
-    let patch = serde_json::json!({ "metadata": { "finalizers": finalizers } });
+    let patch = serde_json::json!({
+        "apiVersion": ModelExpressServer::api_version(&()),
+        "kind": ModelExpressServer::kind(&()),
+        "metadata": { "name": name, "finalizers": held },
+    });
     match api
-        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .patch(
+            name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&patch),
+        )
         .await
     {
         Ok(_) => Ok(()),

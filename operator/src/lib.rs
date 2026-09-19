@@ -5,6 +5,7 @@ pub mod app;
 pub mod controller;
 pub mod crd;
 pub mod deployment;
+pub mod digest;
 pub mod env;
 pub mod labels;
 pub mod metrics_auth;
