@@ -25,6 +25,11 @@
 //! a namespace the overlay does not name and with both images set through
 //! base/params.env (tests/odh_kind). The scenario is the same for both.
 //!
+//! A third install, config/manifests/overlays/odh-xks (tests/odh_xks_kind), is
+//! the platform install on a cluster that is not OpenShift. It gets its own
+//! scenario, `platform_install_without_openshift`: with no APIServer to edit,
+//! what matters is that operands still come up on the Intermediate profile.
+//!
 //! The prometheus-operator API is installed too, as a schemaless CRD for the
 //! same group and kind, so the ServiceMonitor the operator applies for its own
 //! metrics can be checked without running prometheus-operator.
@@ -1124,6 +1129,69 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     .await?;
     operator
         .assert_not_restarted(&client, "certificate rotation")
+        .await?;
+
+    println!("cleanup");
+    for backend in Backend::ALL {
+        let api: Api<Namespace> = Api::all(client.clone());
+        api.delete(backend.namespace(), &DeleteParams::default())
+            .await?;
+    }
+    Ok(())
+}
+
+/// The operator reads the cluster TLS profile with no RBAC for it here, and
+/// the API group does not exist. The apiserver authorizes before it looks the
+/// resource up, so that read is a 403, not a 404, and it must not stop a
+/// ModelExpressServer from reconciling.
+#[tokio::test]
+#[ignore = "needs the kind cluster from test_tls_kind.sh --overlay odh-xks"]
+async fn platform_install_without_openshift() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("tls_kind=debug")
+        .with_test_writer()
+        .try_init();
+    let client = kube_client().await?;
+    let pki = Pki::new()?;
+    let operator_ns = operator_namespace();
+    println!("operator namespace: {operator_ns}");
+
+    let apiserver = GroupVersionKind::gvk("config.openshift.io", "v1", "APIServer");
+    if kube::discovery::oneshot::pinned_kind(&client, &apiserver)
+        .await
+        .is_ok()
+    {
+        bail!("config.openshift.io is served; this scenario needs a cluster without it");
+    }
+
+    println!("setup: the operator is up with plaintext metrics");
+    eventually("the operator pod", CONVERGE, || async {
+        OperatorPod::current(&client, &operator_ns)
+            .await
+            .map(|_| ())
+    })
+    .await?;
+    let operator = OperatorPod::current(&client, &operator_ns).await?;
+
+    println!("setup: one ModelExpressServer per server TLS backend, TLS settings unpinned");
+    for backend in Backend::ALL {
+        create_operand(&client, &pki, backend).await?;
+    }
+
+    println!("operands come up on the Intermediate profile");
+    for target in operands_converge_to(
+        &client,
+        &pki,
+        "VersionTLS12",
+        INTERMEDIATE_CIPHERS,
+        PROFILE_GROUPS,
+    )
+    .await?
+    {
+        assert_intermediate(&client, &pki, &target).await?;
+    }
+    operator
+        .assert_not_restarted(&client, "reconciling without an APIServer")
         .await?;
 
     println!("cleanup");
