@@ -16,6 +16,7 @@ set -euo pipefail
 TARGETS=(
     "modelexpress-server:openssl"
     "modelexpress-operator:openssl"
+    "modelexpress-operator-openshift:openssl"
 )
 BANNED=(ring aws-lc-rs aws-lc-sys rustls)
 

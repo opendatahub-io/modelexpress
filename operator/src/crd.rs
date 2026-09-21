@@ -45,9 +45,11 @@ pub const API_GROUP: &str = "modelexpress.opendatahub.io";
 pub struct ModelExpressServerSpec {
     /// Server image ref. The tag pins the mx version; mx_source_id embeds it,
     /// so a rolling image change cold-starts P2P discovery between old and new
-    /// workers.
+    /// workers. Unset follows the default server image the operator was
+    /// started with, and a change to that default rolls the server.
     #[cel_validate(rule = Rule::new("self != ''").message("image must not be empty"))]
-    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 
     /// Replicas are stateless and share no locks; safe to scale as long as the
     /// cache volume is RWX or per-replica.
@@ -76,6 +78,10 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
 
+    /// TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+
     /// Stale-worker reaper timings, MX_REAPER_* / MX_HEARTBEAT_* / MX_GC_*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaper: Option<ReaperConfig>,
@@ -89,6 +95,11 @@ pub struct ModelExpressServerSpec {
     /// Operator-owned selector labels win on conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_metadata: Option<MetadataOverrides>,
+
+    /// Extra labels/annotations for the Service, e.g. a certificate issuer's
+    /// annotation for tls.secretName. Operator-owned labels win on conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_metadata: Option<MetadataOverrides>,
 
     /// Compute resources for the server container. Defaults to modest
     /// requests and no limits; unset entirely would put the pod in BestEffort,
@@ -333,6 +344,34 @@ pub struct SecurityConfig {
     pub cache_ttl_secs: Option<u32>,
 }
 
+/// Serve TLS from a kubernetes.io/tls Secret. Version, ciphers and groups left
+/// unset take the platform's defaults, or the server's own when there are
+/// none. Kubernetes gRPC probes cannot speak TLS, so the probes switch to TCP
+/// when this is set.
+#[derive(CELSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// Secret holding tls.crt and tls.key, mounted read-only.
+    #[cel_validate(rule = Rule::new("self != ''").message("secretName must not be empty"))]
+    #[schemars(length(max = 253))]
+    pub secret_name: String,
+    /// MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 16))]
+    #[cel_validate(rule = Rule::new("self.matches('^(VersionTLS1[0-3]|TLS1[.][0-3])$')")
+        .message("minVersion must be VersionTLS10..13 or TLS1.0..1.3"))]
+    pub min_version: Option<String>,
+    /// MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub cipher_suites: Vec<String>,
+    /// MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order
+    /// (rendered comma-separated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub groups: Vec<String>,
+}
+
 /// Mirrors upstream AuthMode, but the CRD value is `disabled` rather than
 /// upstream's `off`: YAML 1.1 parsers (kubectl, the apiserver) read an
 /// unquoted `off` as a boolean, which corrupts the schema's enum/default.
@@ -423,7 +462,8 @@ pub struct ModelExpressServerStatus {
     /// Standard conditions; Ready is the rollup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
-    /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to.
+    /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as
+    /// `http://host:port`, or `https://host:port` when spec.tls is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 }
@@ -566,8 +606,16 @@ mod tests {
     #[test]
     fn endpoint_format_is_service_dns() {
         assert_eq!(
-            crate::controller::endpoint("mx", "weaton-dev", 8001),
-            "grpc://mx.weaton-dev.svc.cluster.local:8001"
+            crate::controller::endpoint("mx", "weaton-dev", 8001, false),
+            "http://mx.weaton-dev.svc.cluster.local:8001"
+        );
+    }
+
+    #[test]
+    fn tls_endpoint_uses_https() {
+        assert_eq!(
+            crate::controller::endpoint("mx", "weaton-dev", 8001, true),
+            "https://mx.weaton-dev.svc.cluster.local:8001"
         );
     }
 
@@ -595,7 +643,8 @@ mod tests {
     fn required_fields_marked_in_schema() {
         let json = crd_json();
         assert!(json.contains("metadataBackend"));
-        // spec-level required list must include the backend and image
+        // spec-level required list must include the backend; image may be
+        // left to the operator's default
         let crd = generate_crd();
         let schema = serde_json::to_value(&crd).expect("crd to json");
         let required = schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
@@ -605,7 +654,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
-        assert!(required.contains(&"image"));
+        assert!(!required.contains(&"image"));
         assert!(required.contains(&"metadataBackend"));
     }
 

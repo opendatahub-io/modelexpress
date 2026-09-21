@@ -16,6 +16,8 @@ tls-openssl = ["kube/openssl-tls"]
 tls-rustls = ["kube/rustls-tls"]
 
 [dependencies]
+serde_json = { workspace = true }
+modelexpress-operator-openshift = { path = "../operator-openshift", default-features = false }
 modelexpress-operator = { path = "../operator" }
 kube = { workspace = true }
 # the server's own CRD types, so generated manifests cannot drift from

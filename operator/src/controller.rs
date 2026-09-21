@@ -6,12 +6,16 @@
 use crate::crd::{CacheStorage, ModelExpressServer, ModelExpressServerStatus};
 use crate::deployment::{DesiredState, render};
 use crate::labels;
-use crate::rbac::{ServerRbac, render_rbac, role_name, service_account_name};
+use crate::rbac::{
+    ServerRbac, auth_delegator_binding_name, render_auth_delegator_binding, render_rbac, role_name,
+    service_account_name,
+};
+use crate::tls::{self, TlsDefaults, TlsDefaultsError, TlsSettings};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{Api, ObjectMeta, PartialObjectMeta, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
@@ -24,12 +28,21 @@ use std::time::Duration;
 
 pub const FIELD_MANAGER: &str = "modelexpress-operator";
 
+/// Carried only by CRs that own a ClusterRoleBinding. Cluster-scoped objects
+/// cannot be garbage collected through a namespaced owner, so enforce mode
+/// needs the operator to delete the binding itself.
+pub const AUTH_DELEGATOR_FINALIZER: &str = "modelexpress.opendatahub.io/auth-delegator";
+
 const WATCH_TIMEOUT_SECS: u32 = 290;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("kube api: {0}")]
     Kube(#[from] kube::Error),
+    #[error("TLS defaults: {0}")]
+    TlsDefaults(TlsDefaultsError),
+    #[error("spec.image is unset and the operator has no default server image")]
+    ServerImageUnset,
     #[error("CR has no namespace")]
     MissingNamespace,
     #[error("CR has no uid")]
@@ -49,9 +62,16 @@ pub enum Error {
 
 pub struct Ctx {
     pub client: Client,
+    pub tls_defaults: Arc<dyn TlsDefaults>,
+    /// The server image for CRs that leave spec.image unset.
+    pub default_server_image: Option<String>,
 }
 
-pub async fn run(client: Client) -> Result<(), kube::Error> {
+pub async fn run(
+    client: Client,
+    tls_defaults: Arc<dyn TlsDefaults>,
+    default_server_image: Option<String>,
+) -> Result<(), kube::Error> {
     let servers = Api::<ModelExpressServer>::all(client.clone());
     let deployments = Api::<Deployment>::all(client.clone());
     let services = Api::<Service>::all(client.clone());
@@ -68,7 +88,7 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
         .labels(labels::MANAGED_BY_SELECTOR)
         .timeout(WATCH_TIMEOUT_SECS);
 
-    Controller::new(
+    let controller = Controller::new(
         servers,
         watcher::Config::default().timeout(WATCH_TIMEOUT_SECS),
     )
@@ -78,16 +98,31 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
     .owns_stream(owned_meta(netpols, owned.clone()))
     .owns_stream(owned_meta(sas, owned.clone()))
     .owns_stream(owned_meta(roles, owned.clone()))
-    .owns_stream(owned_meta(bindings, owned))
-    .shutdown_on_signal()
-    .run(reconcile, error_policy, Arc::new(Ctx { client }))
-    .for_each(|result| async move {
-        match result {
-            Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
-            Err(err) => tracing::warn!(%err, "reconcile failed"),
-        }
-    })
-    .await;
+    .owns_stream(owned_meta(bindings, owned));
+
+    // A change to the TLS defaults re-renders every server that relies on
+    // them. They are global, so a full requeue is the cheapest correct mapping.
+    let defaults_changed = tls_defaults.updates().await.map(|_| ());
+    let controller = controller.reconcile_all_on(defaults_changed);
+
+    controller
+        .shutdown_on_signal()
+        .run(
+            reconcile,
+            error_policy,
+            Arc::new(Ctx {
+                client,
+                tls_defaults,
+                default_server_image,
+            }),
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((obj, _)) => tracing::debug!(name = %obj.name, "reconciled"),
+                Err(err) => tracing::warn!(%err, "reconcile failed"),
+            }
+        })
+        .await;
     Ok(())
 }
 
@@ -127,11 +162,16 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     let ns = cr.namespace().ok_or(Error::MissingNamespace)?;
     let name = cr.name_any();
 
+    if cr.metadata.deletion_timestamp.is_some() {
+        release_auth_delegator(&cr, &ns, &name, &ctx).await?;
+        return Ok(Action::await_change());
+    }
+
     let result = apply(&cr, &ns, &name, &ctx).await;
     let (condition, endpoint, observed_generation) = match &result {
         Ok(()) => (
             ready_condition(&cr, "True", "Applied", "resources applied"),
-            Some(endpoint(&name, &ns, cr.spec.port)),
+            Some(endpoint(&name, &ns, cr.spec.port, cr.spec.tls.is_some())),
             cr.metadata.generation,
         ),
         Err(err) => (
@@ -148,9 +188,23 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
 }
 
 /// What clients set MODEL_EXPRESS_ENDPOINT to. The Service is always named
-/// after the CR.
-pub fn endpoint(name: &str, ns: &str, port: i32) -> String {
-    format!("grpc://{name}.{ns}.svc.cluster.local:{port}")
+/// after the CR. The scheme is what the clients parse: the Rust client
+/// negotiates TLS for `https` only, and the Python client strips `http://`
+/// and `https://` and nothing else.
+pub fn endpoint(name: &str, ns: &str, port: i32, tls: bool) -> String {
+    let scheme = if tls { "https" } else { "http" };
+    format!("{scheme}://{name}.{ns}.svc.cluster.local:{port}")
+}
+
+/// The CR's image, else the operator's default.
+fn server_image<'a>(
+    spec: &'a crate::crd::ModelExpressServerSpec,
+    default: Option<&'a str>,
+) -> Result<&'a str, Error> {
+    spec.image
+        .as_deref()
+        .or(default)
+        .ok_or(Error::ServerImageUnset)
 }
 
 #[tracing::instrument(skip_all)]
@@ -158,12 +212,25 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     check_existing_claim(cr, ns, ctx).await?;
     let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
+    let tls_defaults = match &cr.spec.tls {
+        Some(config) if tls::needs_defaults(config) => ctx
+            .tls_defaults
+            .current()
+            .await
+            .map_err(Error::TlsDefaults)?,
+        _ => TlsSettings::default(),
+    };
     let DesiredState {
         mut deployment,
         mut service,
         pvc,
         network_policy,
-    } = render(name, &cr.spec);
+    } = render(
+        name,
+        &cr.spec,
+        server_image(&cr.spec, ctx.default_server_image.as_deref())?,
+        &tls_defaults,
+    );
 
     let owner = cr.controller_owner_ref(&());
     stamp(&mut deployment.metadata, ns, owner.clone());
@@ -250,7 +317,115 @@ async fn apply_rbac(
             delete_if_owned(&role_api, &rname, uid).await?;
         }
     }
+
+    apply_auth_delegator(cr, ns, &name, ctx, params).await
+}
+
+/// The binding outlives the CR unless the operator deletes it, so the
+/// finalizer goes on before the binding is created.
+#[tracing::instrument(skip_all)]
+async fn apply_auth_delegator(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+    params: &PatchParams,
+) -> Result<(), Error> {
+    let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
+    let binding_name = auth_delegator_binding_name(name, ns);
+    match render_auth_delegator_binding(name, ns, &cr.spec) {
+        Some(binding) => {
+            set_finalizer(cr, ns, name, ctx, true).await?;
+            api.patch(&binding_name, params, &Patch::Apply(&binding))
+                .await?;
+        }
+        None => {
+            delete_if_managed(&api, &binding_name, name).await?;
+            set_finalizer(cr, ns, name, ctx, false).await?;
+        }
+    }
     Ok(())
+}
+
+/// Runs on a CR that is going away: drop the binding, then the finalizer that
+/// held the CR open for it.
+#[tracing::instrument(skip_all)]
+async fn release_auth_delegator(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+) -> Result<(), Error> {
+    let api = Api::<ClusterRoleBinding>::all(ctx.client.clone());
+    delete_if_managed(&api, &auth_delegator_binding_name(name, ns), name).await?;
+    set_finalizer(cr, ns, name, ctx, false).await
+}
+
+async fn set_finalizer(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+    present: bool,
+) -> Result<(), Error> {
+    let current = cr.finalizers();
+    let held = current.iter().any(|f| f == AUTH_DELEGATOR_FINALIZER);
+    if held == present {
+        return Ok(());
+    }
+    // Server-side apply: metadata.finalizers is a set, so applying only this
+    // one leaves finalizers other controllers own alone, and applying none
+    // removes just this one. A merge patch would write back the whole array
+    // from a snapshot that may already be stale.
+    let held: &[&str] = if present {
+        &[AUTH_DELEGATOR_FINALIZER]
+    } else {
+        &[]
+    };
+    let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
+    let patch = serde_json::json!({
+        "apiVersion": ModelExpressServer::api_version(&()),
+        "kind": ModelExpressServer::kind(&()),
+        "metadata": { "name": name, "finalizers": held },
+    });
+    match api
+        .patch(
+            name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        // the CR is already gone; nothing left to hold open
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Cluster-scoped objects carry no ownerReference back to a namespaced CR, so
+/// the managed labels are the only proof the operator created this one.
+async fn delete_if_managed(
+    api: &Api<ClusterRoleBinding>,
+    name: &str,
+    cr_name: &str,
+) -> Result<(), Error> {
+    let Some(existing) = api.get_opt(name).await? else {
+        return Ok(());
+    };
+    let labels = existing.labels();
+    let managed = labels.get(labels::MANAGED_BY_LABEL).map(String::as_str)
+        == Some(labels::MANAGED_BY)
+        && labels.get(labels::INSTANCE_LABEL).map(String::as_str) == Some(cr_name);
+    if !managed {
+        tracing::debug!(name, "not operator-owned, leaving in place");
+        return Ok(());
+    }
+    match api.delete(name, &Default::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Cleanup targets names derived from the CR, not names the operator can prove
@@ -334,6 +509,8 @@ fn stamp(
 fn reason(err: &Error) -> &'static str {
     match err {
         Error::Kube(_) => "ApplyFailed",
+        Error::TlsDefaults(_) => "TlsDefaultsUnavailable",
+        Error::ServerImageUnset => "ServerImageUnset",
         Error::MissingNamespace => "MissingNamespace",
         Error::MissingUid => "MissingUid",
         Error::MissingClaim { .. } => "CacheClaimMissing",
@@ -407,7 +584,7 @@ async fn write_status(
 fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Action {
     match err {
         // user-fixable config problems: no point hammering the apiserver
-        Error::MissingClaim { .. } | Error::SingleNodeClaim { .. } => {
+        Error::MissingClaim { .. } | Error::SingleNodeClaim { .. } | Error::ServerImageUnset => {
             Action::requeue(Duration::from_secs(120))
         }
         _ => Action::requeue(Duration::from_secs(15)),
@@ -417,7 +594,7 @@ fn error_policy(_cr: Arc<ModelExpressServer>, err: &Error, _ctx: Arc<Ctx>) -> Ac
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
+    use crate::controller::*;
     use crate::crd::{MetadataBackend, ModelExpressServerSpec, RedisBackend};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 
@@ -425,7 +602,7 @@ mod tests {
         let mut cr = ModelExpressServer::new(
             "mx",
             ModelExpressServerSpec {
-                image: "img".into(),
+                image: Some("img".into()),
                 replicas: 1,
                 metadata_backend: MetadataBackend::Redis(RedisBackend {
                     url: Some("redis://mx-redis:6379".into()),
@@ -435,9 +612,11 @@ mod tests {
                 log: None,
                 cache: None,
                 security: None,
+                tls: None,
                 reaper: None,
                 credentials: None,
                 pod_metadata: None,
+                service_metadata: None,
                 resources: None,
                 node_selector: None,
                 tolerations: None,
@@ -468,6 +647,35 @@ mod tests {
             conditions: vec![condition],
             endpoint: None,
         })
+    }
+
+    #[test]
+    fn server_image_prefers_the_cr() {
+        let mut spec = server(None).spec;
+        spec.image = Some("cr-image".into());
+        assert_eq!(
+            server_image(&spec, Some("default-image")).ok(),
+            Some("cr-image")
+        );
+    }
+
+    #[test]
+    fn server_image_falls_back_to_the_default() {
+        let mut spec = server(None).spec;
+        spec.image = None;
+        assert_eq!(
+            server_image(&spec, Some("default-image")).ok(),
+            Some("default-image")
+        );
+    }
+
+    #[test]
+    fn server_image_without_either_is_a_user_fixable_error() {
+        let mut spec = server(None).spec;
+        spec.image = None;
+        let err = server_image(&spec, None).expect_err("no image anywhere");
+        assert!(matches!(err, Error::ServerImageUnset));
+        assert_eq!(reason(&err), "ServerImageUnset");
     }
 
     #[test]

@@ -139,16 +139,18 @@ mod tests {
 
     fn spec_with_cache(cache: Option<CacheConfig>) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
-            image: "img".into(),
+            image: Some("img".into()),
             replicas: 1,
             metadata_backend: MetadataBackend::Kubernetes {},
             port: 8001,
             log: None,
             cache,
             security: None,
+            tls: None,
             reaper: None,
             credentials: None,
             pod_metadata: None,
+            service_metadata: None,
             resources: None,
             node_selector: None,
             tolerations: None,

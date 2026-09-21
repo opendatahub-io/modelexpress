@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod objects;
+mod openshift;
 
 use clap::{Parser, Subcommand};
 use kube::CustomResourceExt;
@@ -51,7 +52,8 @@ enum Cmd {
         check: bool,
     },
     /// Generate the operator's deploy manifests into config/manifests/rbac/,
-    /// config/manifests/manager/ and config/manifests/base/params.env
+    /// config/manifests/manager/, config/manifests/openshift/ and
+    /// config/manifests/base/params.env
     Manifests {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
         #[arg(long)]
@@ -167,6 +169,22 @@ fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
             config.join("manager/deployment.yaml"),
             to_yaml(&objects::deployment(image))?,
         ),
+        (
+            config.join("manager/service.yaml"),
+            to_yaml(&objects::metrics_service())?,
+        ),
         (config.join("base/params.env"), params),
-    ])
+    ]
+    .into_iter()
+    .chain(
+        openshift::overlay()
+            .into_iter()
+            .map(|(file, value)| Ok((config.join("openshift").join(file), to_yaml(&value)?)))
+            .collect::<Result<Vec<_>>>()?,
+    )
+    .chain([(
+        config.join("openshift/params.env"),
+        openshift::PARAMS_ENV.to_string(),
+    )])
+    .collect())
 }

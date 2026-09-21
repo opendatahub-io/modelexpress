@@ -285,7 +285,9 @@ The server's ServiceAccount needs permission to create `TokenReview`s (a cluster
 subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
 The Helm chart creates this automatically when it also creates the ServiceAccount
 (`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
-existing ServiceAccount, create the equivalent binding separately:
+existing ServiceAccount, create the equivalent binding separately. The operator creates
+it for any `ModelExpressServer` with `spec.security.mode: enforce`, including one using
+`spec.serviceAccountName`, and deletes it when the mode changes or the CR goes away:
 
 ```yaml
 security:
@@ -320,6 +322,73 @@ volumes:
 |---------|---------|-------------|
 | `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
+
+## TLS
+
+The gRPC listener serves plaintext by default. Point it at a certificate to terminate TLS
+in the server. Both builds terminate TLS: the default rustls build (ring provider), and the
+OpenSSL build (`--no-default-features --features openssl`) the container images ship for
+FIPS.
+
+### Server configuration
+
+| Env Var | Flag | Description |
+|---------|------|-------------|
+| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+
+Certificate and key must be set together. Version and cipher settings without a
+certificate fail config validation. A cipher list in which the backend knows none of the
+TLS 1.2 names, or none of the TLS 1.3 names, fails startup.
+
+Settings use OpenSSL spelling on both builds. rustls implements a subset of it: TLS 1.2 and
+1.3 only (a lower minimum is raised to `TLS1.2`), the AEAD ciphers (ECDHE with AES-GCM or
+ChaCha20-Poly1305, and the three TLS 1.3 suites), and the groups `X25519`, `secp256r1` and
+`secp384r1`. Anything else in a profile, such as the CBC ciphers of the Old profile or
+`X25519MLKEM768`, is dropped with a warning.
+
+On OpenShift the cluster TLS profile from `apiservers.config.openshift.io/cluster` maps
+straight onto the last three variables: `spec.tlsSecurityProfile.intermediate` resolves to
+`minTLSVersion: VersionTLS12`, a `ciphers` list and a `groups` list, all accepted verbatim. Leaving both
+unset on RHEL-based images follows the system crypto policy instead.
+
+The same file also configures it:
+
+```yaml
+tls:
+  cert_file: /etc/tls/private/tls.crt
+  key_file: /etc/tls/private/tls.key
+  min_version: TLS1.2
+  cipher_suites:
+    - TLS_AES_128_GCM_SHA256
+    - TLS_AES_256_GCM_SHA384
+    - ECDHE-ECDSA-AES128-GCM-SHA256
+    - ECDHE-RSA-AES128-GCM-SHA256
+  groups:
+    - X25519MLKEM768
+    - X25519
+    - secp256r1
+```
+
+Kubernetes gRPC probes do not speak TLS, so switch the liveness and readiness probes to
+`tcpSocket` when enabling it.
+
+### Client configuration
+
+An `https://` endpoint turns TLS on in both clients. The Rust client and CLI take the
+endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
+`MX_SERVER_ADDRESS` (or the older `MODEL_EXPRESS_URL`).
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+
+On OpenShift a service-ca signed certificate verifies against the bundle injected into any
+ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the
+worker pod and point the variable at `service-ca.crt`.
 
 ## Docker
 
