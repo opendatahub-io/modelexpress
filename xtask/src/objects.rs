@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 pub const NAME: &str = "modelexpress-operator";
 /// Must keep reproducing the committed tree, or `--check` fails for anyone
 /// who did not pass `--image`.
-pub const DEFAULT_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress-operator:latest";
+pub const DEFAULT_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress-operator:odh-stable";
 /// The ConfigMap config/manifests/base generates from its params.env, and
 /// the key in it that carries the controller image.
 pub const PARAMS_CONFIGMAP: &str = "modelexpress-operator-params";

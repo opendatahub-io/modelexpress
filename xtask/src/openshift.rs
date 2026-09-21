@@ -14,7 +14,7 @@ use serde_json::json;
 pub const OPENSHIFT_ROLE: &str = "modelexpress-operator-openshift";
 
 pub const SERVER_IMAGE_PARAM: &str = "MODELEXPRESS_SERVER_IMAGE";
-pub const DEFAULT_SERVER_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress:latest";
+pub const DEFAULT_SERVER_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress:odh-stable";
 const PARAMS_CONFIGMAP: &str = "modelexpress-operator-openshift-params";
 pub const METRICS_TLS_SECRET: &str = "modelexpress-operator-metrics-tls";
 pub const METRICS_TLS_MOUNT: &str = "/etc/modelexpress-operator/metrics-tls";
