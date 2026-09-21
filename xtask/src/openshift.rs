@@ -3,7 +3,7 @@
 
 //! config/manifests/openshift: the operator as deployed on OpenShift.
 
-use crate::objects::{METRICS_SERVICE_NAME, NAME, labels};
+use crate::objects::{METRICS_SERVICE_NAME, NAME, PARAMS_CONFIGMAP, SERVER_IMAGE_PARAM, labels};
 use modelexpress_operator::telemetry;
 use modelexpress_operator_openshift::images::SERVER_IMAGE_ENV;
 use modelexpress_operator_openshift::servicemonitor;
@@ -13,28 +13,58 @@ use serde_json::json;
 /// ServiceMonitor, neither of which the base manifests need.
 pub const OPENSHIFT_ROLE: &str = "modelexpress-operator-openshift";
 
-pub const SERVER_IMAGE_PARAM: &str = "MODELEXPRESS_SERVER_IMAGE";
-pub const DEFAULT_SERVER_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress:odh-stable";
-const PARAMS_CONFIGMAP: &str = "modelexpress-operator-openshift-params";
 pub const METRICS_TLS_SECRET: &str = "modelexpress-operator-metrics-tls";
 pub const METRICS_TLS_MOUNT: &str = "/etc/modelexpress-operator/metrics-tls";
 pub const SERVICE_CA_CONFIGMAP: &str = "openshift-service-ca.crt";
 /// The namespace `config/manifests/default` installs into.
 pub const DEFAULT_NAMESPACE: &str = "modelexpress-operator-system";
 
-/// Path of [`component`] relative to an overlay directory.
-pub const COMPONENT_PATH: &str = "../components/openshift";
+/// Directory of [`component`] under config/manifests.
+pub const COMPONENT_DIR: &str = "components/openshift";
+/// Directory of [`related_image_component`] under config/manifests.
+pub const RELATED_IMAGE_COMPONENT_DIR: &str = "components/related-image";
 
-/// The overlay's image parameters, overridable like the base params.env.
-pub fn params_env() -> String {
-    format!("{SERVER_IMAGE_PARAM}={DEFAULT_SERVER_IMAGE}\n")
+/// The env var [`server_image_replacement`] fills in. Without it the operator
+/// has no default image for a CR that leaves spec.image unset.
+fn server_image_env() -> serde_json::Value {
+    json!({"name": SERVER_IMAGE_ENV, "value": "set from params.env"})
 }
 
-/// Sets the server image the operator defaults CRs to, from `configmap`'s
-/// `MODELEXPRESS_SERVER_IMAGE`.
-pub fn server_image_replacement(configmap: &str) -> serde_json::Value {
+/// Kustomize Component: only the default server image, for a platform install
+/// on a cluster with none of the OpenShift APIs [`component`] depends on.
+pub fn related_image_component() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "kustomization.yaml",
+            json!({
+                "apiVersion": "kustomize.config.k8s.io/v1alpha1",
+                "kind": "Component",
+                "patches": [
+                    {"path": "deployment-patch.yaml", "target": {"kind": "Deployment", "name": NAME}},
+                ],
+            }),
+        ),
+        (
+            "deployment-patch.yaml",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": NAME},
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": "operator",
+                    "env": [server_image_env()],
+                }]}}},
+            }),
+        ),
+    ]
+}
+
+/// Sets the server image the operator defaults CRs to, from the base params
+/// ConfigMap. It lives in the overlays because the env entry it fills in only
+/// exists once a component has added it.
+pub fn server_image_replacement() -> serde_json::Value {
     json!({
-        "source": {"kind": "ConfigMap", "name": configmap, "fieldPath": format!("data.{SERVER_IMAGE_PARAM}")},
+        "source": {"kind": "ConfigMap", "name": PARAMS_CONFIGMAP, "fieldPath": format!("data.{SERVER_IMAGE_PARAM}")},
         "targets": [{
             "select": {"kind": "Deployment", "name": NAME},
             "fieldPaths": [format!("spec.template.spec.containers.[name=operator].env.[name={SERVER_IMAGE_ENV}].value")],
@@ -53,10 +83,8 @@ pub fn overlay() -> Vec<(&'static str, serde_json::Value)> {
                 "kind": "Kustomization",
                 "namespace": DEFAULT_NAMESPACE,
                 "resources": ["../default"],
-                "components": [COMPONENT_PATH],
-                "generatorOptions": {"disableNameSuffixHash": true},
-                "configMapGenerator": [{"name": PARAMS_CONFIGMAP, "envs": ["params.env"]}],
-                "replacements": [server_image_replacement(PARAMS_CONFIGMAP)],
+                "components": [format!("../{COMPONENT_DIR}")],
+                "replacements": [server_image_replacement()],
                 "patches": [
                     {"path": "namespace-patch.yaml", "target": {"kind": "Namespace", "name": DEFAULT_NAMESPACE}},
                 ],
@@ -111,7 +139,7 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
                             "name": "operator",
                             "env": [
                                 {"name": telemetry::METRICS_TLS_DIR_ENV, "value": METRICS_TLS_MOUNT},
-                                {"name": SERVER_IMAGE_ENV, "value": "set from params.env"},
+                                server_image_env(),
                                 {
                                     "name": servicemonitor::NAMESPACE_ENV,
                                     "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
@@ -198,7 +226,8 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use crate::openshift::{COMPONENT_PATH, component, overlay};
+    use crate::openshift::{COMPONENT_DIR, component, overlay, related_image_component};
+    use modelexpress_operator_openshift::images::SERVER_IMAGE_ENV;
     use std::collections::BTreeSet;
 
     /// Files a kustomization names through `resources` and `patches`, minus
@@ -238,6 +267,34 @@ mod tests {
     }
 
     #[test]
+    fn related_image_component_emits_exactly_the_files_it_references() {
+        assert_emits_what_it_references(related_image_component());
+    }
+
+    /// server_image_replacement targets this env entry by name in whichever
+    /// component the overlay pulled in; kustomize fails the build if it is
+    /// missing from either.
+    #[test]
+    fn both_components_declare_the_server_image_env() {
+        for files in [component(), related_image_component()] {
+            let patch = &files
+                .iter()
+                .find(|(file, _)| *file == "deployment-patch.yaml")
+                .expect("has a deployment patch")
+                .1;
+            let env = patch["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .expect("env list");
+            assert_eq!(
+                env.iter()
+                    .filter(|entry| entry["name"] == SERVER_IMAGE_ENV)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn overlay_emits_exactly_the_files_it_references() {
         assert_emits_what_it_references(overlay());
     }
@@ -265,7 +322,7 @@ mod tests {
         let files = overlay();
         assert_eq!(
             files[0].1["components"],
-            serde_json::json!([COMPONENT_PATH])
+            serde_json::json!([format!("../{COMPONENT_DIR}")])
         );
     }
 }

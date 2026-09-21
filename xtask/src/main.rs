@@ -54,7 +54,7 @@ enum Cmd {
     },
     /// Generate the operator's deploy manifests into config/manifests/rbac/,
     /// config/manifests/manager/, config/manifests/components/,
-    /// config/manifests/openshift/, config/manifests/odh/ and
+    /// config/manifests/openshift/, config/manifests/overlays/ and
     /// config/manifests/base/params.env
     Manifests {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
@@ -163,7 +163,6 @@ fn yaml_files(
 fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
     let config = manifests_root();
     let rbac = config.join("rbac");
-    let params = format!("{}={image}\n", objects::OPERATOR_IMAGE_PARAM);
     Ok(vec![
         (
             rbac.join("serviceaccount.yaml"),
@@ -185,16 +184,22 @@ fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
             config.join("manager/service.yaml"),
             to_yaml(&objects::metrics_service())?,
         ),
-        (config.join("base/params.env"), params),
-        (config.join("openshift/params.env"), openshift::params_env()),
-        (config.join("odh/params.env"), odh::params_env(image)),
+        (config.join("base/params.env"), objects::params_env(image)),
     ]
     .into_iter()
     .chain(yaml_files(
-        &config.join("components/openshift"),
+        &config.join(openshift::COMPONENT_DIR),
         openshift::component(),
     )?)
     .chain(yaml_files(&config.join("openshift"), openshift::overlay())?)
-    .chain(yaml_files(&config.join("odh"), odh::overlay())?)
+    .chain(yaml_files(
+        &config.join(openshift::RELATED_IMAGE_COMPONENT_DIR),
+        openshift::related_image_component(),
+    )?)
+    .chain(yaml_files(&config.join(odh::OVERLAY_DIR), odh::overlay())?)
+    .chain(yaml_files(
+        &config.join(odh::XKS_OVERLAY_DIR),
+        odh::xks_overlay(),
+    )?)
     .collect())
 }
