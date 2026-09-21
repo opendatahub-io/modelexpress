@@ -6,8 +6,8 @@
 # and the operator's metrics listener, without restarts.
 #
 # Runs once per install: config/manifests/openshift as a standalone user applies
-# it, and config/manifests/odh as a platform operator does, in a namespace the
-# overlay does not name and with images set through params.env.
+# it, and config/manifests/overlays/odh as a platform operator does, in a
+# namespace the overlay does not name and with images set through params.env.
 
 name: TLS kind e2e
 

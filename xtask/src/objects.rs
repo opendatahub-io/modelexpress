@@ -23,10 +23,19 @@ pub const NAME: &str = "modelexpress-operator";
 /// Must keep reproducing the committed tree, or `--check` fails for anyone
 /// who did not pass `--image`.
 pub const DEFAULT_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress-operator:odh-stable";
+pub const DEFAULT_SERVER_IMAGE: &str = "quay.io/opendatahub/odh-modelexpress:odh-stable";
 /// The ConfigMap config/manifests/base generates from its params.env, and
-/// the key in it that carries the controller image.
+/// the keys in it that carry the controller image and the default server
+/// image.
 pub const PARAMS_CONFIGMAP: &str = "modelexpress-operator-params";
 pub const OPERATOR_IMAGE_PARAM: &str = "MODELEXPRESS_OPERATOR_IMAGE";
+pub const SERVER_IMAGE_PARAM: &str = "MODELEXPRESS_SERVER_IMAGE";
+
+/// config/manifests/base/params.env: every image in the tree, in the one file
+/// a platform operator rewrites.
+pub fn params_env(image: &str) -> String {
+    format!("{OPERATOR_IMAGE_PARAM}={image}\n{SERVER_IMAGE_PARAM}={DEFAULT_SERVER_IMAGE}\n")
+}
 
 pub fn labels() -> BTreeMap<String, String> {
     [

@@ -21,9 +21,9 @@
 //!
 //! The operator comes from one of two installs, picked by `test_tls_kind.sh
 //! --overlay`: config/manifests/openshift in its own namespace (tests/tls_kind),
-//! or config/manifests/odh the way a platform operator applies it, in a
-//! namespace the overlay does not name and with both images set through
-//! odh/params.env (tests/odh_kind). The scenario is the same for both.
+//! or config/manifests/overlays/odh the way a platform operator applies it, in
+//! a namespace the overlay does not name and with both images set through
+//! base/params.env (tests/odh_kind). The scenario is the same for both.
 //!
 //! The prometheus-operator API is installed too, as a schemaless CRD for the
 //! same group and kind, so the ServiceMonitor the operator applies for its own

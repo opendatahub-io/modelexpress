@@ -10,10 +10,11 @@
 # without touching a real cluster. The test logic lives in
 # operator-openshift/tests/tls_kind.rs; this script only prepares the cluster.
 #
-# --overlay odh runs the same scenario against config/manifests/odh, installed
-# the way a platform operator installs it (operator-openshift/tests/odh_kind):
-# into a namespace the overlay does not name, with both images set by rewriting
-# odh/params.env in a staged copy of the manifests.
+# --overlay odh runs the same scenario against config/manifests/overlays/odh,
+# installed the way a platform operator installs it
+# (operator-openshift/tests/odh_kind): into a namespace the overlay does not
+# name, with both images set by rewriting base/params.env, the file the
+# platform resolves for that overlay, in a staged copy of the manifests.
 #
 # Prerequisites: docker (with buildx), kind, kubectl, cargo.
 #
@@ -92,7 +93,7 @@ if [ "${OVERLAY}" = odh ]; then
     cp -R operator-openshift/tests "${STAGE}/operator-openshift/tests"
     printf 'MODELEXPRESS_OPERATOR_IMAGE=%s\nMODELEXPRESS_SERVER_IMAGE=%s\n' \
         mx-e2e/operator:kind mx-e2e/server-openssl:kind \
-        > "${STAGE}/config/manifests/odh/params.env"
+        > "${STAGE}/config/manifests/base/params.env"
     HARNESS="${STAGE}/operator-openshift/tests/odh_kind"
 else
     HARNESS=operator-openshift/tests/tls_kind
