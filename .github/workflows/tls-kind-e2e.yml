@@ -42,6 +42,9 @@ jobs:
           - overlay: odh
             cluster: mx-tls-e2e-odh
             namespace: mx-platform
+          - overlay: odh-xks
+            cluster: mx-tls-e2e-xks
+            namespace: mx-platform
     env:
       KIND_VERSION: v0.31.0
       KIND_SHA256: eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
