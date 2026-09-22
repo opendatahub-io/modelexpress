@@ -29,7 +29,7 @@ pub fn labels() -> BTreeMap<String, String> {
         ("app.kubernetes.io/name".to_string(), NAME.to_string()),
         (
             "app.kubernetes.io/managed-by".to_string(),
-            "xtask".to_string(),
+            "kustomize".to_string(),
         ),
     ]
     .into_iter()
