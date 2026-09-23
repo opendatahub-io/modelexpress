@@ -573,6 +573,8 @@ kind: ModelExpressServer
 metadata:
   name: mx
 spec:
+  metadataBackend:
+    kubernetes: {}
   image: registry.example.com/modelexpress-server:0.7.0
   imagePullSecrets:
     - name: registry-creds
