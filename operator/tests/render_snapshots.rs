@@ -139,6 +139,9 @@ fn full_spec() -> ModelExpressServerSpec {
             ],
         }),
         service_account_name: None,
+        image_pull_secrets: Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
+            name: "registry-creds".into(),
+        }]),
     }
 }
 

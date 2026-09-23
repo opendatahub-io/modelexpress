@@ -51,6 +51,16 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
+    /// Pull secrets for the server image, for a private or mirrored registry.
+    /// Set on the pod spec, so they apply whether the pods run as the
+    /// generated ServiceAccount or one named by `serviceAccountName`.
+    #[cel_validate(
+        rule = Rule::new("self.all(secret, secret.name != '')")
+            .message("image pull secret name must not be empty")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_secrets: Option<Vec<k8s_openapi::api::core::v1::LocalObjectReference>>,
+
     /// Replicas are stateless and share no locks; safe to scale as long as the
     /// cache volume is RWX or per-replica.
     #[serde(default = "default_replicas")]
@@ -582,6 +592,7 @@ mod tests {
             "self.startsWith('redis://')",
             "self >= 0",
             "self > 0 && self < 65536",
+            "self.all(secret, secret.name != '')",
             "self.cache.storage.pvc.spec.accessModes.exists(m, m == 'ReadWriteMany' || m == 'ReadOnlyMany')",
             "'storage' in self.spec.resources.requests",
             "must be a Kubernetes quantity",
@@ -589,6 +600,21 @@ mod tests {
             assert!(json.contains(rule), "missing CEL rule: {rule}");
         }
         assert!(json.contains("x-kubernetes-validations"));
+    }
+
+    #[test]
+    fn image_pull_secret_names_are_validated() {
+        let crd = serde_json::to_value(generate_crd()).expect("CRD serializes");
+        let image_pull_secrets = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["imagePullSecrets"];
+        let validations = image_pull_secrets["x-kubernetes-validations"]
+            .as_array()
+            .expect("imagePullSecrets validations");
+
+        assert!(validations.iter().any(|validation| {
+            validation["rule"] == "self.all(secret, secret.name != '')"
+                && validation["message"] == "image pull secret name must not be empty"
+        }));
     }
 
     #[test]

@@ -563,6 +563,25 @@ kubectl create secret generic gcs-service-account-key \
 
 Mount the secret into the server or client pod and set `GOOGLE_APPLICATION_CREDENTIALS` to the mounted file path. When using Workload Identity, no key secret is needed. For cache layout, manifest behavior, and failure modes, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
 
+### Private Image Registries
+
+When the server image lives in a private or mirrored registry, set `spec.imagePullSecrets` on the `ModelExpressServer`. The operator applies them to the pod spec, so they hold whether the pods run as the generated `<cr-name>-server` ServiceAccount or one supplied through `spec.serviceAccountName`.
+
+```yaml
+apiVersion: modelexpress.opendatahub.io/v1alpha1
+kind: ModelExpressServer
+metadata:
+  name: mx
+spec:
+  metadataBackend:
+    kubernetes: {}
+  image: registry.example.com/modelexpress-server:0.7.0
+  imagePullSecrets:
+    - name: registry-creds
+```
+
+Each entry names a `kubernetes.io/dockerconfigjson` Secret in the same namespace as the CR. This is required on clusters with no node-level pull secret, where nothing else supplies registry credentials to the pods the operator creates.
+
 ### Helm Chart
 
 The `helm/` directory provides a full Helm chart with configurable replicas, PVC, ingress, and resource limits.
