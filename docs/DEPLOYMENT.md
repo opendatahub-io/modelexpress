@@ -334,11 +334,11 @@ FIPS.
 
 | Env Var | Flag | Description |
 |---------|------|-------------|
-| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
-| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
-| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+| `MX_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MX_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MX_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
+| `MX_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
+| `MX_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
 
 Certificate and key must be set together. Version and cipher settings without a
 certificate fail config validation. A cipher list in which the backend knows none of the
@@ -384,7 +384,7 @@ endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+| `MX_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
 
 On OpenShift a service-ca signed certificate verifies against the bundle injected into any
 ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the

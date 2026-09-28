@@ -657,9 +657,9 @@ async fn operand_converged(
     eventually(&what, CONVERGE, || async move {
         let env = operand_env(client, backend).await?;
         for (name, want) in [
-            ("MODEL_EXPRESS_TLS_MIN_VERSION", min_version),
-            ("MODEL_EXPRESS_TLS_CIPHER_SUITES", ciphers),
-            ("MODEL_EXPRESS_TLS_GROUPS", groups),
+            ("MX_TLS_MIN_VERSION", min_version),
+            ("MX_TLS_CIPHER_SUITES", ciphers),
+            ("MX_TLS_GROUPS", groups),
         ] {
             let got = env.get(name).map(String::as_str);
             if got != Some(want) {
