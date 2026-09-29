@@ -1,0 +1,5 @@
+After PR #33 merges:
+
+- Add the default `namespace: opendatahub` to the generated ODH and xKS overlays.
+- Keep the KServe module override to `redhat-ods-applications`.
+- Regenerate the manifests and verify direct Kustomize output.

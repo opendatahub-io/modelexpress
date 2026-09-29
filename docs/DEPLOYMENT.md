@@ -723,6 +723,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
+| `MX_MODEL_NAME_OVERRIDE` | (unset) | Override vLLM's MX model identity without changing its model-loading path. Set before worker startup and use the same name for RL trainers and WeightVersions. Unset or empty preserves vLLM's configured model path/ID, including rewritten S3 cache paths. See [S3 Delta Weight Refit](S3_DELTA_WEIGHT_REFIT.md). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
@@ -1238,6 +1239,35 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
+
+#### Sharing One Server Across Namespaces
+
+Workers do not have to run in the server's namespace. One server can back workers in several workload namespaces, and every worker that talks to it joins the same P2P source pool — a namespace added later boots over RDMA from the workers already registered with that server instead of reading the weights from storage. Running a separate server per namespace splits the pool instead: each namespace then loads from storage on its first start and shares sources only within itself.
+
+Only the worker's server address changes. A worker outside the server's namespace has to qualify the Service name with the server's namespace, because the Pod's DNS search path resolves a bare name only within its own namespace:
+
+```yaml
+# Worker pods, in any namespace.
+# <server-service>   the server's Service name — "modelexpress-server" in the
+#                    example manifests, the Helm release's fullname when installed
+#                    from the chart.
+# <server-namespace> the namespace that Service lives in, not the worker's.
+env:
+  - name: MX_SERVER_ADDRESS
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+  - name: MODEL_EXPRESS_URL   # deprecated alias; keep identical during the transition
+    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
+```
+
+For a server deployed as `modelexpress-server` in a namespace named `modelexpress`, that is `modelexpress-server.modelexpress.svc.cluster.local:8001`. Workers that do run in the server's namespace can keep the short `modelexpress-server:8001` used by the example manifests.
+
+`MX_METADATA_NAMESPACE` is a server setting, not a worker one: it selects the namespace the server writes `ModelMetadata` and `ModelCacheEntry` CRs into, and the client does not read it. The metadata RBAC in [Distributed backend selection](#distributed-backend-selection) is likewise needed only by the server — workers publish and list sources over gRPC and never call the Kubernetes API, and the weight transfer is Pod-to-Pod RDMA. The source pool is scoped by the server a worker connects to and by `SourceIdentity`, not by the worker's own namespace.
+
+Three consequences:
+
+- **Ownership falls back to the reaper.** Kubernetes does not let a Pod own a namespaced object in another namespace, so `ModelMetadata` CRs published by workers outside the server's `MX_METADATA_NAMESPACE` carry no `ownerReference` — the cross-namespace identity behavior described under [Distributed backend selection](#distributed-backend-selection). Rather than disappearing with the Pod, those records go STALE after `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s) and are garbage-collected after `MX_GC_TIMEOUT_SECS` (default 3600s); see [Source Lifecycle](metadata.md#source-lifecycle). Setting `POD_NAME` / `POD_UID` / `POD_NAMESPACE` on such workers is harmless — ignored for ownership, and used if the worker later moves into the server's namespace.
+- **The auth allowlist is per ServiceAccount.** `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` is an exact-match list of `<namespace>:<serviceaccount>`, so under `enforce` a shared server needs one entry per allowed ServiceAccount in each workload namespace — two entries for `vllm:worker` and `vllm:router`, not one for `vllm`. Every workload namespace adds its own entries. See [ServiceAccount Authentication](#serviceaccount-authentication).
+- **Model files stay per namespace.** PersistentVolumeClaims are namespaced, and the engine reads the model's config and tokenizer from the `--model` path even when every weight arrives over RDMA. That path must still resolve inside the worker's own namespace.
 
 #### K8s-Service-Routed Backend
 

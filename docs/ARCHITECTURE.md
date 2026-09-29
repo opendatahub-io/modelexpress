@@ -687,6 +687,11 @@ already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
 these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
 no numeric ordering and requires no version-directory naming convention; the
 exact `object_storage.uri` identifies the version's global index.
+Generators use the registered MX IDs and base relationships for replay. A delta
+index's `metadata.version` and `metadata.base_version` are optional descriptive
+fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
+MX lineage checks and payload validation remain enabled. The registering caller
+is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -1138,7 +1143,18 @@ work.
 trainer staging buffers, direct generator-peer transfer, and verification. The
 vLLM-specific
 `installer.py` captures trainer load-time geometry through layerwise reload and
-installs it through `process_weights_after_loading`. Generator peers instead
+installs it through `process_weights_after_loading`. For tensor and checkpoint
+reloads, vLLM owns quantization-aware refresh of MLA's `W_UV` and `W_UK_T`;
+ModelExpress preserves their graph-bound storage when post-load processing
+replaces these bare tensor attributes. The RL installer does not recompute MLA
+weights from `kv_b_proj.weight` or reject quantized MLA models. After reload,
+the installer checks that vLLM replaced each existing `W_UV` and `W_UK_T`
+before copying it back into its original graph-bound storage. An unchanged tensor
+identity raises `IncompleteRefit` rather than accepting a potentially stale update.
+Compatibility is checked through this post-load behavior, not a version-string
+gate, so nightly and source builds can be used. The check runs after weight
+loading; a failed refit requires engine recovery before serving resumes.
+Generator peers instead
 transfer the complete post-load runtime tensor set directly into existing live
 storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout

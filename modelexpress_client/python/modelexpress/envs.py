@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     MODEL_EXPRESS_NO_SHARED_STORAGE: bool
     MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
-    MODEL_NAME: Optional[str]
+    MX_MODEL_NAME_OVERRIDE: Optional[str]
     # TLS (client)
     MX_TLS_CA_FILE: Optional[str]
     # Auth (client)
@@ -251,7 +251,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
     ),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
-    "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    "MX_MODEL_NAME_OVERRIDE": lambda: os.environ.get("MX_MODEL_NAME_OVERRIDE"),
     # ── TLS (client) ───────────────────────────────────────────────────────
     # PEM CA bundle for an https:// server address; unset means system roots.
     "MX_TLS_CA_FILE": lambda: os.environ.get("MX_TLS_CA_FILE"),
