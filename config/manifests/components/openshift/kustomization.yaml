@@ -15,4 +15,3 @@ patches:
 resources:
 - openshift-clusterrole.yaml
 - openshift-clusterrolebinding.yaml
-- service-ca-configmap.yaml

@@ -15,7 +15,6 @@ pub const OPENSHIFT_ROLE: &str = "modelexpress-operator-openshift";
 
 pub const METRICS_TLS_SECRET: &str = "modelexpress-operator-metrics-tls";
 pub const METRICS_TLS_MOUNT: &str = "/etc/modelexpress-operator/metrics-tls";
-pub const SERVICE_CA_CONFIGMAP: &str = "openshift-service-ca.crt";
 /// The namespace `config/manifests/default` installs into.
 pub const DEFAULT_NAMESPACE: &str = "modelexpress-operator-system";
 
@@ -118,7 +117,6 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
                 "resources": [
                     "openshift-clusterrole.yaml",
                     "openshift-clusterrolebinding.yaml",
-                    "service-ca-configmap.yaml",
                 ],
                 "patches": [
                     {"path": "deployment-patch.yaml", "target": {"kind": "Deployment", "name": NAME}},
@@ -170,18 +168,6 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
                     "port": telemetry::METRICS_TLS_PORT,
                     "targetPort": telemetry::METRICS_TLS_PORT_NAME,
                 }]},
-            }),
-        ),
-        (
-            "service-ca-configmap.yaml",
-            json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "name": SERVICE_CA_CONFIGMAP,
-                    "labels": labels(),
-                    "annotations": {"service.beta.openshift.io/inject-cabundle": "true"},
-                },
             }),
         ),
         (
@@ -313,6 +299,17 @@ mod tests {
             assert!(
                 value["metadata"].get("namespace").is_none(),
                 "{file} pins metadata.namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn component_ships_no_platform_owned_objects() {
+        for (file, value) in component() {
+            let name = value["metadata"]["name"].as_str().unwrap_or_default();
+            assert!(
+                !name.starts_with("openshift-") && !name.starts_with("kube-"),
+                "{file} ships {name}, which the platform owns"
             );
         }
     }
