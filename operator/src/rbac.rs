@@ -245,6 +245,7 @@ mod tests {
         ModelExpressServerSpec {
             image: Some("img".into()),
             image_pull_secrets: None,
+            probes: None,
             replicas: 1,
             metadata_backend: backend,
             port: 8001,

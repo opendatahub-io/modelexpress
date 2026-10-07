@@ -9,8 +9,8 @@
 use modelexpress_operator::crd::{
     AuthMode, CacheConfig, CacheStorage, CredentialsConfig, EmptyDirStorage, ExistingClaimStorage,
     LogConfig, LogFormat, LogLevel, ManagedPvcStorage, MetadataBackend, MetadataOverrides,
-    ModelExpressServerSpec, NetworkPolicyConfig, ReaperConfig, RedisBackend, SecretKeyRef,
-    SecurityConfig, ServiceAccountRef, TlsConfig,
+    ModelExpressServerSpec, NetworkPolicyConfig, ProbeConfig, ProbeTimingOverrides, ReaperConfig,
+    RedisBackend, SecretKeyRef, SecurityConfig, ServiceAccountRef, TlsConfig,
 };
 use modelexpress_operator::deployment::render;
 use modelexpress_operator::tls::TlsSettings;
@@ -142,6 +142,18 @@ fn full_spec() -> ModelExpressServerSpec {
         image_pull_secrets: Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
             name: "registry-creds".into(),
         }]),
+        probes: Some(ProbeConfig {
+            startup: Some(ProbeTimingOverrides {
+                initial_delay_seconds: Some(10),
+                period_seconds: Some(15),
+                failure_threshold: Some(60),
+            }),
+            readiness: Some(ProbeTimingOverrides {
+                period_seconds: Some(20),
+                ..ProbeTimingOverrides::default()
+            }),
+            liveness: None,
+        }),
     }
 }
 

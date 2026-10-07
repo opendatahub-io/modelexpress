@@ -380,7 +380,7 @@ tls:
     - secp256r1
 ```
 
-Kubernetes gRPC probes do not speak TLS, so switch the liveness and readiness probes to
+Kubernetes gRPC probes do not speak TLS, so switch the startup, liveness and readiness probes to
 `tcpSocket` when enabling it.
 
 ### Client configuration
@@ -588,6 +588,31 @@ spec:
 ```
 
 Each entry names a `kubernetes.io/dockerconfigjson` Secret in the same namespace as the CR. This is required on clusters with no node-level pull secret, where nothing else supplies registry credentials to the pods the operator creates.
+
+### Container Probe Timings
+
+The operator always renders a startup probe, so a server that is slow to come up is given time to start instead of being restart-looped by liveness: while the startup probe is failing, kubelet suspends both liveness and readiness. Defaults give a cold start about five minutes (5s initial delay, 10s period, 30 failures) before liveness applies. Steady-state timings are unchanged from earlier releases: readiness 5s/10s, liveness 15s/30s, `failureThreshold` left at the Kubernetes default of 3.
+
+Per-probe timings can be tuned through `spec.probes`; each field set replaces the default for that probe only, and unset fields keep the default. With TLS enabled, all probes switch from `grpc` to `tcpSocket`.
+
+```yaml
+apiVersion: modelexpress.opendatahub.io/v1alpha1
+kind: ModelExpressServer
+metadata:
+  name: mx
+spec:
+  metadataBackend:
+    kubernetes: {}
+  probes:
+    startup:
+      failureThreshold: 60 # ~10 minutes of startup budget
+    readiness:
+      periodSeconds: 20
+    liveness:
+      initialDelaySeconds: 30
+      periodSeconds: 60
+      failureThreshold: 5
+```
 
 ### Helm Chart
 

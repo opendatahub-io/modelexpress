@@ -969,6 +969,92 @@ spec:
                   x-kubernetes-validations:
                     - message: port must be 1-65535
                       rule: self > 0 && self < 65536
+                probes:
+                  description: Container probe timings. A startup probe is always rendered so a slow cold start suspends liveness instead of restart-looping the pod; overrides here replace only the timings that are set.
+                  nullable: true
+                  properties:
+                    liveness:
+                      description: "Liveness probe. Defaults: 15s initial delay, 30s period."
+                      nullable: true
+                      properties:
+                        failureThreshold:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: failureThreshold must be positive
+                              rule: self > 0
+                        initialDelaySeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: initialDelaySeconds must not be negative
+                              rule: self >= 0
+                        periodSeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: periodSeconds must be positive
+                              rule: self > 0
+                      type: object
+                      x-kubernetes-validations: []
+                    readiness:
+                      description: "Readiness probe. Defaults: 5s initial delay, 10s period."
+                      nullable: true
+                      properties:
+                        failureThreshold:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: failureThreshold must be positive
+                              rule: self > 0
+                        initialDelaySeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: initialDelaySeconds must not be negative
+                              rule: self >= 0
+                        periodSeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: periodSeconds must be positive
+                              rule: self > 0
+                      type: object
+                      x-kubernetes-validations: []
+                    startup:
+                      description: "Startup probe. Defaults: 5s initial delay, 10s period, 30 failures (~5 minutes of startup budget)."
+                      nullable: true
+                      properties:
+                        failureThreshold:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: failureThreshold must be positive
+                              rule: self > 0
+                        initialDelaySeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: initialDelaySeconds must not be negative
+                              rule: self >= 0
+                        periodSeconds:
+                          format: int32
+                          nullable: true
+                          type: integer
+                          x-kubernetes-validations:
+                            - message: periodSeconds must be positive
+                              rule: self > 0
+                      type: object
+                      x-kubernetes-validations: []
+                  type: object
                 reaper:
                   description: "Stale-worker reaper timings, MX_REAPER_* / MX_HEARTBEAT_* / MX_GC_*."
                   nullable: true
