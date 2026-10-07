@@ -96,6 +96,12 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaper: Option<ReaperConfig>,
 
+    /// Container probe timings. A startup probe is always rendered so a slow
+    /// cold start suspends liveness instead of restart-looping the pod;
+    /// overrides here replace only the timings that are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<ProbeConfig>,
+
     /// Download credentials, injected as secretKeyRef env vars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<CredentialsConfig>,
@@ -443,6 +449,40 @@ pub struct ReaperConfig {
     pub gc_timeout_secs: Option<u32>,
 }
 
+/// Timing overrides for one container probe. Unset fields keep that probe's
+/// operator default.
+#[derive(CELSchema, Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeTimingOverrides {
+    #[cel_validate(rule = Rule::new("self >= 0").message("initialDelaySeconds must not be negative"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_delay_seconds: Option<i32>,
+    #[cel_validate(rule = Rule::new("self > 0").message("periodSeconds must be positive"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_seconds: Option<i32>,
+    #[cel_validate(rule = Rule::new("self > 0").message("failureThreshold must be positive"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<i32>,
+}
+
+/// Container probe timings for the server Deployment. While the startup
+/// probe is failing, kubelet suspends liveness and readiness, so a slow
+/// cold start is waited out instead of restart-looped.
+#[derive(JsonSchema, Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeConfig {
+    /// Startup probe. Defaults: 5s initial delay, 10s period, 30 failures
+    /// (~5 minutes of startup budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<ProbeTimingOverrides>,
+    /// Readiness probe. Defaults: 5s initial delay, 10s period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ProbeTimingOverrides>,
+    /// Liveness probe. Defaults: 15s initial delay, 30s period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<ProbeTimingOverrides>,
+}
+
 #[derive(JsonSchema, Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsConfig {
@@ -615,6 +655,23 @@ mod tests {
             validation["rule"] == "self.all(secret, secret.name != '')"
                 && validation["message"] == "image pull secret name must not be empty"
         }));
+    }
+
+    #[test]
+    fn probe_timing_fields_are_validated() {
+        let crd = serde_json::to_value(generate_crd()).expect("CRD serializes");
+        let spec_props = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"];
+
+        for probe in ["startup", "readiness", "liveness"] {
+            let timing_props = &spec_props["probes"]["properties"][probe]["properties"];
+            let delay = &timing_props["initialDelaySeconds"]["x-kubernetes-validations"];
+            assert!(delay[0]["rule"] == "self >= 0");
+            let period = &timing_props["periodSeconds"]["x-kubernetes-validations"];
+            assert!(period[0]["rule"] == "self > 0");
+            let threshold = &timing_props["failureThreshold"]["x-kubernetes-validations"];
+            assert!(threshold[0]["rule"] == "self > 0");
+        }
     }
 
     #[test]

@@ -86,7 +86,7 @@ spec:
             grpc:
               port: 8001
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 20
           resources:
             requests:
               memory: 2Gi
@@ -96,6 +96,12 @@ spec:
               drop:
                 - ALL
             runAsNonRoot: true
+          startupProbe:
+            failureThreshold: 60
+            grpc:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 15
           volumeMounts:
             - mountPath: /cache
               name: model-cache

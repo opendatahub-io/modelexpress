@@ -72,6 +72,12 @@ spec:
               drop:
                 - ALL
             runAsNonRoot: true
+          startupProbe:
+            failureThreshold: 30
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            tcpSocket:
+              port: 8001
           volumeMounts:
             - mountPath: /var/cache/modelexpress
               name: model-cache
