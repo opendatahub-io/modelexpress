@@ -306,7 +306,7 @@ fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
     }
 }
 
-pub(crate) struct RenderedProbes {
+struct RenderedProbes {
     pub startup: Probe,
     pub readiness: Probe,
     pub liveness: Probe,
