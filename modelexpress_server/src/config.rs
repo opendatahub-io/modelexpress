@@ -167,15 +167,53 @@ pub struct TlsConfig {
     pub cert_file: Option<PathBuf>,
     /// PEM private key for `cert_file`.
     pub key_file: Option<PathBuf>,
-    /// Lowest protocol version accepted. OpenSSL's default when unset.
+    /// Lowest protocol version accepted. TLS1.2 when unset, and a lower value
+    /// is raised to it.
     pub min_version: Option<TlsVersion>,
-    /// OpenSSL cipher names to offer, TLS 1.2 and 1.3 names mixed as in an
-    /// OpenShift `tlsSecurityProfile`. OpenSSL's default when empty.
+    /// OpenSSL cipher names to offer, TLS 1.2 and 1.3 names mixed as in a
+    /// cluster TLS profile. OpenSSL's default when empty.
     pub cipher_suites: Vec<String>,
     /// Key exchange groups to offer, in preference order, as OpenSSL names
-    /// (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL
-    /// does not know are dropped with a warning. OpenSSL's default when empty.
+    /// (`X25519MLKEM768`, `X25519`, `secp256r1`). Unknown names are dropped,
+    /// and a list left with none is an error. The backend's default when empty.
     pub groups: Vec<String>,
+}
+
+/// What loading or validating a server configuration can fail with. The
+/// `config` crate's own error is a variant rather than the return type, so a
+/// caller can match on what went wrong instead of reading a message.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerConfigError {
+    #[error(transparent)]
+    File(#[from] ConfigError),
+    #[error(transparent)]
+    Tls(#[from] TlsConfigError),
+    #[error(transparent)]
+    TlsSetup(#[from] crate::tls::TlsError),
+    #[error("cache directory parent does not exist: {}", .0.display())]
+    MissingCacheParent(PathBuf),
+    #[error("{field} {value} is not a valid address: {source}")]
+    Address {
+        field: &'static str,
+        value: String,
+        source: std::net::AddrParseError,
+    },
+    #[error("{0}")]
+    Security(String),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TlsConfigError {
+    #[error("tls.cert_file is set without tls.key_file")]
+    CertWithoutKey,
+    #[error("tls.key_file is set without tls.cert_file")]
+    KeyWithoutCert,
+    #[error(
+        "tls.min_version, tls.cipher_suites and tls.groups need tls.cert_file and tls.key_file"
+    )]
+    SettingsWithoutCertificate,
+    #[error("{field} does not exist: {}", path.display())]
+    MissingFile { field: &'static str, path: PathBuf },
 }
 
 impl TlsConfig {
@@ -185,31 +223,31 @@ impl TlsConfig {
     }
 
     /// Certificate and key paths when TLS is on.
-    pub fn key_pair(&self) -> Result<Option<(&PathBuf, &PathBuf)>, String> {
+    pub fn key_pair(&self) -> Result<Option<(&PathBuf, &PathBuf)>, TlsConfigError> {
         match (&self.cert_file, &self.key_file) {
             (Some(cert), Some(key)) => Ok(Some((cert, key))),
             (None, None) => Ok(None),
-            (Some(_), None) => Err("tls.cert_file is set without tls.key_file".to_string()),
-            (None, Some(_)) => Err("tls.key_file is set without tls.cert_file".to_string()),
+            (Some(_), None) => Err(TlsConfigError::CertWithoutKey),
+            (None, Some(_)) => Err(TlsConfigError::KeyWithoutCert),
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), TlsConfigError> {
         let Some((cert, key)) = self.key_pair()? else {
             if self.min_version.is_some()
                 || !self.cipher_suites.is_empty()
                 || !self.groups.is_empty()
             {
-                return Err(
-                    "tls.min_version, tls.cipher_suites and tls.groups need tls.cert_file and tls.key_file"
-                        .to_string(),
-                );
+                return Err(TlsConfigError::SettingsWithoutCertificate);
             }
             return Ok(());
         };
-        for (name, path) in [("tls.cert_file", cert), ("tls.key_file", key)] {
+        for (field, path) in [("tls.cert_file", cert), ("tls.key_file", key)] {
             if !path.is_file() {
-                return Err(format!("{name} does not exist: {}", path.display()));
+                return Err(TlsConfigError::MissingFile {
+                    field,
+                    path: path.clone(),
+                });
             }
         }
         Ok(())
@@ -219,26 +257,26 @@ impl TlsConfig {
 #[derive(clap::Args, Debug, Default)]
 pub struct TlsArgs {
     /// PEM certificate chain for the gRPC listener. Enables TLS.
-    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MX_TLS_CERT_FILE)]
+    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CERT_FILE)]
     pub cert_file: Option<PathBuf>,
 
     /// PEM private key for --tls-cert-file.
-    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MX_TLS_KEY_FILE)]
+    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_KEY_FILE)]
     pub key_file: Option<PathBuf>,
 
-    /// Minimum TLS version (TLS1.2, TLS1.3, or the OpenShift VersionTLS12 spelling).
-    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MX_TLS_MIN_VERSION)]
+    /// Minimum TLS version (TLS1.2, TLS1.3, or the VersionTLS12 spelling).
+    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_MIN_VERSION)]
     pub min_version: Option<TlsVersion>,
 
     /// Comma-separated OpenSSL cipher names, TLS 1.2 and 1.3 names mixed.
     #[arg(
         long = "tls-cipher-suites",
-        env = modelexpress_common::envs::MX_TLS_CIPHER_SUITES
+        env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CIPHER_SUITES
     )]
     pub cipher_suites: Option<CommaList<String>>,
 
     /// Comma-separated key exchange groups in preference order (OpenSSL names).
-    #[arg(long = "tls-groups", env = modelexpress_common::envs::MX_TLS_GROUPS)]
+    #[arg(long = "tls-groups", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_GROUPS)]
     pub groups: Option<CommaList<String>>,
 }
 
@@ -321,21 +359,18 @@ pub struct ServerSettings {
     pub port: NonZeroU16,
     /// Prometheus `/metrics` port. `0` disables the listener.
     ///
-    /// Two properties here are load-bearing, and both exist because
-    /// `load_layered_config` swallows any deserialization error and silently
-    /// returns `T::default()` — so anything this field rejects is not "the
-    /// field is ignored" but "the entire config file is ignored", with no log
-    /// line at any level. The gRPC port, cache directory, eviction policy and
-    /// **auth settings** would all revert to defaults because of a typo here.
+    /// Two properties here are load-bearing. A value a field rejects fails the
+    /// whole file, so anything this field cannot deserialize stops the server
+    /// from starting rather than being ignored.
     ///
     /// 1. `#[serde(default)]` covers the missing-key case. `ServerSettings` has
     ///    no struct-level default, so without it every existing
     ///    `model-express.yaml` — none of which mention this field — would fail
     ///    to parse.
     /// 2. The type is `u16`, not `NonZeroU16`. `0` is the documented disable
-    ///    value, and `NonZeroU16` rejects it during deserialization, which is
-    ///    exactly the silent-total-fallback case above. Normalization to
-    ///    "disabled" happens in [`ServerConfig::metrics_socket_addr`].
+    ///    value, and `NonZeroU16` rejects it during deserialization, which
+    ///    would fail the file. Normalization to "disabled" happens in
+    ///    [`ServerConfig::metrics_socket_addr`].
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
 }
@@ -398,19 +433,22 @@ impl ServerConfig {
     /// 2. Environment variables
     /// 3. Configuration file
     /// 4. Default values (lowest priority)
-    pub fn load(args: ServerArgs) -> Result<Self, ConfigError> {
+    pub fn load(args: ServerArgs) -> Result<Self, ServerConfigError> {
         Self::load_internal(args, false)
     }
 
     /// Load and validate configuration file strictly without fallbacks.
     /// This method should be used when validating configuration files.
-    /// It will return an error if the file has invalid syntax or values.
-    pub fn load_and_validate_strict(args: ServerArgs) -> Result<Self, ConfigError> {
-        Self::load_internal(args, true)
+    /// It will return an error if the file has invalid syntax or values, or if
+    /// the TLS backend cannot load the certificate, key, ciphers or groups.
+    pub fn load_and_validate_strict(args: ServerArgs) -> Result<Self, ServerConfigError> {
+        let config = Self::load_internal(args, true)?;
+        crate::tls::build_acceptor(&config.tls)?;
+        Ok(config)
     }
 
     /// Internal method to load configuration with optional strict mode
-    fn load_internal(args: ServerArgs, strict_mode: bool) -> Result<Self, ConfigError> {
+    fn load_internal(args: ServerArgs, strict_mode: bool) -> Result<Self, ServerConfigError> {
         let mut config = if strict_mode {
             // Use strict loading - fail on any configuration errors
             if let Some(ref config_file) = args.config {
@@ -420,8 +458,13 @@ impl ServerConfig {
                 // No config file specified, use defaults
                 Self::default()
             }
+        } else if let Some(ref config_file) = args.config {
+            // An explicit file that does not parse is fatal: falling back to
+            // defaults here would drop a tls section and serve plaintext.
+            modelexpress_common::config::validate_config_file(config_file)?
         } else {
-            // Use layered config loading with fallbacks to defaults
+            // No explicit file: a default config file if one is found, else
+            // the defaults. A default file that does not load is fatal too.
             load_layered_config(
                 args.config.clone(),
                 modelexpress_common::envs::MODEL_EXPRESS_PREFIX,
@@ -475,7 +518,6 @@ impl ServerConfig {
             config.security.cache_ttl_secs = cache_ttl_secs;
         }
 
-        // Apply TLS overrides
         if let Some(cert_file) = args.tls.cert_file {
             config.tls.cert_file = Some(cert_file);
         }
@@ -499,32 +541,32 @@ impl ServerConfig {
     }
 
     /// Validate the configuration
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ServerConfigError> {
         // Validate cache directory
         if let Some(parent) = self.cache.directory.parent()
             && !parent.exists()
         {
-            return Err(ConfigError::Message(format!(
-                "Cache directory parent does not exist: {}",
-                parent.display()
-            )));
+            return Err(ServerConfigError::MissingCacheParent(parent.to_path_buf()));
         }
 
         let mode = self.security.resolve_mode();
         self.security
             .validate_resolved(mode)
-            .map_err(ConfigError::Message)?;
+            .map_err(ServerConfigError::Security)?;
 
-        self.tls.validate().map_err(ConfigError::Message)?;
+        self.tls.validate()?;
 
         Ok(())
     }
 
     /// Get the server socket address
-    pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
+    pub fn socket_addr(&self) -> Result<SocketAddr, ServerConfigError> {
         let addr = format!("{}:{}", self.server.host, self.server.port);
-        addr.parse()
-            .map_err(|e| ConfigError::Message(format!("Invalid server address {addr}: {e}")))
+        addr.parse().map_err(|source| ServerConfigError::Address {
+            field: "server address",
+            value: addr,
+            source,
+        })
     }
 
     /// Socket address for the Prometheus `/metrics` listener, or `None` when
@@ -532,7 +574,7 @@ impl ServerConfig {
     ///
     /// # Errors
     /// Returns an error when host and metrics port do not form a valid address.
-    pub fn metrics_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+    pub fn metrics_socket_addr(&self) -> Result<Option<SocketAddr>, ServerConfigError> {
         // `0` is the disable sentinel. Normalizing here rather than in the field
         // type keeps `0` deserializable from a config file; see
         // `ServerSettings::metrics_port`.
@@ -542,7 +584,11 @@ impl ServerConfig {
         let addr = format!("{}:{}", self.server.host, metrics_port);
         addr.parse()
             .map(Some)
-            .map_err(|e| ConfigError::Message(format!("Invalid metrics address {addr}: {e}")))
+            .map_err(|source| ServerConfigError::Address {
+                field: "metrics address",
+                value: addr,
+                source,
+            })
     }
 
     /// Get the logging level as a tracing Level
@@ -598,15 +644,15 @@ impl ServerConfig {
                 info!("  Key: {}", key.display());
                 match self.tls.min_version {
                     Some(version) => info!("  Min version: {version}"),
-                    None => info!("  Min version: OpenSSL default"),
+                    None => info!("  Min version: TLS1.2 (default)"),
                 }
                 if self.tls.cipher_suites.is_empty() {
-                    info!("  Cipher suites: OpenSSL default");
+                    info!("  Cipher suites: TLS backend default");
                 } else {
                     info!("  Cipher suites: {}", self.tls.cipher_suites.join(":"));
                 }
                 if self.tls.groups.is_empty() {
-                    info!("  Groups: OpenSSL default");
+                    info!("  Groups: TLS backend default");
                 } else {
                     info!("  Groups: {}", self.tls.groups.join(":"));
                 }
@@ -1072,16 +1118,126 @@ mod tests {
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
 
+    fn args_with_tls(tls: TlsArgs) -> ServerArgs {
+        ServerArgs {
+            config: None,
+            port: None,
+            host: None,
+            metrics_port: None,
+            log_level: None,
+            log_format: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
+            tls,
+            validate_config: true,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn strict_validation_loads_the_certificate() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let cert_file = temp_dir.path().join("tls.crt");
+        let key_file = temp_dir.path().join("tls.key");
+        fs::write(&cert_file, "not a certificate").expect("write cert");
+        fs::write(&key_file, "not a key").expect("write key");
+
+        let config = ServerConfig::load(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file.clone()),
+            key_file: Some(key_file.clone()),
+            ..TlsArgs::default()
+        }));
+        assert!(config.is_ok(), "the files exist, so plain loading passes");
+
+        let strict = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file),
+            key_file: Some(key_file),
+            ..TlsArgs::default()
+        }));
+        assert!(
+            matches!(strict, Err(ServerConfigError::TlsSetup(_))),
+            "{strict:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn strict_validation_rejects_a_cipher_list_the_backend_cannot_honor() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let issuer = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let cert_file = temp_dir.path().join("tls.crt");
+        let key_file = temp_dir.path().join("tls.key");
+        fs::write(&cert_file, issuer.cert.pem()).expect("write cert");
+        fs::write(&key_file, issuer.signing_key.serialize_pem()).expect("write key");
+
+        let valid = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file.clone()),
+            key_file: Some(key_file.clone()),
+            ..TlsArgs::default()
+        }));
+        assert!(valid.is_ok(), "{valid:?}");
+
+        let strict = ServerConfig::load_and_validate_strict(args_with_tls(TlsArgs {
+            cert_file: Some(cert_file),
+            key_file: Some(key_file),
+            cipher_suites: Some("NOT-A-CIPHER".parse().expect("cipher list")),
+            ..TlsArgs::default()
+        }));
+        assert!(
+            matches!(strict, Err(ServerConfigError::TlsSetup(_))),
+            "{strict:?}"
+        );
+    }
+
+    /// A file that does not parse must not fall back to defaults: the defaults
+    /// have no certificate, so the server would come up serving plaintext.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn unparsable_config_file_fails_instead_of_dropping_tls() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("bad_tls.yaml");
+        fs::write(
+            &config_file,
+            r#"
+            server:
+              host: "127.0.0.1"
+              port: 18012
+            tls:
+              cert_file: /etc/tls/tls.crt
+              key_file: /etc/tls/tls.key
+              min_version: TLS9.9
+        "#,
+        )
+        .expect("Failed to write config file");
+
+        let args = ServerArgs {
+            config: Some(config_file),
+            port: None,
+            host: None,
+            metrics_port: None,
+            log_level: None,
+            log_format: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
+            tls: TlsArgs::default(),
+            validate_config: false,
+        };
+        assert!(
+            ServerConfig::load(args).is_err(),
+            "a bad file must not silently disable TLS"
+        );
+    }
+
     /// A config file must survive both spellings of the metrics port.
     ///
-    /// `load_layered_config` swallows every deserialization error and returns
-    /// `T::default()` with no log line, so any value this field rejects costs the
-    /// operator the gRPC port, the cache directory, the eviction policy and the
-    /// auth settings -- silently. That is why `metrics_port` is a `u16` and not a
-    /// `NonZeroU16` (`0` has to deserialize, and is normalized afterwards), and
-    /// why it carries `#[serde(default)]` (no existing model-express.yaml mentions
-    /// it). Both cases assert the *rest* of the file survived, because that is how
-    /// the failure would present.
+    /// A value this field rejects fails the whole file. That is why
+    /// `metrics_port` is a `u16` and not a `NonZeroU16` (`0` has to deserialize,
+    /// and is normalized afterwards), and why it carries `#[serde(default)]` (no
+    /// existing model-express.yaml mentions it). Both cases assert the *rest* of
+    /// the file loaded too.
     #[test]
     #[allow(clippy::expect_used)]
     fn metrics_port_never_costs_the_rest_of_the_config_file() {

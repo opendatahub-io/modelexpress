@@ -14,7 +14,7 @@ set -euo pipefail
 
 # package:features pairs, matching how each image is built
 TARGETS=(
-    "modelexpress-server:openssl"
+    "modelexpress-server:openssl,s3"
     "modelexpress-operator:openssl"
     "modelexpress-operator-openshift:openssl"
 )

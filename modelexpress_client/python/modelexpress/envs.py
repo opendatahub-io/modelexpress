@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     MODEL_EXPRESS_LOG_LEVEL: str
     MX_MODEL_NAME_OVERRIDE: Optional[str]
     # TLS (client)
-    MX_TLS_CA_FILE: Optional[str]
+    MODEL_EXPRESS_TLS_CA_FILE: Optional[str]
     # Auth (client)
     MX_AUTH_TOKEN_PATH: Optional[str]
     MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
@@ -263,7 +263,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_NAME_OVERRIDE": lambda: os.environ.get("MX_MODEL_NAME_OVERRIDE"),
     # ── TLS (client) ───────────────────────────────────────────────────────
     # PEM CA bundle for an https:// server address; unset means system roots.
-    "MX_TLS_CA_FILE": lambda: os.environ.get("MX_TLS_CA_FILE"),
+    "MODEL_EXPRESS_TLS_CA_FILE": lambda: os.environ.get("MODEL_EXPRESS_TLS_CA_FILE"),
     # ── Auth (client) ──────────────────────────────────────────────────────
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
     "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),

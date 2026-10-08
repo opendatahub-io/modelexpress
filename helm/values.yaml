@@ -42,13 +42,16 @@ security:
   allowedServiceAccounts: []
   # cacheTtlSecs: 60
 
-# TLS termination on the gRPC listener. Off by default. Needs the OpenSSL image
-# build (the published images). The Secret holds tls.crt and tls.key; on OpenShift
-# set serviceCA to have service-ca issue it via the Service annotation.
+# TLS termination on the gRPC listener, off by default. The Secret holds
+# tls.crt and tls.key. To have an in-cluster issuer populate it, annotate the
+# Service through service.annotations rather than creating the Secret yourself.
 tls:
   enabled: false
   secretName: ""
-  serviceCA: false
+  # Key in secretName holding the CA that issued the certificate (ca.crt for
+  # cert-manager). When set, `helm test` verifies the server certificate against
+  # it for the name <fullname>.<namespace>.svc; otherwise it skips verification.
+  caKey: ""
   # minVersion: TLS1.2
   # cipherSuites: []
   # groups: []
@@ -83,6 +86,9 @@ securityContext:
 service:
   type: ClusterIP
   port: 8001
+  # Annotations on the Service, e.g. to have an in-cluster issuer populate
+  # tls.secretName with a serving certificate.
+  annotations: {}
 
 # Prometheus metrics.
 #

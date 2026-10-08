@@ -1,24 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! TLS settings shared by the server flags and the operator that renders them.
+//! Shared TLS settings.
 
 use serde::{Deserialize, Serialize};
 
-/// Minimum TLS protocol version a listener accepts.
-///
-/// Parses both the `TLS1.2` spelling used by kube-rbac-proxy style flags and
-/// the `VersionTLS12` spelling of `apiservers.config.openshift.io`, so a
-/// cluster TLS profile can be passed through verbatim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Minimum TLS protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TlsVersion {
-    #[serde(rename = "TLS1.0")]
     Tls10,
-    #[serde(rename = "TLS1.1")]
     Tls11,
-    #[serde(rename = "TLS1.2")]
     Tls12,
-    #[serde(rename = "TLS1.3")]
     Tls13,
 }
 
@@ -31,6 +23,19 @@ impl TlsVersion {
             Self::Tls12 => "TLS1.2",
             Self::Tls13 => "TLS1.3",
         }
+    }
+}
+
+impl Serialize for TlsVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for TlsVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -63,11 +68,11 @@ impl std::str::FromStr for TlsVersion {
     }
 }
 
-/// Split a cluster profile's cipher list into what OpenSSL configures through
+/// Split a mixed cipher list into what OpenSSL configures through
 /// `set_cipher_list` (TLS 1.2 and below) and `set_ciphersuites` (TLS 1.3).
-///
-/// OpenSSL keeps the two lists separate and rejects a TLS 1.3 name in the
-/// 1.2 list, while OpenShift profiles mix them in one array.
+/// IANA-spelled TLS 1.2 names (`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`) start
+/// with `TLS_` too, but contain `_WITH_`, which no TLS 1.3 suite name does;
+/// each backend resolves them with its own IANA name table.
 #[must_use]
 pub fn split_cipher_suites(names: &[String]) -> (Vec<String>, Vec<String>) {
     names
@@ -75,7 +80,7 @@ pub fn split_cipher_suites(names: &[String]) -> (Vec<String>, Vec<String>) {
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .partition(|name| !name.starts_with("TLS_"))
+        .partition(|name| !name.starts_with("TLS_") || name.contains("_WITH_"))
 }
 
 #[cfg(test)]
@@ -83,7 +88,7 @@ mod tests {
     use crate::tls::{TlsVersion, split_cipher_suites};
 
     #[test]
-    fn parses_flag_and_openshift_spellings() {
+    fn parses_flag_and_version_prefixed_spellings() {
         for (input, expected) in [
             ("TLS1.2", TlsVersion::Tls12),
             ("tls1.3", TlsVersion::Tls13),
@@ -135,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_openshift_intermediate_profile() {
+    fn splits_intermediate_profile_cipher_list() {
         let profile: Vec<String> = [
             "TLS_AES_128_GCM_SHA256",
             "TLS_AES_256_GCM_SHA384",
@@ -165,6 +170,27 @@ mod tests {
                 "TLS_CHACHA20_POLY1305_SHA256",
             ]
         );
+    }
+
+    #[test]
+    fn iana_tls12_names_stay_out_of_the_tls13_list() {
+        let names: Vec<String> = [
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_AES_128_GCM_SHA256",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let (tls12, tls13) = split_cipher_suites(&names);
+        assert_eq!(
+            tls12,
+            [
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "ECDHE-RSA-AES256-GCM-SHA384",
+            ]
+        );
+        assert_eq!(tls13, ["TLS_AES_128_GCM_SHA256"]);
     }
 
     #[test]

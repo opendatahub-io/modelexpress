@@ -7,7 +7,7 @@
 # Replaces the upstream Dockerfile's Ubuntu base with UBI9 for
 # Red Hat / Konflux builds.
 #
-# Built --no-default-features --features openssl for FIPS. That drops the gcs
+# Built --no-default-features --features openssl,s3 for FIPS. That drops the gcs
 # feature along with rustls, so this image cannot pull models from GCS:
 # google-cloud-auth hardcodes rustls. HuggingFace and NGC are unaffected.
 
@@ -40,7 +40,7 @@ RUN set -eux; \
 WORKDIR /src
 COPY . .
 RUN cargo build --release --package modelexpress-server --bin modelexpress-server \
-        --no-default-features --features openssl \
+        --no-default-features --features openssl,s3 \
     && cp target/release/modelexpress-server /modelexpress-server
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221

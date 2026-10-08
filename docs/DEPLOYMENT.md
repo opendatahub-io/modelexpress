@@ -251,12 +251,12 @@ calls the Kubernetes `TokenReview` API in-process.
 - **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
   entry.
 
-> **Warning: only enable auth over an encrypted transport.** The server and clients
-> speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
+> **Warning: only enable auth over an encrypted transport.** gRPC is plaintext unless
+> the server is given a certificate (see [TLS](#tls)). Without encryption the bearer
 > token crosses the wire in cleartext and anyone who can sniff the traffic can replay
-> it until it expires. Run enforce mode only where the transport is encrypted, e.g. a
-> service mesh providing mTLS (Istio/Linkerd sidecars) or a TLS-terminating proxy in
-> front of the server.
+> it until it expires. Run enforce mode only where the transport is encrypted: the
+> server's own TLS listener, a service mesh providing mTLS (Istio/Linkerd sidecars), or
+> a TLS-terminating proxy in front of the server.
 
 Other properties to be aware of:
 
@@ -341,26 +341,33 @@ FIPS.
 
 | Env Var | Flag | Description |
 |---------|------|-------------|
-| `MX_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
-| `MX_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
-| `MX_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
-| `MX_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
-| `MX_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the `VersionTLS12` spelling used by cluster TLS policy APIs. `TLS1.2` when unset, and a lower value is raised to it. |
+| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in a cluster TLS profile. The IANA spelling of a TLS 1.2 suite (`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, used by Go and Kubernetes) is accepted too. The backend's defaults when unset. |
+| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. A list with no supported name at all fails startup instead of falling back to the defaults. The backend's defaults when unset. |
 
 Certificate and key must be set together. Version and cipher settings without a
-certificate fail config validation. A cipher list in which the backend knows none of the
-TLS 1.2 names, or none of the TLS 1.3 names, fails startup.
+certificate fail config validation. Cipher names the backend does not know are dropped
+with a warning, and a cipher list in which it knows none of the TLS 1.2 names, or none of
+the TLS 1.3 names, fails startup. `--validate-config` loads the certificate and key and
+checks the cipher and group lists against the backend, so it reports the same errors
+startup would.
+
+Both builds floor the minimum at TLS 1.2 and require an h2 ALPN offer, which every gRPC
+client sends.
 
 Settings use OpenSSL spelling on both builds. rustls implements a subset of it: TLS 1.2 and
-1.3 only (a lower minimum is raised to `TLS1.2`), the AEAD ciphers (ECDHE with AES-GCM or
-ChaCha20-Poly1305, and the three TLS 1.3 suites), and the groups `X25519`, `secp256r1` and
-`secp384r1`. Anything else in a profile, such as the CBC ciphers of the Old profile or
+1.3 only, the AEAD ciphers (ECDHE with AES-GCM or ChaCha20-Poly1305, and the three TLS 1.3
+suites), and the groups `X25519`, `secp256r1` and `secp384r1`. Anything else in a profile, such as the CBC ciphers of the Old profile or
 `X25519MLKEM768`, is dropped with a warning.
 
 On OpenShift the cluster TLS profile from `apiservers.config.openshift.io/cluster` maps
 straight onto the last three variables: `spec.tlsSecurityProfile.intermediate` resolves to
-`minTLSVersion: VersionTLS12`, a `ciphers` list and a `groups` list, all accepted verbatim. Leaving both
-unset on RHEL-based images follows the system crypto policy instead.
+`minTLSVersion: VersionTLS12`, a `ciphers` list and a `groups` list, all accepted verbatim.
+Leaving them unset uses the backend's defaults: the system crypto policy on the OpenSSL
+build (the RHEL-based images), and ring's defaults on the rustls build, whatever the system
+policy says.
 
 The same file also configures it:
 
@@ -381,7 +388,13 @@ tls:
 ```
 
 Kubernetes gRPC probes do not speak TLS, so switch the startup, liveness and readiness probes to
-`tcpSocket` when enabling it.
+`tcpSocket` when enabling it. A connection closed before the TLS handshake starts, which
+is what a `tcpSocket` probe does, is logged at debug only. Failed handshakes are logged at
+warn, at most once every 10 seconds, with a count of the ones in between.
+
+The certificate and key are read once at startup. A rotated certificate, from
+cert-manager or the OpenShift service CA, takes effect when the pod restarts, so pair
+rotation with a controller that restarts the deployment when the Secret changes.
 
 ### Client configuration
 
@@ -391,11 +404,13 @@ endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MX_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Both clients trust only this bundle when it is set, not the system roots. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
 
-On OpenShift a service-ca signed certificate verifies against the bundle injected into any
-ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the
-worker pod and point the variable at `service-ca.crt`.
+A certificate from an in-cluster signer verifies against that signer's CA bundle. Mount the
+bundle into the worker pod and point the variable at it. On OpenShift a service-ca signed
+certificate verifies against the bundle injected into any ConfigMap annotated
+`service.beta.openshift.io/inject-cabundle: "true"`; mount it and point the variable at
+`service-ca.crt`.
 
 ## Docker
 

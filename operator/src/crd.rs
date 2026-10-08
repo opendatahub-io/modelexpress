@@ -88,7 +88,7 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
 
-    /// TLS termination on the gRPC listener, MX_TLS_*.
+    /// TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
@@ -371,17 +371,17 @@ pub struct TlsConfig {
     #[cel_validate(rule = Rule::new("self != ''").message("secretName must not be empty"))]
     #[schemars(length(max = 253))]
     pub secret_name: String,
-    /// MX_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
+    /// MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 16))]
     #[cel_validate(rule = Rule::new("self.matches('^(VersionTLS1[0-3]|TLS1[.][0-3])$')")
         .message("minVersion must be VersionTLS10..13 or TLS1.0..1.3"))]
     pub min_version: Option<String>,
-    /// MX_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
+    /// MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub cipher_suites: Vec<String>,
-    /// MX_TLS_GROUPS, key exchange groups in preference order
+    /// MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order
     /// (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 16))]
