@@ -49,7 +49,7 @@ pub struct ClientArgs {
     pub timeout: Option<u64>,
 
     /// PEM CA bundle to trust for an https:// endpoint
-    #[arg(long, env = crate::envs::MX_TLS_CA_FILE)]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_TLS_CA_FILE)]
     pub tls_ca_file: Option<PathBuf>,
 
     /// Cache path override
@@ -380,6 +380,27 @@ mod tests {
         assert_eq!(args.log_level, Some(LogLevel::Debug));
     }
 
+    /// A client config that does not load must not become the defaults: they
+    /// point at a plaintext localhost endpoint, whatever the file asked for.
+    #[test]
+    fn test_client_config_load_rejects_a_file_that_does_not_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("client.yaml");
+        std::fs::write(
+            &path,
+            "connection:\n  endpoint: \"https://mx.example:8001\"\n  timeout_secs: \"soon\"\n",
+        )
+        .expect("write config");
+        let path = path.to_str().expect("utf-8 path");
+
+        let args = ClientArgs::parse_from(["modelexpress-client", "--config", path]);
+        assert!(ClientConfig::load(args).is_err());
+
+        let missing =
+            ClientArgs::parse_from(["modelexpress-client", "--config", "/no/such/file.yaml"]);
+        assert!(ClientConfig::load(missing).is_err());
+    }
+
     #[test]
     fn test_client_config_load_applies_cli_args() {
         // Test that ClientConfig::load() properly applies CLI arguments
@@ -403,5 +424,67 @@ mod tests {
         assert!(config.logging.quiet);
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);
+    }
+
+    const FILE_ENDPOINT: &str = "http://from-file:9999";
+    const FILE_CA: &str = "/from/file/ca.pem";
+
+    /// A config file holding a whole `ClientConfig`. The loader swaps in the
+    /// defaults when a file fails to load, so the endpoint doubles as proof
+    /// that this one was read.
+    fn config_file_with_ca(dir: &tempfile::TempDir) -> PathBuf {
+        let mut config = ClientConfig::default();
+        config.connection.endpoint = FILE_ENDPOINT.to_string();
+        config.connection.tls_ca_file = Some(PathBuf::from(FILE_CA));
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config");
+        path
+    }
+
+    fn args_with_ca(config: PathBuf, tls_ca_file: Option<PathBuf>) -> ClientArgs {
+        ClientArgs {
+            config: Some(config),
+            endpoint: None,
+            timeout: None,
+            tls_ca_file,
+            cache_path: None,
+            log_level: None,
+            log_format: None,
+            quiet: false,
+            no_shared_storage: false,
+            transfer_chunk_size: None,
+        }
+    }
+
+    #[test]
+    fn test_client_config_load_tls_ca_file_arg_overrides_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let args = args_with_ca(
+            config_file_with_ca(&dir),
+            Some(PathBuf::from("/from/args/ca.pem")),
+        );
+
+        let config = ClientConfig::load(args).expect("Failed to load config");
+
+        assert_eq!(config.connection.endpoint, FILE_ENDPOINT);
+        assert_eq!(
+            config.connection.tls_ca_file,
+            Some(PathBuf::from("/from/args/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn test_client_config_load_keeps_file_tls_ca_file_without_arg() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let args = args_with_ca(config_file_with_ca(&dir), None);
+
+        let config = ClientConfig::load(args).expect("Failed to load config");
+
+        assert_eq!(config.connection.endpoint, FILE_ENDPOINT);
+        assert_eq!(config.connection.tls_ca_file, Some(PathBuf::from(FILE_CA)));
     }
 }

@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenSSL handshakes for the gRPC listener. tonic's own TLS support is
-//! rustls-only, which the FIPS build cannot link.
+//! OpenSSL handshakes for the gRPC listener.
 
 use std::pin::Pin;
 
@@ -40,22 +39,27 @@ impl Acceptor {
     }
 }
 
+#[cfg(test)]
+pub fn tcp(stream: &Stream) -> &TcpStream {
+    stream.get_ref()
+}
+
 /// Build the OpenSSL acceptor from the resolved config, or `None` when TLS is off.
 pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
-    let Some((cert, key)) = config.key_pair().map_err(TlsError::Config)? else {
+    let Some((cert, key)) = config.key_pair()? else {
         return Ok(None);
     };
     let mut builder = SslContextBuilder::new(SslMethod::tls_server())?;
     builder.set_certificate_chain_file(cert)?;
     builder.set_private_key_file(key, SslFiletype::PEM)?;
     builder.check_private_key()?;
-    if let Some(version) = config.min_version {
-        builder.set_min_proto_version(Some(ssl_version(version)))?;
-    }
+    builder.set_min_proto_version(Some(ssl_version(min_version(config.min_version))))?;
     let (tls12, tls13) = split_cipher_suites(&config.cipher_suites);
+    let tls12 = supported_names(&tls12, "TLS1.2 cipher", SslContextBuilder::set_cipher_list)?;
     if !tls12.is_empty() {
         builder.set_cipher_list(&tls12.join(":"))?;
     }
+    let tls13 = supported_names(&tls13, "TLS1.3 cipher", SslContextBuilder::set_ciphersuites)?;
     if !tls13.is_empty() {
         builder.set_ciphersuites(&tls13.join(":"))?;
     }
@@ -64,28 +68,68 @@ pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
         builder.set_groups_list(&groups.join(":"))?;
     }
     builder.set_alpn_select_callback(|_ssl, client| {
-        select_next_proto(ALPN_H2, client).ok_or(AlpnError::NOACK)
+        select_next_proto(ALPN_H2, client).ok_or(AlpnError::ALERT_FATAL)
     });
     Ok(Some(Acceptor {
         context: builder.build(),
     }))
 }
 
-/// The subset of `groups` this OpenSSL can negotiate, in the order given.
-///
-/// A cluster profile lists post-quantum groups that OpenSSL before 3.5 does
-/// not know, and `set_groups_list` rejects the whole list on one unknown
-/// name. Each name is probed on a scratch context so the known ones still
-/// apply, the way the Go library reports unsupported entries and moves on.
-fn supported_groups(groups: &[String]) -> Result<Vec<String>, ErrorStack> {
-    let mut probe = SslContextBuilder::new(SslMethod::tls_server())?;
-    let mut supported = Vec::with_capacity(groups.len());
-    for group in groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
-        if probe.set_groups_list(group).is_ok() {
-            supported.push(group.to_string());
-        } else {
-            warn!("TLS group {group} is not supported by the linked OpenSSL; dropping it");
+/// The configured minimum, floored at TLS 1.2. rustls cannot go below it, and
+/// an unset minimum otherwise leaves the OpenSSL default in charge.
+fn min_version(configured: Option<TlsVersion>) -> TlsVersion {
+    match configured {
+        Some(version) if version >= TlsVersion::Tls12 => version,
+        Some(version) => {
+            warn!("TLS minimum {version} is below TLS1.2, using TLS1.2");
+            TlsVersion::Tls12
         }
+        None => TlsVersion::Tls12,
+    }
+}
+
+/// The subset of `groups` this OpenSSL can negotiate, in the order given, or
+/// none when `groups` is empty, which leaves the OpenSSL defaults.
+fn supported_groups(groups: &[String]) -> Result<Vec<String>, TlsError> {
+    supported_names(groups, "group", SslContextBuilder::set_groups_list)
+}
+
+/// The names in `names` that `set` accepts on its own, in the order given.
+/// Each name is probed separately: `set_groups_list` rejects a whole list
+/// containing one unknown name, while `set_cipher_list` and `set_ciphersuites`
+/// skip unknown names without a word as long as one matches. Cipher string
+/// operators (`!aNULL`, `-RSA`, `+AES`, `@STRENGTH`) pass through unprobed,
+/// since they match nothing on their own. A list naming nothing supported is
+/// an error: falling back to the defaults would widen the policy the list
+/// asked for.
+fn supported_names(
+    names: &[String],
+    kind: &str,
+    set: fn(&mut SslContextBuilder, &str) -> Result<(), ErrorStack>,
+) -> Result<Vec<String>, TlsError> {
+    let names: Vec<&str> = names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    let mut probe = SslContextBuilder::new(SslMethod::tls_server())?;
+    let mut supported = Vec::with_capacity(names.len());
+    let mut matched = false;
+    for name in names.iter().copied() {
+        if name.starts_with(['!', '-', '+', '@']) {
+            supported.push(name.to_string());
+        } else if set(&mut probe, name).is_ok() {
+            matched = true;
+            supported.push(name.to_string());
+        } else {
+            warn!("TLS {kind} {name} is not supported by the linked OpenSSL; dropping it");
+        }
+    }
+    if !names.is_empty() && !matched {
+        return Err(TlsError::Unsupported(format!(
+            "none of the {kind}s {} are supported by the linked OpenSSL",
+            names.join(":")
+        )));
     }
     Ok(supported)
 }
@@ -108,9 +152,9 @@ mod tests {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
     use tempfile::TempDir;
 
-    use crate::config::TlsConfig;
+    use crate::config::{TlsConfig, TlsConfigError};
     use crate::tls::TlsError;
-    use crate::tls::backend_openssl::{ALPN_H2, build};
+    use crate::tls::backend_openssl::{ALPN_H2, build, min_version};
 
     /// A throwaway CA-signed leaf for `localhost` written into `dir`.
     pub(crate) fn self_signed(dir: &TempDir) -> (PathBuf, PathBuf) {
@@ -177,11 +221,28 @@ mod tests {
         handshake_with_groups(context, max, cipher, None)
     }
 
+    fn handshake_with_alpn(
+        context: &openssl::ssl::SslContext,
+        alpn: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        handshake_with_opts(context, SslVersion::TLS1_3, None, None, alpn)
+    }
+
     fn handshake_with_groups(
         context: &openssl::ssl::SslContext,
         max: SslVersion,
         cipher: Option<&str>,
         groups: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        handshake_with_opts(context, max, cipher, groups, ALPN_H2)
+    }
+
+    fn handshake_with_opts(
+        context: &openssl::ssl::SslContext,
+        max: SslVersion,
+        cipher: Option<&str>,
+        groups: Option<&str>,
+        alpn: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
         use openssl::ssl::Ssl;
         use std::io::{Read, Write};
@@ -205,7 +266,7 @@ mod tests {
         let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("connector");
         builder.set_verify(SslVerifyMode::NONE);
         builder.set_max_proto_version(Some(max)).expect("max");
-        builder.set_alpn_protos(ALPN_H2).expect("alpn");
+        builder.set_alpn_protos(alpn).expect("alpn");
         if let Some(cipher) = cipher {
             builder.set_cipher_list(cipher).expect("cipher");
         }
@@ -243,7 +304,10 @@ mod tests {
             cert_file: Some(PathBuf::from("/nonexistent/tls.crt")),
             ..TlsConfig::default()
         };
-        assert!(matches!(context(&config), Err(TlsError::Config(_))));
+        assert!(matches!(
+            context(&config),
+            Err(TlsError::Config(TlsConfigError::CertWithoutKey))
+        ));
     }
 
     #[test]
@@ -286,6 +350,31 @@ mod tests {
         let ctx = context(&config).expect("build").expect("enabled");
         assert!(handshake_with(&ctx, SslVersion::TLS1_2, None).is_err());
         assert!(handshake_with(&ctx, SslVersion::TLS1_3, None).is_ok());
+    }
+
+    #[test]
+    fn client_offering_only_http1_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = config(&dir);
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(handshake_with_alpn(&ctx, b"\x08http/1.1").is_err());
+        assert!(handshake_with_alpn(&ctx, ALPN_H2).is_ok());
+    }
+
+    #[test]
+    fn unset_min_version_refuses_tls11_clients() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = config(&dir);
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(handshake_with(&ctx, SslVersion::TLS1_1, None).is_err());
+        assert!(handshake_with(&ctx, SslVersion::TLS1_2, None).is_ok());
+    }
+
+    #[test]
+    fn min_version_below_tls12_is_raised() {
+        assert_eq!(min_version(None), TlsVersion::Tls12);
+        assert_eq!(min_version(Some(TlsVersion::Tls10)), TlsVersion::Tls12);
+        assert_eq!(min_version(Some(TlsVersion::Tls13)), TlsVersion::Tls13);
     }
 
     #[test]
@@ -350,10 +439,21 @@ mod tests {
     }
 
     #[test]
-    fn all_unknown_groups_leave_openssl_defaults() {
+    fn all_unknown_groups_are_a_config_error() {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
-        config.groups = vec!["NOT_A_GROUP".to_string()];
+        config.groups = vec!["NOT_A_GROUP".to_string(), "ALSO_NOT".to_string()];
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-groups error");
+        };
+        assert!(message.contains("NOT_A_GROUP:ALSO_NOT"), "{message}");
+    }
+
+    #[test]
+    fn blank_group_names_leave_openssl_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.groups = vec![String::new(), "  ".to_string()];
         let ctx = context(&config).expect("build").expect("enabled");
         assert!(handshake_with_groups(&ctx, SslVersion::TLS1_3, None, Some("secp384r1")).is_ok());
     }
@@ -363,7 +463,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
         config.cipher_suites = vec!["NOT-A-CIPHER".to_string()];
-        assert!(matches!(context(&config), Err(TlsError::OpenSsl(_))));
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-ciphers error");
+        };
+        assert!(message.contains("NOT-A-CIPHER"), "{message}");
     }
 
     #[test]
@@ -371,6 +474,96 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
         config.cipher_suites = vec!["TLS_NOT_A_SUITE".to_string()];
-        assert!(matches!(context(&config), Err(TlsError::OpenSsl(_))));
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-suites error");
+        };
+        assert!(message.contains("TLS_NOT_A_SUITE"), "{message}");
+    }
+
+    #[test]
+    fn unknown_cipher_names_are_dropped_beside_known_ones() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "NOT-A-CIPHER".to_string(),
+            "ECDHE-RSA-AES256-GCM-SHA384".to_string(),
+            "TLS_NOT_A_SUITE".to_string(),
+            "TLS_AES_256_GCM_SHA384".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn iana_tls12_cipher_names_restrict_negotiation() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".to_string(),
+            "TLS_AES_256_GCM_SHA384".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cipher_string_operators_pass_through() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.min_version = Some(TlsVersion::Tls12);
+        config.cipher_suites = vec![
+            "ECDHE-RSA-AES256-GCM-SHA384".to_string(),
+            "ECDHE-RSA-AES128-GCM-SHA256".to_string(),
+            "!AES128".to_string(),
+        ];
+        let ctx = context(&config).expect("build").expect("enabled");
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES256-GCM-SHA384")
+            )
+            .is_ok()
+        );
+        assert!(
+            handshake_with(
+                &ctx,
+                SslVersion::TLS1_2,
+                Some("ECDHE-RSA-AES128-GCM-SHA256")
+            )
+            .is_err()
+        );
     }
 }
