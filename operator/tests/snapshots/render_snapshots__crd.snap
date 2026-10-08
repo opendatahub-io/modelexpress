@@ -1204,23 +1204,23 @@ spec:
                       type: object
                   type: object
                 tls:
-                  description: "TLS termination on the gRPC listener, MX_TLS_*."
+                  description: "TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*."
                   nullable: true
                   properties:
                     cipherSuites:
-                      description: "MX_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated)."
+                      description: "MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated)."
                       items:
                         type: string
                       maxItems: 64
                       type: array
                     groups:
-                      description: "MX_TLS_GROUPS, key exchange groups in preference order (rendered comma-separated)."
+                      description: "MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order (rendered comma-separated)."
                       items:
                         type: string
                       maxItems: 16
                       type: array
                     minVersion:
-                      description: "MX_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style."
+                      description: "MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style."
                       maxLength: 16
                       nullable: true
                       type: string
