@@ -16,6 +16,7 @@ keywords.workspace = true
 default = ["gcs", "tls-rustls"]
 openssl = ["tls-native"]
 gcs = ["modelexpress-common/gcs"]
+s3 = ["modelexpress-common/s3"]
 tls-native = [
     "modelexpress-common/tls-native",
     "dep:openssl",
