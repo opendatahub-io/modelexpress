@@ -2764,6 +2764,7 @@ dependencies = [
  "modelexpress-server",
  "redis",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tonic 0.13.1",
