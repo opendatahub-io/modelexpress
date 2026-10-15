@@ -1,13 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! rustls handshakes for the gRPC listener, with the ring provider.
-//!
-//! Settings arrive in OpenSSL spelling because that is what a cluster TLS
-//! profile carries. rustls implements a subset of it: TLS 1.2 and 1.3 only,
-//! AEAD suites only, and no post-quantum groups under ring. Names outside the
-//! subset are dropped with a warning, the way the OpenSSL backend drops groups
-//! its library cannot negotiate.
+//! rustls handshakes for the gRPC listener, with the ring provider. Settings
+//! arrive in OpenSSL spelling; names rustls does not implement are dropped
+//! with a warning.
 
 use std::sync::Arc;
 
@@ -39,6 +35,11 @@ impl Acceptor {
     ) -> Result<Stream, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.inner.accept(tcp).await?)
     }
+}
+
+#[cfg(test)]
+pub fn tcp(stream: &Stream) -> &TcpStream {
+    stream.get_ref().0
 }
 
 /// OpenSSL cipher names rustls implements, with the suite each one names.
@@ -94,7 +95,7 @@ const GROUPS: [(&str, NamedGroup); 6] = [
 
 /// Build the rustls acceptor from the resolved config, or `None` when TLS is off.
 pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
-    let Some((cert, key)) = config.key_pair().map_err(TlsError::Config)? else {
+    let Some((cert, key)) = config.key_pair()? else {
         return Ok(None);
     };
     let chain = CertificateDer::pem_file_iter(cert)
@@ -117,20 +118,21 @@ pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
     }))
 }
 
-/// ring's provider narrowed to the configured ciphers and groups.
-///
-/// The TLS 1.2 and 1.3 cipher lists are independent, as in OpenSSL: naming
-/// only 1.2 ciphers leaves every 1.3 suite enabled, and the reverse.
+/// ring's provider narrowed to the configured ciphers and groups. The TLS 1.2
+/// and 1.3 lists are independent, as in OpenSSL, and the TLS 1.2 list is only
+/// read when TLS 1.2 can be negotiated.
 fn provider(config: &TlsConfig) -> Result<CryptoProvider, TlsError> {
     let base = ring::default_provider();
     let (tls12, tls13) = split_cipher_suites(&config.cipher_suites);
     let mut cipher_suites = select_cipher_suites(&base, &tls13, &rustls::version::TLS13)?;
-    cipher_suites.extend(select_cipher_suites(
-        &base,
-        &tls12,
-        &rustls::version::TLS12,
-    )?);
-    let kx_groups = select_kx_groups(&base, &config.groups);
+    if config.min_version != Some(TlsVersion::Tls13) {
+        cipher_suites.extend(select_cipher_suites(
+            &base,
+            &tls12,
+            &rustls::version::TLS12,
+        )?);
+    }
+    let kx_groups = select_kx_groups(&base, &config.groups)?;
     Ok(CryptoProvider {
         cipher_suites,
         kx_groups,
@@ -139,8 +141,7 @@ fn provider(config: &TlsConfig) -> Result<CryptoProvider, TlsError> {
 }
 
 /// The provider's suites for `version`, in the order `names` gives them, or
-/// all of them when `names` is empty. A list naming nothing rustls implements
-/// is an error rather than a silent fallback to every suite.
+/// all of them when `names` is empty. A list naming none of them is an error.
 fn select_cipher_suites(
     provider: &CryptoProvider,
     names: &[String],
@@ -160,7 +161,12 @@ fn select_cipher_suites(
         let suite = CIPHERS
             .iter()
             .find(|(openssl, _)| openssl == name)
-            .and_then(|(_, id)| available.iter().find(|suite| suite.suite() == *id));
+            .and_then(|(_, id)| available.iter().find(|suite| suite.suite() == *id))
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|suite| suite.suite().as_str() == Some(name.as_str()))
+            });
         match suite {
             Some(suite) if !selected.contains(suite) => selected.push(*suite),
             Some(_) => {}
@@ -168,7 +174,7 @@ fn select_cipher_suites(
         }
     }
     if selected.is_empty() {
-        return Err(TlsError::Config(format!(
+        return Err(TlsError::Unsupported(format!(
             "none of the {:?} ciphers {} are supported by rustls",
             version.version,
             names.join(":")
@@ -177,19 +183,24 @@ fn select_cipher_suites(
     Ok(selected)
 }
 
-/// The provider's groups named in `names`, in order. Unknown names are
-/// dropped; when none are left the provider's defaults apply, matching the
-/// OpenSSL backend.
+/// The provider's groups named in `names`, in order, or all of them when
+/// `names` is empty. Unknown names are dropped. A list naming none of them is
+/// an error, as for ciphers: falling back to the defaults would widen the key
+/// exchange policy the list asked for.
 fn select_kx_groups(
     provider: &CryptoProvider,
     names: &[String],
-) -> Vec<&'static dyn SupportedKxGroup> {
-    let mut selected: Vec<&'static dyn SupportedKxGroup> = Vec::with_capacity(names.len());
-    for name in names
+) -> Result<Vec<&'static dyn SupportedKxGroup>, TlsError> {
+    let names: Vec<&str> = names
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
-    {
+        .collect();
+    if names.is_empty() {
+        return Ok(provider.kx_groups.clone());
+    }
+    let mut selected: Vec<&'static dyn SupportedKxGroup> = Vec::with_capacity(names.len());
+    for name in names.iter().copied() {
         let group = GROUPS
             .iter()
             .find(|(openssl, _)| openssl.eq_ignore_ascii_case(name))
@@ -209,10 +220,12 @@ fn select_kx_groups(
         }
     }
     if selected.is_empty() {
-        provider.kx_groups.clone()
-    } else {
-        selected
+        return Err(TlsError::Unsupported(format!(
+            "none of the groups {} are supported by rustls",
+            names.join(":")
+        )));
     }
+    Ok(selected)
 }
 
 fn protocol_versions(min: Option<TlsVersion>) -> &'static [&'static SupportedProtocolVersion] {
@@ -251,7 +264,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
 
-    use crate::config::TlsConfig;
+    use crate::config::{TlsConfig, TlsConfigError};
     use crate::tls::TlsError;
     use crate::tls::backend_rustls::{Acceptor, build, select_kx_groups};
 
@@ -447,7 +460,10 @@ mod tests {
             key_file: Some(PathBuf::from("/nonexistent/tls.key")),
             ..TlsConfig::default()
         };
-        assert!(matches!(build(&config), Err(TlsError::Config(_))));
+        assert!(matches!(
+            build(&config),
+            Err(TlsError::Config(TlsConfigError::KeyWithoutCert))
+        ));
     }
 
     #[test]
@@ -609,6 +625,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iana_tls12_cipher_names_restrict_negotiation() {
+        let restrict = |config: &mut TlsConfig| {
+            config.cipher_suites = strings(&["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"]);
+        };
+        let negotiated = handshake(
+            server(restrict),
+            tls12_only(&[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384]),
+        )
+        .await
+        .expect("listed suite");
+        assert_eq!(
+            negotiated.suite,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+        assert!(
+            handshake(
+                server(restrict),
+                tls12_only(&[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn cipher_suites_restrict_tls13_negotiation() {
         let restrict = |config: &mut TlsConfig| {
             config.cipher_suites = strings(&["TLS_CHACHA20_POLY1305_SHA256"]);
@@ -700,7 +741,7 @@ mod tests {
                 ..TlsConfig::default()
             };
             assert!(
-                matches!(build(&config), Err(TlsError::Config(_))),
+                matches!(build(&config), Err(TlsError::Unsupported(_))),
                 "{names:?}"
             );
         }
@@ -733,9 +774,10 @@ mod tests {
     }
 
     #[test]
-    fn openshift_group_list_drops_post_quantum_under_ring() {
+    fn profile_group_list_drops_post_quantum_under_ring() {
         let names: Vec<NamedGroup> =
             select_kx_groups(&ring::default_provider(), &strings(&PROFILE_GROUPS))
+                .expect("groups")
                 .iter()
                 .map(|group| group.name())
                 .collect();
@@ -755,6 +797,7 @@ mod tests {
             &ring::default_provider(),
             &strings(&["P-256", " prime256v1 ", "x25519", "", "P-384"]),
         )
+        .expect("groups")
         .iter()
         .map(|group| group.name())
         .collect();
@@ -768,10 +811,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_unknown_groups_are_a_config_error() {
+        let result = select_kx_groups(
+            &ring::default_provider(),
+            &strings(&["NOT_A_GROUP", "X25519MLKEM768"]),
+        );
+        let Err(TlsError::Unsupported(message)) = result else {
+            panic!("expected an unsupported-groups error");
+        };
+        assert!(message.contains("NOT_A_GROUP:X25519MLKEM768"), "{message}");
+
+        let dir = TempDir::new().expect("tempdir");
+        let pair = chain(&dir, "server");
+        let config = TlsConfig {
+            cert_file: Some(pair.cert),
+            key_file: Some(pair.key),
+            groups: strings(&["NOT_A_GROUP"]),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(build(&config), Err(TlsError::Unsupported(_))));
+    }
+
     #[tokio::test]
-    async fn all_unknown_groups_leave_provider_defaults() {
+    async fn blank_group_names_leave_provider_defaults() {
         let negotiated = handshake(
-            server(|config| config.groups = strings(&["NOT_A_GROUP", "X25519MLKEM768"])),
+            server(|config| config.groups = strings(&["", "  "])),
             Offer {
                 groups: vec![NamedGroup::secp384r1],
                 ..Offer::default()
@@ -783,7 +848,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openshift_intermediate_profile_serves_tls12_and_tls13() {
+    async fn tls12_ciphers_are_not_read_when_only_tls13_is_served() {
+        let tls13_only = |config: &mut TlsConfig| {
+            config.min_version = Some(TlsVersion::Tls13);
+            config.cipher_suites = strings(&["DHE-RSA-AES128-GCM-SHA256"]);
+        };
+        let negotiated = handshake(server(tls13_only), Offer::default())
+            .await
+            .expect("tls13 client");
+        assert_eq!(negotiated.version, ProtocolVersion::TLSv1_3);
+
+        let dir = TempDir::new().expect("tempdir");
+        let pair = chain(&dir, "server");
+        let tls12_served = TlsConfig {
+            cert_file: Some(pair.cert),
+            key_file: Some(pair.key),
+            min_version: Some(TlsVersion::Tls12),
+            cipher_suites: strings(&["DHE-RSA-AES128-GCM-SHA256"]),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            build(&tls12_served),
+            Err(TlsError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn intermediate_profile_serves_tls12_and_tls13() {
         let intermediate = |config: &mut TlsConfig| {
             config.min_version = Some(TlsVersion::Tls12);
             config.cipher_suites = strings(&INTERMEDIATE_CIPHERS);
@@ -801,7 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openshift_modern_profile_refuses_tls12() {
+    async fn modern_profile_refuses_tls12() {
         let modern = |config: &mut TlsConfig| {
             config.min_version = Some(TlsVersion::Tls13);
             config.cipher_suites = strings(&INTERMEDIATE_CIPHERS[..3]);

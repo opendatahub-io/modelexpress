@@ -38,7 +38,7 @@ WORKDIR /src
 COPY . .
 RUN __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly CARGO_BUILD_SBOM=true \
     cargo auditable build -Z sbom --release --package modelexpress-server --bin modelexpress-server \
-        --no-default-features --features openssl \
+        --no-default-features --features openssl, s3 \
     && objdump -h target/release/modelexpress-server | grep -q '\.dep-v0' \
     && ci/check-fips-crypto.sh target/release/modelexpress-server \
     && cp target/release/modelexpress-server /modelexpress-server

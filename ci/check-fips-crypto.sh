@@ -19,7 +19,12 @@ if [[ $# -eq 0 ]]; then
     echo "usage: $0 <binary>..." >&2
     exit 2
 fi
-
+# package:features pairs, matching how each image is built
+TARGETS=(
+    "modelexpress-server:openssl,s3"
+    "modelexpress-operator:openssl"
+    "modelexpress-operator-openshift:openssl"
+)
 # Rust paths (ring::, rustls::, ...) and the prefixed C symbols ring and
 # aws-lc build with. \b keeps string:: from matching ring::.
 BANNED='\b(ring|rustls|aws_lc_rs|aws_lc_sys)::|\bring_core_[0-9]|\baws_lc_[0-9]'

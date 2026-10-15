@@ -88,6 +88,8 @@ pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
 /// HuggingFace Hub endpoint override. Read directly by the `hf_hub` crate;
 /// registered here for reference (ModelExpress only sets it in tests).
 pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
+/// Suppresses use of the locally cached HuggingFace token.
+pub const HF_HUB_DISABLE_IMPLICIT_TOKEN: &str = "HF_HUB_DISABLE_IMPLICIT_TOKEN";
 
 // ── NGC ─────────────────────────────────────────────────────────────────────
 /// Base URL for the NGC artifact/download API.
@@ -149,19 +151,19 @@ pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_
 
 // ── TLS (server) ────────────────────────────────────────────────────────────
 /// PEM certificate chain the gRPC listener serves (`TlsArgs::cert_file`).
-pub const MX_TLS_CERT_FILE: &str = "MX_TLS_CERT_FILE";
-/// PEM private key for [`MX_TLS_CERT_FILE`] (`TlsArgs::key_file`).
-pub const MX_TLS_KEY_FILE: &str = "MX_TLS_KEY_FILE";
+pub const MODEL_EXPRESS_TLS_CERT_FILE: &str = "MODEL_EXPRESS_TLS_CERT_FILE";
+/// PEM private key for [`MODEL_EXPRESS_TLS_CERT_FILE`] (`TlsArgs::key_file`).
+pub const MODEL_EXPRESS_TLS_KEY_FILE: &str = "MODEL_EXPRESS_TLS_KEY_FILE";
 /// Minimum TLS protocol version the listener accepts (`TlsArgs::min_version`).
-pub const MX_TLS_MIN_VERSION: &str = "MX_TLS_MIN_VERSION";
+pub const MODEL_EXPRESS_TLS_MIN_VERSION: &str = "MODEL_EXPRESS_TLS_MIN_VERSION";
 /// Comma-separated OpenSSL cipher names the listener offers (`TlsArgs::cipher_suites`).
-pub const MX_TLS_CIPHER_SUITES: &str = "MX_TLS_CIPHER_SUITES";
+pub const MODEL_EXPRESS_TLS_CIPHER_SUITES: &str = "MODEL_EXPRESS_TLS_CIPHER_SUITES";
 /// Comma-separated key exchange groups the listener offers (`TlsArgs::groups`).
-pub const MX_TLS_GROUPS: &str = "MX_TLS_GROUPS";
+pub const MODEL_EXPRESS_TLS_GROUPS: &str = "MODEL_EXPRESS_TLS_GROUPS";
 
 // ── TLS (client) ────────────────────────────────────────────────────────────
 /// PEM CA bundle the client trusts for an `https://` endpoint (`ClientArgs::tls_ca_file`).
-pub const MX_TLS_CA_FILE: &str = "MX_TLS_CA_FILE";
+pub const MODEL_EXPRESS_TLS_CA_FILE: &str = "MODEL_EXPRESS_TLS_CA_FILE";
 
 // ── Auth (client) ───────────────────────────────────────────────────────────
 /// Path to the Kubernetes projected ServiceAccount token file.
@@ -239,6 +241,14 @@ pub fn hf_hub_cache() -> Option<PathBuf> {
 /// Enabled when the value is one of `1`, `ON`, `YES`, `TRUE` (case-insensitive).
 pub fn hf_offline() -> bool {
     env::var(HF_HUB_OFFLINE)
+        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
+        .unwrap_or(false)
+}
+
+/// Whether the locally cached HuggingFace token must not be used implicitly, via
+/// [`HF_HUB_DISABLE_IMPLICIT_TOKEN`]. Same truthy values as [`hf_offline`].
+pub fn hf_implicit_token_disabled() -> bool {
+    env::var(HF_HUB_DISABLE_IMPLICIT_TOKEN)
         .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
         .unwrap_or(false)
 }
@@ -386,6 +396,10 @@ mod tests {
         assert_eq!(HF_HUB_CACHE, "HF_HUB_CACHE");
         assert_eq!(HF_HUB_OFFLINE, "HF_HUB_OFFLINE");
         assert_eq!(HF_ENDPOINT, "HF_ENDPOINT");
+        assert_eq!(
+            HF_HUB_DISABLE_IMPLICIT_TOKEN,
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+        );
         assert_eq!(NGC_API_ENDPOINT, "NGC_API_ENDPOINT");
         assert_eq!(NGC_AUTH_ENDPOINT, "NGC_AUTH_ENDPOINT");
         assert_eq!(NGC_API_KEY, "NGC_API_KEY");
@@ -420,12 +434,18 @@ mod tests {
             MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
             "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS"
         );
-        assert_eq!(MX_TLS_CERT_FILE, "MX_TLS_CERT_FILE");
-        assert_eq!(MX_TLS_KEY_FILE, "MX_TLS_KEY_FILE");
-        assert_eq!(MX_TLS_MIN_VERSION, "MX_TLS_MIN_VERSION");
-        assert_eq!(MX_TLS_CIPHER_SUITES, "MX_TLS_CIPHER_SUITES");
-        assert_eq!(MX_TLS_GROUPS, "MX_TLS_GROUPS");
-        assert_eq!(MX_TLS_CA_FILE, "MX_TLS_CA_FILE");
+        assert_eq!(MODEL_EXPRESS_TLS_CERT_FILE, "MODEL_EXPRESS_TLS_CERT_FILE");
+        assert_eq!(MODEL_EXPRESS_TLS_KEY_FILE, "MODEL_EXPRESS_TLS_KEY_FILE");
+        assert_eq!(
+            MODEL_EXPRESS_TLS_MIN_VERSION,
+            "MODEL_EXPRESS_TLS_MIN_VERSION"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_TLS_CIPHER_SUITES,
+            "MODEL_EXPRESS_TLS_CIPHER_SUITES"
+        );
+        assert_eq!(MODEL_EXPRESS_TLS_GROUPS, "MODEL_EXPRESS_TLS_GROUPS");
+        assert_eq!(MODEL_EXPRESS_TLS_CA_FILE, "MODEL_EXPRESS_TLS_CA_FILE");
         assert_eq!(MX_AUTH_TOKEN_PATH, "MX_AUTH_TOKEN_PATH");
         assert_eq!(MX_AUTH_TOKEN_TTL_SECONDS, "MX_AUTH_TOKEN_TTL_SECONDS");
         assert_eq!(HOME, "HOME");

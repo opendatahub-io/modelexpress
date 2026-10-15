@@ -26,7 +26,7 @@ pub const PLURAL: &str = "servicemonitors";
 
 /// The operator's metrics Service, from the base manifests.
 pub const METRICS_SERVICE_NAME: &str = "modelexpress-operator-metrics";
-/// service-ca's bundle, injected into this ConfigMap by the overlay.
+/// The service-ca bundle OpenShift publishes into every namespace.
 pub const SERVICE_CA_CONFIGMAP: &str = "openshift-service-ca.crt";
 
 pub const NAME: &str = "modelexpress-operator";

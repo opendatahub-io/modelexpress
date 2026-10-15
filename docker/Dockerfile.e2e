@@ -36,7 +36,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --package modelexpress-operator-openshift --package modelexpress-server \
-        --no-default-features --features openssl \
+        --no-default-features --features openssl,s3 \
     && cp target/release/modelexpress-operator-openshift /modelexpress-operator \
     && cp target/release/modelexpress-server /modelexpress-server-openssl
 RUN --mount=type=cache,target=/root/.cargo/registry \

@@ -108,15 +108,19 @@ def _raw_server_url(explicit_url: str | None = None) -> str:
 
 
 def _tls_requested(explicit_url: str | None = None) -> bool:
-    """TLS is on for an ``https://`` address or when a CA bundle is configured."""
-    return _raw_server_url(explicit_url).startswith("https://") or bool(
-        envs.MX_TLS_CA_FILE
-    )
+    """TLS is on for an ``https://`` address, off for ``http://``, and on for a
+    bare ``host:port`` only when a CA bundle is configured."""
+    url = _raw_server_url(explicit_url)
+    if url.startswith("https://"):
+        return True
+    if url.startswith("http://"):
+        return False
+    return bool(envs.MODEL_EXPRESS_TLS_CA_FILE)
 
 
 def _channel_credentials() -> grpc.ChannelCredentials:
-    """Client credentials trusting ``MX_TLS_CA_FILE``, else system roots."""
-    ca_file = envs.MX_TLS_CA_FILE
+    """Client credentials trusting ``MODEL_EXPRESS_TLS_CA_FILE``, else system roots."""
+    ca_file = envs.MODEL_EXPRESS_TLS_CA_FILE
     if not ca_file:
         return grpc.ssl_channel_credentials()
     with open(ca_file, "rb") as handle:

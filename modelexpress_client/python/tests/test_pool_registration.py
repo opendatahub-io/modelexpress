@@ -205,7 +205,8 @@ class TestRawDescriptorMemType:
 
     def test_pool_registration_uses_vram_segment(self, monkeypatch, fake_driver):
         monkeypatch.setenv("MX_POOL_REG", "1")
-        tensor = torch.zeros(4, dtype=torch.float32)
+        tensor = MagicMock(wraps=torch.zeros(4, dtype=torch.float32))
+        tensor.is_cuda = True
         fake_driver([(tensor.data_ptr(), tensor.numel() * tensor.element_size())])
 
         mgr = self._make_manager()
@@ -216,6 +217,36 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_draft_view_inside_registered_pool_reuses_main_registration(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(8, dtype=torch.float32)
+        main = MagicMock(wraps=backing[:2])
+        main.is_cuda = True
+        draft = backing[4:6]
+        mgr = self._make_manager()
+        mgr._find_cuda_allocations = MagicMock(
+            return_value=[(backing.data_ptr(), backing.numel() * backing.element_size())]
+        )
+
+        mgr.register_tensors({"main": main})
+        assert mgr.register_additional_tensors({"draft": draft}) == b"metadata"
+
+        assert [item.name for item in mgr.tensor_descriptors] == ["main", "draft"]
+        mgr._agent.register_memory.assert_called_once()
+
+    def test_host_sources_bypass_cuda_pool_discovery(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        tensor = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._find_cuda_allocations = MagicMock(
+            side_effect=AssertionError("CPU address")
+        )
+        assert mgr.register_tensors({"w": tensor}) == b"metadata"
+        mgr._find_cuda_allocations.assert_not_called()
+        mgr._agent.register_memory.assert_called_once_with([tensor], backends=["UCX"])
 
     def test_arena_registration_uses_vram_segment(self):
         # The arena range must actually cover the tensor, as a real arena does.
@@ -237,6 +268,112 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_draft_view_inside_registered_arena_reuses_main_registration(self):
+        main = torch.zeros(8, dtype=torch.float32)
+        draft = main[2:4]
+
+        class FakeArena:
+            live_allocation_count = 1
+
+            def registered_range(self):
+                return main.data_ptr(), main.numel() * main.element_size()
+
+        mgr = self._make_manager()
+        mgr.register_arena(FakeArena(), {"main": main})
+
+        assert mgr.register_additional_tensors({"draft": draft}) == b"metadata"
+        assert [item.name for item in mgr.tensor_descriptors] == ["main", "draft"]
+        mgr._agent.register_memory.assert_called_once()
+
+        mgr.deregister_tensors(["draft"])
+        assert [item.name for item in mgr.tensor_descriptors] == ["main"]
+        mgr._agent.deregister_memory.assert_not_called()
+
+    def test_draft_tensor_outside_main_registration_gets_its_own_range(self):
+        main = torch.zeros(8, dtype=torch.float32)
+        draft = torch.ones(8, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr.register_tensors({"main": main})
+
+        assert mgr.register_additional_tensors({"draft": draft}) == b"metadata"
+        assert [item.name for item in mgr.tensor_descriptors] == ["main", "draft"]
+        assert mgr._agent.register_memory.call_count == 2
+
+    def test_appended_subview_reuses_registration_until_last_name_is_removed(self):
+        main = torch.zeros(8, dtype=torch.float32)
+        draft = torch.ones(8, dtype=torch.float32)
+        draft_alias = draft[2:4]
+        base_handle, draft_handle, duplicate_handle = object(), object(), object()
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = [
+            base_handle,
+            draft_handle,
+            duplicate_handle,
+        ]
+
+        mgr.register_tensors({"main": main})
+        mgr.register_additional_tensors({"draft": draft})
+        mgr.register_additional_tensors({"draft_alias": draft_alias})
+
+        assert [item.name for item in mgr.tensor_descriptors] == [
+            "main",
+            "draft",
+            "draft_alias",
+        ]
+        assert mgr._agent.register_memory.call_count == 2
+
+        mgr.deregister_tensors(["draft"])
+        assert [item.name for item in mgr.tensor_descriptors] == [
+            "main",
+            "draft_alias",
+        ]
+        mgr._agent.deregister_memory.assert_not_called()
+
+        mgr.deregister_tensors(["draft_alias"])
+        mgr._agent.deregister_memory.assert_called_once_with(draft_handle)
+
+    def test_appended_batch_registers_parent_once_even_when_view_is_first(self):
+        main = torch.zeros(8, dtype=torch.float32)
+        draft = torch.ones(8, dtype=torch.float32)
+        draft_alias = draft[2:4]
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = [object(), object(), object()]
+
+        mgr.register_tensors({"main": main})
+        mgr.register_additional_tensors(
+            {"draft_alias": draft_alias, "draft": draft}
+        )
+
+        assert [item.name for item in mgr.tensor_descriptors] == [
+            "main",
+            "draft_alias",
+            "draft",
+        ]
+        assert mgr._agent.register_memory.call_count == 2
+        registered = mgr._agent.register_memory.call_args.args[0]
+        assert len(registered) == 1
+        assert registered[0] is draft
+
+    def test_appended_sibling_reuses_range_after_parent_name_is_removed(self):
+        main = torch.zeros(8, dtype=torch.float32)
+        draft = torch.ones(8, dtype=torch.float32)
+        first_view = draft[1:3]
+        second_view = draft[5:7]
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = [object(), object(), object()]
+
+        mgr.register_tensors({"main": main})
+        mgr.register_additional_tensors({"draft": draft, "first_view": first_view})
+        mgr.deregister_tensors(["draft"])
+        mgr.register_additional_tensors({"second_view": second_view})
+
+        assert [item.name for item in mgr.tensor_descriptors] == [
+            "main",
+            "first_view",
+            "second_view",
+        ]
+        assert mgr._agent.register_memory.call_count == 2
 
     def test_arena_registration_falls_back_when_tensor_uncovered(self):
         # A tensor outside [base, base+used) must not be served by the single MR.
@@ -440,9 +577,7 @@ class TestReceiveFromSourceManifestValidation:
 
         result = mgr.receive_from_source(
             source_metadata=b"",
-            source_tensors=[
-                TensorDescriptor("indices", 0, 0, 0, str(indices.dtype))
-            ],
+            source_tensors=[TensorDescriptor("indices", 0, 0, 0, str(indices.dtype))],
             remote_agent_name="source",
             require_exact_match=True,
         )
@@ -472,7 +607,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         hetero_bogus = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=2, dtype=str(local.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=2,
+            dtype=str(local.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(
@@ -538,7 +677,11 @@ class TestReceiveFromSourceManifestValidation:
             },
         )
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
             mgr.receive_from_source(
@@ -555,10 +698,18 @@ class TestReceiveFromSourceManifestValidation:
         )
         src = [
             TensorDescriptor(
-                name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+                name="w",
+                addr=0x1000,
+                size=4,
+                device_id=0,
+                dtype="torch.float32",
             ),
             TensorDescriptor(
-                name="extra", addr=0x2000, size=4, device_id=0, dtype="torch.float32",
+                name="extra",
+                addr=0x2000,
+                size=4,
+                device_id=0,
+                dtype="torch.float32",
             ),
         ]
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
@@ -576,7 +727,11 @@ class TestReceiveFromSourceManifestValidation:
             monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
         )
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
             mgr.receive_from_source(
@@ -595,7 +750,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=0, dtype=str(local.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=0,
+            dtype=str(local.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(
@@ -612,7 +771,11 @@ class TestReceiveFromSourceManifestValidation:
         auxiliary = torch.zeros(1, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"__convert__w": auxiliary})
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=0, dtype=str(canonical.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=0,
+            dtype=str(canonical.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(

@@ -16,6 +16,7 @@ keywords.workspace = true
 default = ["gcs", "tls-rustls"]
 openssl = ["tls-native"]
 gcs = ["modelexpress-common/gcs"]
+s3 = ["modelexpress-common/s3"]
 tls-native = [
     "modelexpress-common/tls-native",
     "dep:openssl",
@@ -56,15 +57,14 @@ tokio-openssl = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+hyper-util = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
-tokio-test = "0.4"
-tonic-build = { workspace = true }
 tempfile = "3.20"
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

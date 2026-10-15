@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
 import os
@@ -169,7 +170,8 @@ def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
 
     GLM (Glm4MoeForCausalLM) stores the MTP head as extra decoder layers
     model.layers.{num_hidden_layers + i}, i < num_nextn_predict_layers, with
-    both counts at the top level. Reads the on-disk config, not the runtime
+    both counts at the top level. Multimodal GLM (Glm5NextForConditionalGeneration)
+    nests both counts under text_config. Reads the on-disk config, not the runtime
     draft config: vLLM rewrites num_hidden_layers to 0 for some families (MiMo,
     GLM-Lite), which would then match the ordinary layer 0. Any other shape
     returns () so the selector safely streams all shards. Name forms mirror
@@ -177,6 +179,9 @@ def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
     """
     if not config:
         return ()
+    text_config = config.get("text_config")
+    if "num_hidden_layers" not in config and isinstance(text_config, dict):
+        config = text_config
     base = config.get("num_hidden_layers")
     n = config.get("num_nextn_predict_layers")
     if isinstance(base, bool) or isinstance(n, bool):
@@ -323,7 +328,13 @@ class VllmAdapter(EngineAdapter):
         result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
-        return self._refresh_host_quantization_state(result)
+        result = self._refresh_host_quantization_state(result)
+        # Release idle post-processing storage after the receive is complete,
+        # before later loaders (for example an MTP draft) allocate NCCL buffers.
+        # Live tensors, including registered weight storage, stay allocated.
+        self.accelerator_backend.synchronize()
+        self.accelerator_backend.empty_cache()
+        return result
 
     def apply_weight_iter(
         self,
@@ -447,15 +458,20 @@ class VllmAdapter(EngineAdapter):
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from vllm.model_executor.model_loader.utils import initialize_model
 
-        stale_value = result.value
         stale_model = result.model
+        if stale_model is None:
+            raise RuntimeError("vLLM retry reinitialization requires result.model")
         result.value = None
         result.model = None
-        # Unregister before dropping the model: its registrations identify it,
-        # and clearing them frees its parameters before the rebuild allocates.
         self._unregister_model_layers(stale_model)
-        del stale_value
-        del stale_model
+        # Native tensor aliases can retain child modules through weight-loader
+        # callbacks beyond Python GC. Preserve shared parameterless caches,
+        # such as rotary embeddings, while releasing the discarded weights.
+        for module in list(stale_model.modules()):
+            if module is stale_model or module._parameters:
+                module.__dict__.clear()
+        del module, stale_model
+        gc.collect()
         self.accelerator_backend.empty_cache()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",

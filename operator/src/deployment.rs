@@ -62,13 +62,11 @@ pub fn render(
     // The server wires tonic_health, so use real gRPC probes instead of the
     // chart's TCP socket checks. Liveness is deliberately laxer than
     // readiness: a slow backend should pull the pod from rotation, not
-    // restart it. kubelet's gRPC probe is plaintext only, so a TLS listener
-    // gets TCP probes instead.
-    let (readiness, liveness) = if tls.is_some() {
-        (tcp_probe(spec.port, 5, 10), tcp_probe(spec.port, 15, 30))
-    } else {
-        (grpc_probe(spec.port, 5, 10), grpc_probe(spec.port, 15, 30))
-    };
+    // restart it. A startup probe suspends liveness while it fails, so a
+    // slow cold start is waited out (~5 minutes by default) instead of
+    // restart-looping once the 105s liveness window lapses. kubelet's gRPC
+    // probe is plaintext only, so a TLS listener gets TCP probes instead.
+    let probes = render_probes(spec, tls.is_some());
 
     let mut volume_mounts = vec![mount];
     let mut volumes = vec![volume];
@@ -99,8 +97,9 @@ pub fn render(
         }]),
         env: Some(render_env(spec, tls.as_ref())),
         volume_mounts: Some(volume_mounts),
-        readiness_probe: Some(readiness),
-        liveness_probe: Some(liveness),
+        startup_probe: Some(probes.startup),
+        readiness_probe: Some(probes.readiness),
+        liveness_probe: Some(probes.liveness),
         security_context: Some(container_security_context()),
         resources: Some(spec.resources.clone().unwrap_or_else(default_resources)),
         ..Container::default()
@@ -307,6 +306,51 @@ fn grpc_probe(port: i32, initial_delay: i32, period: i32) -> Probe {
     }
 }
 
+struct RenderedProbes {
+    pub startup: Probe,
+    pub readiness: Probe,
+    pub liveness: Probe,
+}
+
+/// (initial delay, period, failure threshold) per probe. Readiness and
+/// liveness mirror the historical constants, failureThreshold unset so the
+/// apiserver default (3) applies. The startup threshold is explicit: 30
+/// failures at a 10s period buys a slow cold start ~5 minutes before
+/// liveness is allowed to restart the pod.
+const DEFAULT_STARTUP: (i32, i32, Option<i32>) = (5, 10, Some(30));
+const DEFAULT_READINESS: (i32, i32, Option<i32>) = (5, 10, None);
+const DEFAULT_LIVENESS: (i32, i32, Option<i32>) = (15, 30, None);
+
+fn render_probes(spec: &ModelExpressServerSpec, tls: bool) -> RenderedProbes {
+    let overrides = spec.probes.as_ref();
+    let build = |defaults: (i32, i32, Option<i32>),
+                 timing: Option<&crate::crd::ProbeTimingOverrides>| {
+        let initial_delay = timing
+            .and_then(|t| t.initial_delay_seconds)
+            .unwrap_or(defaults.0);
+        let period = timing.and_then(|t| t.period_seconds).unwrap_or(defaults.1);
+        let failure_threshold = timing.and_then(|t| t.failure_threshold).or(defaults.2);
+        let mut probe = if tls {
+            tcp_probe(spec.port, initial_delay, period)
+        } else {
+            grpc_probe(spec.port, initial_delay, period)
+        };
+        probe.failure_threshold = failure_threshold;
+        probe
+    };
+    RenderedProbes {
+        startup: build(DEFAULT_STARTUP, overrides.and_then(|p| p.startup.as_ref())),
+        readiness: build(
+            DEFAULT_READINESS,
+            overrides.and_then(|p| p.readiness.as_ref()),
+        ),
+        liveness: build(
+            DEFAULT_LIVENESS,
+            overrides.and_then(|p| p.liveness.as_ref()),
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -342,6 +386,7 @@ mod tests {
             network_policy: None,
             service_account_name: None,
             image_pull_secrets: None,
+            probes: None,
         }
     }
 
@@ -554,10 +599,92 @@ mod tests {
         spec.port = 9000;
         let state = render("mx", &spec, "img", &TlsSettings::default());
         let c = container(&state);
+        let startup = c.startup_probe.as_ref().expect("startup");
         let readiness = c.readiness_probe.as_ref().expect("readiness");
         let liveness = c.liveness_probe.as_ref().expect("liveness");
+        assert_eq!(startup.grpc.as_ref().expect("grpc").port, 9000);
         assert_eq!(readiness.grpc.as_ref().expect("grpc").port, 9000);
         assert_eq!(liveness.grpc.as_ref().expect("grpc").port, 9000);
+    }
+
+    #[test]
+    fn startup_probe_defaults_give_a_slow_cold_start_five_minutes() {
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
+        let startup = container(&state).startup_probe.as_ref().expect("startup");
+        assert_eq!(startup.initial_delay_seconds, Some(5));
+        assert_eq!(startup.period_seconds, Some(10));
+        assert_eq!(startup.failure_threshold, Some(30));
+    }
+
+    #[test]
+    fn readiness_and_liveness_timings_are_unchanged_by_default() {
+        let state = render("mx", &base_spec(), "img", &TlsSettings::default());
+        let c = container(&state);
+        let readiness = c.readiness_probe.as_ref().expect("readiness");
+        let liveness = c.liveness_probe.as_ref().expect("liveness");
+        assert_eq!(readiness.initial_delay_seconds, Some(5));
+        assert_eq!(readiness.period_seconds, Some(10));
+        assert_eq!(readiness.failure_threshold, None);
+        assert_eq!(liveness.initial_delay_seconds, Some(15));
+        assert_eq!(liveness.period_seconds, Some(30));
+        assert_eq!(liveness.failure_threshold, None);
+    }
+
+    #[test]
+    fn probe_timing_overrides_replace_only_what_is_set() {
+        let mut spec = base_spec();
+        spec.probes = Some(crate::crd::ProbeConfig {
+            startup: Some(crate::crd::ProbeTimingOverrides {
+                failure_threshold: Some(60),
+                ..crate::crd::ProbeTimingOverrides::default()
+            }),
+            readiness: Some(crate::crd::ProbeTimingOverrides {
+                period_seconds: Some(20),
+                ..crate::crd::ProbeTimingOverrides::default()
+            }),
+            liveness: Some(crate::crd::ProbeTimingOverrides {
+                initial_delay_seconds: Some(30),
+                period_seconds: Some(60),
+                failure_threshold: Some(5),
+            }),
+        });
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let c = container(&state);
+        let startup = c.startup_probe.as_ref().expect("startup");
+        let readiness = c.readiness_probe.as_ref().expect("readiness");
+        let liveness = c.liveness_probe.as_ref().expect("liveness");
+        // overridden values win
+        assert_eq!(startup.failure_threshold, Some(60));
+        assert_eq!(readiness.period_seconds, Some(20));
+        assert_eq!(liveness.initial_delay_seconds, Some(30));
+        assert_eq!(liveness.period_seconds, Some(60));
+        assert_eq!(liveness.failure_threshold, Some(5));
+        // unset values keep the operator defaults
+        assert_eq!(startup.initial_delay_seconds, Some(5));
+        assert_eq!(startup.period_seconds, Some(10));
+        assert_eq!(readiness.initial_delay_seconds, Some(5));
+        assert_eq!(readiness.failure_threshold, None);
+    }
+
+    #[test]
+    fn probes_switch_to_tcp_when_tls_is_enabled() {
+        let mut spec = base_spec();
+        spec.tls = Some(crate::crd::TlsConfig {
+            secret_name: "mx-tls".into(),
+            min_version: None,
+            cipher_suites: Vec::new(),
+            groups: Vec::new(),
+        });
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let c = container(&state);
+        for probe in [
+            c.startup_probe.as_ref().expect("startup"),
+            c.readiness_probe.as_ref().expect("readiness"),
+            c.liveness_probe.as_ref().expect("liveness"),
+        ] {
+            assert!(probe.grpc.is_none());
+            assert!(probe.tcp_socket.is_some());
+        }
     }
 
     #[test]

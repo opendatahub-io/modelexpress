@@ -9,8 +9,8 @@
 use modelexpress_operator::crd::{
     AuthMode, CacheConfig, CacheStorage, CredentialsConfig, EmptyDirStorage, ExistingClaimStorage,
     LogConfig, LogFormat, LogLevel, ManagedPvcStorage, MetadataBackend, MetadataOverrides,
-    ModelExpressServerSpec, NetworkPolicyConfig, ReaperConfig, RedisBackend, SecretKeyRef,
-    SecurityConfig, ServiceAccountRef, TlsConfig,
+    ModelExpressServerSpec, NetworkPolicyConfig, ProbeConfig, ProbeTimingOverrides, ReaperConfig,
+    RedisBackend, SecretKeyRef, SecurityConfig, ServiceAccountRef, TlsConfig,
 };
 use modelexpress_operator::deployment::render;
 use modelexpress_operator::tls::TlsSettings;
@@ -142,6 +142,18 @@ fn full_spec() -> ModelExpressServerSpec {
         image_pull_secrets: Some(vec![k8s_openapi::api::core::v1::LocalObjectReference {
             name: "registry-creds".into(),
         }]),
+        probes: Some(ProbeConfig {
+            startup: Some(ProbeTimingOverrides {
+                initial_delay_seconds: Some(10),
+                period_seconds: Some(15),
+                failure_threshold: Some(60),
+            }),
+            readiness: Some(ProbeTimingOverrides {
+                period_seconds: Some(20),
+                ..ProbeTimingOverrides::default()
+            }),
+            liveness: None,
+        }),
     }
 }
 
@@ -251,7 +263,7 @@ fn tls_env(
         .clone()
         .expect("env")
         .into_iter()
-        .filter(|e| e.name.starts_with("MX_TLS_"))
+        .filter(|e| e.name.starts_with("MODEL_EXPRESS_TLS_"))
         .map(|e| (e.name, e.value))
         .collect()
 }
@@ -290,7 +302,11 @@ fn tls_without_defaults_renders_only_what_the_cr_pins() {
     let names: Vec<String> = tls_env(&state).into_iter().map(|(name, _)| name).collect();
     assert_eq!(
         names,
-        ["MX_TLS_CERT_FILE", "MX_TLS_KEY_FILE", "MX_TLS_MIN_VERSION"]
+        [
+            "MODEL_EXPRESS_TLS_CERT_FILE",
+            "MODEL_EXPRESS_TLS_KEY_FILE",
+            "MODEL_EXPRESS_TLS_MIN_VERSION"
+        ]
     );
     assert!(state.service.metadata.annotations.is_none());
 }
@@ -315,12 +331,18 @@ fn tls_pinned_in_cr() {
             .find(|(n, _)| n == name)
             .and_then(|(_, value)| value.clone())
     };
-    assert_eq!(value("MX_TLS_MIN_VERSION").as_deref(), Some("TLS1.2"));
     assert_eq!(
-        value("MX_TLS_CIPHER_SUITES").as_deref(),
+        value("MODEL_EXPRESS_TLS_MIN_VERSION").as_deref(),
+        Some("TLS1.2")
+    );
+    assert_eq!(
+        value("MODEL_EXPRESS_TLS_CIPHER_SUITES").as_deref(),
         Some("ECDHE-RSA-AES256-GCM-SHA384")
     );
-    assert_eq!(value("MX_TLS_GROUPS").as_deref(), Some("secp256r1"));
+    assert_eq!(
+        value("MODEL_EXPRESS_TLS_GROUPS").as_deref(),
+        Some("secp256r1")
+    );
 }
 
 #[test]

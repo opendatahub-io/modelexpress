@@ -624,6 +624,7 @@ mod tests {
                 network_policy: None,
                 service_account_name: None,
                 image_pull_secrets: None,
+                probes: None,
             },
         );
         cr.metadata.generation = Some(1);

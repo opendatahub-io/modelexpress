@@ -91,6 +91,11 @@ EOF
         | grep -c "^  namespace: ${namespace}\$" || true)"
     [[ "${bindings}" -gt 0 && "${subjects}" -eq "${bindings}" ]] \
         || fail "${overlay}: ${subjects} of ${bindings} ClusterRoleBinding subjects were namespaced"
+
+    platform_owned="$(awk '/^---/ { m = 0 } /^metadata:/ { m = 1; next } /^[^ ]/ { m = 0 }
+        m && /^  name: / { print $2; m = 0 }' "${out}" | grep -E '^(openshift|kube)-' || true)"
+    [[ -z "${platform_owned}" ]] \
+        || fail "${overlay} renders objects the platform owns: ${platform_owned}"
 done
 
 echo "==> overlays/odh-xks needs nothing OpenShift provides"
