@@ -806,7 +806,53 @@ async fn create_operand(client: &Client, pki: &Pki, backend: Backend) -> Result<
         .create(&PostParams::default(), &server)
         .await
         .with_context(|| format!("create ModelExpressServer in {namespace}"))?;
-    Ok(())
+    wait_for_operand_pickup(client, backend).await
+}
+
+/// Block until the operator has rendered the operand's Deployment, so later
+/// convergence waits start from a reconciled baseline.
+///
+/// If the operator never reconciles the freshly created CR within the poll
+/// interval, re-patch it with a changing annotation. That bumps the CR's
+/// resourceVersion, which the operator's live watch delivers as a Modified
+/// event, so a reconcile the operator would otherwise have missed is forced
+/// within seconds. Each patch must carry a distinct value or the merge is a
+/// server-side no-op that bumps nothing and wakes no watch, so the counter is
+/// advanced in the outer FnMut, not inside the per-poll future.
+async fn wait_for_operand_pickup(client: &Client, backend: Backend) -> Result<()> {
+    let namespace = backend.namespace();
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let servers = model_express_servers(client, namespace);
+    let mut nudge = 0_u64;
+    eventually(
+        &format!("{backend:?} operand Deployment to be rendered"),
+        CONVERGE,
+        || {
+            nudge = nudge.wrapping_add(1);
+            let nudge = nudge;
+            let deployments = deployments.clone();
+            let servers = servers.clone();
+            async move {
+                if deployments.get_opt(SERVER).await?.is_some() {
+                    return Ok(());
+                }
+                servers
+                    .patch(
+                        SERVER,
+                        &PatchParams::default(),
+                        &Patch::Merge(json!({
+                            "metadata": {
+                                "annotations": {"tls-kind-e2e/nudge": nudge.to_string()},
+                            },
+                        })),
+                    )
+                    .await
+                    .with_context(|| format!("nudge ModelExpressServer in {namespace}"))?;
+                bail!("Deployment not rendered yet");
+            }
+        },
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
