@@ -89,6 +89,17 @@ jobs:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
 
     steps:
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@v2
+      with:
+        android: true
+        dotnet: true
+        haskell: true
+        docker-images: true
+        large-packages: false
+        preinstalled-runtimes: false
+        swap-storage: false
+
     - name: Checkout repository
       uses: actions/checkout@v7
       with:
