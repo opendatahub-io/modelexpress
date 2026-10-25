@@ -338,6 +338,35 @@ impl RedisRefitBackend {
 
 #[async_trait]
 impl RefitBackend for RedisRefitBackend {
+    async fn validate_trainer_mesh_workers(
+        &self,
+        model_name: &str,
+        workers: &HashMap<String, TrainerTensorsMetadata>,
+    ) -> RefitResult<()> {
+        let members: Vec<_> = workers.iter().collect();
+        let mut pipeline = redis::pipe();
+        for (worker_id, _) in &members {
+            pipeline.hgetall(worker_key(worker_id));
+        }
+        let registrations: Vec<HashMap<String, String>> = pipeline
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(redis_error)?;
+        let trainer_role = i32::from(WorkerRole::Trainer).to_string();
+        for ((worker_id, metadata), registration) in members.into_iter().zip(registrations) {
+            if registration.get("worker_id") != Some(worker_id)
+                || registration.get("model_name").map(String::as_str) != Some(model_name)
+                || registration.get("role") != Some(&trainer_role)
+                || registration.get("refit_endpoint") != Some(&metadata.metadata_endpoint)
+            {
+                return Err(RefitBackendError::FailedPrecondition(format!(
+                    "mesh worker {worker_id:?} requires an active trainer registration for the model and binding endpoint"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn find_trainer_mesh_for_request(
         &self,
         request: &CreateTrainerMeshRequest,
@@ -761,7 +790,8 @@ impl RefitBackend for RedisRefitBackend {
             .arg(i32::from(WeightVersionState::Ready))
             .arg(&shard.worker_id)
             .arg(i32::from(WorkerRole::Trainer))
-            .arg(&shard.manifest_endpoint)
+            .arg(&shard.metadata_endpoint)
+            .arg(&shard.stable_metadata_digest)
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -794,6 +824,12 @@ impl RefitBackend for RedisRefitBackend {
             "WORKER_NOT_TRAINER" | "WORKER_NOT_IN_MESH" | "WORKER_ENDPOINT_MISMATCH" => {
                 return Err(RefitBackendError::FailedPrecondition(
                     "worker is not an active trainer member of this logical shard".to_string(),
+                ));
+            }
+            "STABLE_METADATA_MISMATCH" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "trainer stable metadata changed within the current mesh generation"
+                        .to_string(),
                 ));
             }
             "VERSION_NOT_WRITABLE" => {
@@ -849,7 +885,7 @@ impl RefitBackend for RedisRefitBackend {
             shards.retain(|shard| {
                 mesh.workers.get(&shard.worker_id).is_some_and(|metadata| {
                     metadata.logical_shard_id == shard.logical_shard_id
-                        && metadata.metadata_endpoint == shard.manifest_endpoint
+                        && metadata.metadata_endpoint == shard.metadata_endpoint
                 })
             });
             if !shards.is_empty() {
