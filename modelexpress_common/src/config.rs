@@ -319,6 +319,14 @@ pub struct ConnectionConfig {
     /// PEM CA bundle to trust for an `https://` endpoint. System roots when unset.
     #[serde(default)]
     pub tls_ca_file: Option<std::path::PathBuf>,
+
+    /// Total time budget, in seconds, for retrying the initial server connection in the
+    /// smart-fallback download path before falling back to downloading directly from the
+    /// provider (bypassing the server cache). Retries use exponential backoff (250ms,
+    /// doubling, capped at 2s per sleep). `Some(0)` disables waiting (single attempt);
+    /// `None` uses `DEFAULT_CONNECT_WAIT_SECS`.
+    #[serde(default)]
+    pub connect_wait_secs: Option<u64>,
 }
 
 pub fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> String {
@@ -337,6 +345,7 @@ impl Default for ConnectionConfig {
             endpoint: format!("http://localhost:{}", crate::constants::DEFAULT_GRPC_PORT),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
             tls_ca_file: None,
+            connect_wait_secs: Some(crate::constants::DEFAULT_CONNECT_WAIT_SECS),
         }
     }
 }
@@ -347,6 +356,7 @@ impl ConnectionConfig {
             endpoint: normalize_grpc_endpoint(endpoint),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
             tls_ca_file: None,
+            connect_wait_secs: Some(crate::constants::DEFAULT_CONNECT_WAIT_SECS),
         }
     }
 

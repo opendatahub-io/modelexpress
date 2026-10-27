@@ -52,6 +52,11 @@ pub struct ClientArgs {
     #[arg(long, env = crate::envs::MODEL_EXPRESS_TLS_CA_FILE)]
     pub tls_ca_file: Option<PathBuf>,
 
+    /// Seconds to keep retrying the initial server connection before falling back to a
+    /// direct provider download (0 disables waiting)
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_CONNECT_WAIT_SECS)]
+    pub connect_wait_secs: Option<u64>,
+
     /// Cache path override
     #[arg(long, env = crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_path: Option<PathBuf>,
@@ -138,6 +143,10 @@ impl ClientConfig {
 
         if let Some(tls_ca_file) = args.tls_ca_file {
             config.connection.tls_ca_file = Some(tls_ca_file);
+        }
+
+        if let Some(wait) = args.connect_wait_secs {
+            config.connection.connect_wait_secs = Some(wait);
         }
 
         // Cache settings
@@ -409,6 +418,7 @@ mod tests {
             endpoint: Some("cli-override:7777".to_string()),
             timeout: Some(120),
             tls_ca_file: None,
+            connect_wait_secs: Some(7),
             cache_path: None,
             log_level: None,
             log_format: None,
@@ -421,6 +431,7 @@ mod tests {
 
         assert_eq!(config.connection.endpoint, "http://cli-override:7777");
         assert_eq!(config.connection.timeout_secs, Some(120));
+        assert_eq!(config.connection.connect_wait_secs, Some(7));
         assert!(config.logging.quiet);
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);
@@ -451,6 +462,7 @@ mod tests {
             endpoint: None,
             timeout: None,
             tls_ca_file,
+            connect_wait_secs: None,
             cache_path: None,
             log_level: None,
             log_format: None,
