@@ -354,10 +354,17 @@ pub struct MetadataOverrides {
 #[cel_validate(rule = Rule::new(
     "!(has(self.mode) && self.mode == 'enforce') || (has(self.tokenAudiences) && size(self.tokenAudiences) > 0 && has(self.allowedServiceAccounts) && size(self.allowedServiceAccounts) > 0)"
 ).message("enforce mode requires tokenAudiences and allowedServiceAccounts"))]
+#[cel_validate(rule = Rule::new(
+    "!(has(self.tenantIsolation) && self.tenantIsolation == 'enforce') || (has(self.mode) && self.mode == 'enforce')"
+).message("tenantIsolation enforce requires mode enforce"))]
 pub struct SecurityConfig {
     /// MODEL_EXPRESS_SECURITY_MODE.
     #[serde(default)]
     pub mode: AuthMode,
+    /// MODEL_EXPRESS_SECURITY_TENANT_ISOLATION. Scopes P2P sources to the
+    /// caller's verified namespace; requires `mode: enforce`.
+    #[serde(default)]
+    pub tenant_isolation: AuthMode,
     /// MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 32))]
@@ -638,6 +645,7 @@ mod tests {
         let json = crd_json();
         for rule in [
             "!(has(self.mode) && self.mode == 'enforce')",
+            "!(has(self.tenantIsolation) && self.tenantIsolation == 'enforce') || (has(self.mode) && self.mode == 'enforce')",
             "self.heartbeatTimeoutSecs > self.scanIntervalSecs",
             "self.gcTimeoutSecs >= self.heartbeatTimeoutSecs",
             "self.startsWith('redis://')",

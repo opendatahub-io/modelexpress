@@ -358,7 +358,19 @@ How to configure a server whose callers come from more than one namespace:
 On a shared server, every tenant must be in the allowlist, per ServiceAccount or as
 `<namespace>:*`; isolation then scopes each caller to its own namespace, whichever entry
 admitted it. With the Helm chart, set `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through
-`extraEnv`.
+`extraEnv`. With the ModelExpress operator, set it on the `ModelExpressServer`; the CRD
+rejects `tenantIsolation: enforce` without `mode: enforce`:
+
+```yaml
+spec:
+  security:
+    mode: enforce
+    tenantIsolation: enforce
+    tokenAudiences: ["modelexpress"]
+    allowedServiceAccounts:
+      - {namespace: tenant-a, serviceAccount: worker}
+      - {namespace: tenant-b, serviceAccount: worker}
+```
 
 Tenant isolation covers the central server. Engine pods serve the worker gRPC (6555+) and
 the NIXL metadata listener (5555+) directly, so on a multi-tenant cluster restrict those

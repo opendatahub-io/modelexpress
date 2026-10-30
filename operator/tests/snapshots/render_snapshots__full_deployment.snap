@@ -54,6 +54,8 @@ spec:
               value: "true"
             - name: MODEL_EXPRESS_SECURITY_MODE
               value: enforce
+            - name: MODEL_EXPRESS_SECURITY_TENANT_ISOLATION
+              value: enforce
             - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
               value: mx
             - name: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
