@@ -168,11 +168,18 @@ pub struct ModelExpressServerSpec {
 #[derive(CELSchema, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyConfig {
-    /// Who may connect. Deliberately required and non-empty: an empty `from`
-    /// in a NetworkPolicy rule means allow-everywhere, which is what *not*
-    /// setting networkPolicy already gives you.
-    #[schemars(length(min = 1, max = 32))]
+    /// Sources admitted to the gRPC port. Empty admits any source
+    /// (compatibility profile); non-empty admits only these (restrictive
+    /// profile).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
     pub allow_from: Vec<k8s_openapi::api::networking::v1::NetworkPolicyPeer>,
+    /// Sources admitted to the metrics port in the restrictive profile.
+    /// Defaults to openshift-monitoring, openshift-user-workload-monitoring
+    /// and redhat-ods-monitoring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
+    pub monitoring_from: Vec<k8s_openapi::api::networking::v1::NetworkPolicyPeer>,
 }
 
 fn default_replicas() -> i32 {

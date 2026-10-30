@@ -227,7 +227,7 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
         mut deployment,
         mut service,
         pvc,
-        network_policy,
+        mut network_policy,
     } = render(
         name,
         &cr.spec,
@@ -259,15 +259,13 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     api.patch(name, &params, &Patch::Apply(&service)).await?;
 
     let api = Api::<NetworkPolicy>::namespaced(ctx.client.clone(), ns);
-    match network_policy {
-        Some(mut netpol) => {
-            stamp(&mut netpol.metadata, ns, cr.controller_owner_ref(&()));
-            api.patch(name, &params, &Patch::Apply(&netpol)).await?;
-        }
-        // config removed: clean up the stale policy rather than leave a
-        // stray ingress restriction behind
-        None => delete_if_owned(&api, name, &uid).await?,
-    }
+    stamp(
+        &mut network_policy.metadata,
+        ns,
+        cr.controller_owner_ref(&()),
+    );
+    api.patch(name, &params, &Patch::Apply(&network_policy))
+        .await?;
 
     tracing::debug!("desired state applied");
     Ok(())

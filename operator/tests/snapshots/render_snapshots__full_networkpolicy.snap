@@ -12,6 +12,8 @@ metadata:
     istio.io/dataplane-mode: ambient
   name: mx-full
 spec:
+  egress:
+    - {}
   ingress:
     - from:
         - namespaceSelector:
@@ -20,9 +22,22 @@ spec:
       ports:
         - port: 8001
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  - openshift-monitoring
+                  - openshift-user-workload-monitoring
+                  - redhat-ods-monitoring
+      ports:
+        - port: 9401
+          protocol: TCP
   podSelector:
     matchLabels:
       app.kubernetes.io/instance: mx-full
       app.kubernetes.io/name: modelexpress-server
   policyTypes:
     - Ingress
+    - Egress

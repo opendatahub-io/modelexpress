@@ -15,10 +15,11 @@ use k8s_openapi::api::core::v1::{
     SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
-    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
+    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+    NetworkPolicyPort, NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
@@ -27,14 +28,23 @@ pub const CONTAINER_NAME: &str = "server";
 pub const PORT_NAME: &str = "grpc";
 pub const TLS_VOLUME_NAME: &str = "tls";
 
+/// The server's built-in Prometheus port.
+const METRICS_PORT: i32 = 9401;
+
+/// Namespaces admitted to the metrics port when `monitoringFrom` is unset.
+const DEFAULT_MONITORING_NAMESPACES: [&str; 3] = [
+    "openshift-monitoring",
+    "openshift-user-workload-monitoring",
+    "redhat-ods-monitoring",
+];
+
 /// Everything the reconciler applies for one CR. ownerReferences and
 /// namespaces are its job, not the renderer's.
 pub struct DesiredState {
     pub deployment: Deployment,
     pub service: Service,
     pub pvc: Option<PersistentVolumeClaim>,
-    /// None means "no policy desired": the reconciler deletes any stale one.
-    pub network_policy: Option<NetworkPolicy>,
+    pub network_policy: NetworkPolicy,
 }
 
 /// `tls_defaults` fill in what `spec.tls` leaves unset; they only matter when
@@ -164,7 +174,80 @@ pub fn render(
         status: None,
     };
 
-    let network_policy = spec.network_policy.as_ref().map(|np| NetworkPolicy {
+    let network_policy = build_network_policy(cr_name, spec);
+
+    DesiredState {
+        deployment,
+        service,
+        pvc,
+        network_policy,
+    }
+}
+
+/// A TCP `NetworkPolicyPort` for one port.
+fn tcp_port(port: i32) -> NetworkPolicyPort {
+    NetworkPolicyPort {
+        port: Some(IntOrString::Int(port)),
+        protocol: Some("TCP".to_string()),
+        ..NetworkPolicyPort::default()
+    }
+}
+
+/// Default metrics-port sources: the monitoring namespaces, by their immutable
+/// `kubernetes.io/metadata.name` label. Used when `monitoringFrom` is unset.
+fn default_monitoring_peers() -> Vec<NetworkPolicyPeer> {
+    vec![NetworkPolicyPeer {
+        namespace_selector: Some(LabelSelector {
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "kubernetes.io/metadata.name".to_string(),
+                operator: "In".to_string(),
+                values: Some(
+                    DEFAULT_MONITORING_NAMESPACES
+                        .iter()
+                        .map(|ns| (*ns).to_string())
+                        .collect(),
+                ),
+            }]),
+            ..LabelSelector::default()
+        }),
+        ..NetworkPolicyPeer::default()
+    }]
+}
+
+/// The server pods' NetworkPolicy. Without `allowFrom` (compatibility
+/// profile) the gRPC and metrics ports admit any source; with it (restrictive
+/// profile) gRPC admits `allowFrom` and metrics admits `monitoringFrom`.
+/// Egress is allow-all.
+fn build_network_policy(cr_name: &str, spec: &ModelExpressServerSpec) -> NetworkPolicy {
+    let ingress = match spec
+        .network_policy
+        .as_ref()
+        .filter(|np| !np.allow_from.is_empty())
+    {
+        Some(np) => {
+            let monitoring_from = if np.monitoring_from.is_empty() {
+                default_monitoring_peers()
+            } else {
+                np.monitoring_from.clone()
+            };
+            vec![
+                NetworkPolicyIngressRule {
+                    from: Some(np.allow_from.clone()),
+                    ports: Some(vec![tcp_port(spec.port)]),
+                },
+                NetworkPolicyIngressRule {
+                    from: Some(monitoring_from),
+                    ports: Some(vec![tcp_port(METRICS_PORT)]),
+                },
+            ]
+        }
+        None => vec![NetworkPolicyIngressRule {
+            from: None,
+            ports: Some(vec![tcp_port(spec.port), tcp_port(METRICS_PORT)]),
+        }],
+    };
+
+    NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(cr_name.to_string()),
             labels: Some(pod_labels(cr_name, spec)),
@@ -175,24 +258,10 @@ pub fn render(
                 match_labels: Some(selector_labels(cr_name)),
                 ..LabelSelector::default()
             },
-            policy_types: Some(vec!["Ingress".to_string()]),
-            ingress: Some(vec![NetworkPolicyIngressRule {
-                from: Some(np.allow_from.clone()),
-                ports: Some(vec![NetworkPolicyPort {
-                    port: Some(IntOrString::Int(spec.port)),
-                    protocol: Some("TCP".to_string()),
-                    ..NetworkPolicyPort::default()
-                }]),
-            }]),
-            ..NetworkPolicySpec::default()
+            policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
+            ingress: Some(ingress),
+            egress: Some(vec![NetworkPolicyEgressRule::default()]),
         }),
-    });
-
-    DesiredState {
-        deployment,
-        service,
-        pvc,
-        network_policy,
     }
 }
 
@@ -890,6 +959,7 @@ mod tests {
         });
         spec.network_policy = Some(crate::crd::NetworkPolicyConfig {
             allow_from: vec![NetworkPolicyPeer::default()],
+            monitoring_from: vec![],
         });
 
         let state = render("mx", &spec, "img", &TlsSettings::default());
@@ -900,15 +970,7 @@ mod tests {
             ("deployment", &state.deployment.metadata.labels),
             ("service", &state.service.metadata.labels),
             ("pvc", &state.pvc.as_ref().expect("pvc").metadata.labels),
-            (
-                "networkpolicy",
-                &state
-                    .network_policy
-                    .as_ref()
-                    .expect("netpol")
-                    .metadata
-                    .labels,
-            ),
+            ("networkpolicy", &state.network_policy.metadata.labels),
             (
                 "serviceaccount",
                 &rbac.service_account.as_ref().expect("sa").metadata.labels,
@@ -1021,16 +1083,42 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_absent_by_default() {
-        assert!(
-            render("mx", &base_spec(), "img", &TlsSettings::default())
-                .network_policy
-                .is_none()
+    fn network_policy_compatibility_profile_by_default() {
+        let mut spec = base_spec();
+        spec.port = 9000;
+        let np_spec = render("mx", &spec, "img", &TlsSettings::default())
+            .network_policy
+            .spec
+            .expect("spec");
+        assert_eq!(
+            np_spec.policy_types,
+            Some(vec!["Ingress".to_string(), "Egress".to_string()])
+        );
+        let ingress = np_spec.ingress.expect("ingress");
+        assert_eq!(ingress.len(), 1);
+        assert!(ingress[0].from.is_none());
+        let ports: Vec<_> = ingress[0]
+            .ports
+            .as_ref()
+            .expect("ports")
+            .iter()
+            .map(|p| p.port.clone())
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                Some(IntOrString::Int(9000)),
+                Some(IntOrString::Int(METRICS_PORT))
+            ]
+        );
+        assert_eq!(
+            np_spec.egress,
+            Some(vec![NetworkPolicyEgressRule::default()])
         );
     }
 
     #[test]
-    fn network_policy_restricts_grpc_port_to_peers() {
+    fn network_policy_restrictive_profile_splits_grpc_and_metrics() {
         use k8s_openapi::api::networking::v1::NetworkPolicyPeer;
         let mut spec = base_spec();
         spec.port = 9000;
@@ -1046,25 +1134,81 @@ mod tests {
                 }),
                 ..NetworkPolicyPeer::default()
             }],
+            monitoring_from: vec![],
         });
-        let netpol = render("mx", &spec, "img", &TlsSettings::default())
+        let np_spec = render("mx", &spec, "img", &TlsSettings::default())
             .network_policy
-            .expect("netpol");
-        let np_spec = netpol.spec.expect("spec");
+            .spec
+            .expect("spec");
         assert_eq!(
-            np_spec
-                .pod_selector
-                .match_labels
-                .expect("labels")
-                .get("app.kubernetes.io/instance")
-                .map(String::as_str),
-            Some("mx")
+            np_spec.policy_types,
+            Some(vec!["Ingress".to_string(), "Egress".to_string()])
         );
-        assert_eq!(np_spec.policy_types, Some(vec!["Ingress".to_string()]));
-        let rule = &np_spec.ingress.expect("ingress")[0];
-        assert_eq!(rule.from.as_ref().expect("from").len(), 1);
-        let port = &rule.ports.as_ref().expect("ports")[0];
-        assert_eq!(port.port, Some(IntOrString::Int(9000)));
+        let ingress = np_spec.ingress.expect("ingress");
+        assert_eq!(ingress.len(), 2);
+
+        let grpc = &ingress[0];
+        assert_eq!(grpc.from.as_ref().expect("from").len(), 1);
+        assert_eq!(
+            grpc.ports.as_ref().expect("ports")[0].port,
+            Some(IntOrString::Int(9000))
+        );
+
+        let metrics = &ingress[1];
+        assert_eq!(
+            metrics.ports.as_ref().expect("ports")[0].port,
+            Some(IntOrString::Int(METRICS_PORT))
+        );
+        let selector = metrics.from.as_ref().expect("from")[0]
+            .namespace_selector
+            .as_ref()
+            .expect("namespaceSelector");
+        let values = selector.match_expressions.as_ref().expect("exprs")[0]
+            .values
+            .clone()
+            .expect("values");
+        assert!(values.contains(&"openshift-user-workload-monitoring".to_string()));
+    }
+
+    #[test]
+    fn network_policy_honors_explicit_monitoring_from() {
+        use k8s_openapi::api::networking::v1::NetworkPolicyPeer;
+        let mut spec = base_spec();
+        spec.network_policy = Some(crate::crd::NetworkPolicyConfig {
+            allow_from: vec![NetworkPolicyPeer::default()],
+            monitoring_from: vec![NetworkPolicyPeer {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(
+                        [(
+                            "kubernetes.io/metadata.name".to_string(),
+                            "my-monitoring".to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..LabelSelector::default()
+                }),
+                ..NetworkPolicyPeer::default()
+            }],
+        });
+        let np_spec = render("mx", &spec, "img", &TlsSettings::default())
+            .network_policy
+            .spec
+            .expect("spec");
+        let metrics = &np_spec.ingress.expect("ingress")[1];
+        let labels = metrics.from.as_ref().expect("from")[0]
+            .namespace_selector
+            .as_ref()
+            .expect("namespaceSelector")
+            .match_labels
+            .as_ref()
+            .expect("labels");
+        assert_eq!(
+            labels
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str),
+            Some("my-monitoring")
+        );
     }
 
     #[test]

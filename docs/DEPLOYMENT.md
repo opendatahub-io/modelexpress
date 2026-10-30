@@ -680,6 +680,34 @@ helm/deploy.sh --namespace my-ns --values helm/values-local-storage.yaml
 
 See [`../helm/README.md`](../helm/README.md) for the full parameter reference and installation guide.
 
+### Operator NetworkPolicies
+
+The ModelExpress operator reconciles a NetworkPolicy for every `ModelExpressServer`,
+named after the CR and selecting its server pods. The CR owns it, the operator recreates
+it if it is deleted, and the CR reports not ready while it cannot be applied.
+`spec.networkPolicy` selects the profile:
+
+- **Compatibility** (`allowFrom` unset or empty): the gRPC port (`spec.port`) and the
+  metrics port (9401) admit any source.
+- **Restrictive** (`allowFrom` set): the gRPC port admits only `allowFrom`, and the
+  metrics port admits only `monitoringFrom`, which defaults to `openshift-monitoring`,
+  `openshift-user-workload-monitoring` and `redhat-ods-monitoring`.
+
+```yaml
+spec:
+  networkPolicy:
+    allowFrom:
+      - podSelector: {}   # every pod in the server's own namespace
+```
+
+`podSelector: {}` admits the server's whole namespace and nothing outside it; use it
+when that namespace holds only the server's callers. Egress is allow-all, because the
+server downloads from Hugging Face, S3, GCS, NGC and image registries at addresses a
+NetworkPolicy cannot name.
+
+NetworkPolicy covers the pod network only. NIXL traffic over RDMA or another secondary
+network is not filtered by it.
+
 ### Monitoring
 
 The chart defaults to `prometheus.io/*` pod annotations, which
