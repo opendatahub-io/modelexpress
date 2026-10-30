@@ -287,10 +287,19 @@ Other properties to be aware of:
 | `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
+| `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
 
 `enforce` fails config validation if either the audience list or the allowlist is empty,
 so an omitted list can't silently deny-all or accept-any-audience. Configured values
 still need to be correct.
+
+With `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION=enforce`, `PublishMetadata` records the
+caller's verified namespace as the worker's owner, and `ListSources`, `GetMetadata` and
+`UpdateStatus` only see workers owned by the caller's namespace. A `GetMetadata` for
+another namespace's worker returns not found. Ownership is per worker: `mx_source_id`
+carries no namespace, so the same model published from two namespaces shares a source id
+with separate workers. Isolation requires `MODEL_EXPRESS_SECURITY_MODE=enforce` and is off
+by default.
 
 The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
 subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
@@ -331,6 +340,24 @@ volumes:
 |---------|---------|-------------|
 | `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
 | `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
+
+## Multi-tenancy
+
+How to configure a server whose callers come from more than one namespace:
+
+| Topology | Configuration |
+|---|---|
+| Single tenant | Nothing to configure. |
+| One server shared by several namespaces | `MODEL_EXPRESS_SECURITY_MODE=enforce` and `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION=enforce`. |
+| One server per namespace | A NetworkPolicy that admits only the server's own namespace to its gRPC port. |
+
+On a shared server, every tenant's ServiceAccount must be in the allowlist; isolation
+then scopes each caller to its own namespace. With the Helm chart, set
+`MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through `extraEnv`.
+
+Tenant isolation covers the central server. Engine pods serve the worker gRPC (6555+) and
+the NIXL metadata listener (5555+) directly, so on a multi-tenant cluster restrict those
+ports to the pod's own namespace with a NetworkPolicy.
 
 ## Docker
 

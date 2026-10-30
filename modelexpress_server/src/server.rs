@@ -346,7 +346,9 @@ pub async fn run_server(
         }
     }
 
-    let p2p_service = P2pServiceImpl::new(p2p_state.clone());
+    let tenant_isolation =
+        config.security.resolve_tenant_isolation() == crate::config::AuthMode::Enforce;
+    let p2p_service = P2pServiceImpl::with_tenant_isolation(p2p_state.clone(), tenant_isolation);
 
     // Start reaper for stale source detection
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();

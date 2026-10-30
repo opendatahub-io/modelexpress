@@ -38,6 +38,8 @@ pub struct ModelMetadataRecord {
     pub model_name: String,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
+    /// Namespace that published this worker; `None` when tenant isolation is off.
+    pub owner_namespace: Option<String>,
     /// Full SourceIdentity that produced ``source_id``.
     ///
     /// Older records (written before this field was added) leave it ``None``.
@@ -77,6 +79,8 @@ pub struct SourceInstanceInfo {
     pub training_step: Option<u64>,
     /// Stable topology/registry digest, when published by the source.
     pub layout_signature: Option<String>,
+    /// Namespace that published this worker; `None` when tenant isolation is off.
+    pub owner_namespace: Option<String>,
 }
 
 pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) -> Option<u64> {
@@ -346,6 +350,7 @@ pub trait MetadataBackend: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
         pod_namespace: &str,
+        owner_namespace: Option<String>,
     ) -> MetadataResult<()>;
 
     /// Get full tensor metadata for one specific worker.

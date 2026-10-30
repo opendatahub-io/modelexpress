@@ -159,6 +159,9 @@ pub const MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS: &str =
     "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS";
 /// TTL for the verified-token and rejection caches, in seconds.
 pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS";
+/// Namespace tenant isolation (`off`, `enforce`). Off by default; `enforce`
+/// requires `MODEL_EXPRESS_SECURITY_MODE=enforce`.
+pub const MODEL_EXPRESS_SECURITY_TENANT_ISOLATION: &str = "MODEL_EXPRESS_SECURITY_TENANT_ISOLATION";
 
 // ── TLS (server) ────────────────────────────────────────────────────────────
 /// PEM certificate chain the gRPC listener serves (`TlsArgs::cert_file`).

@@ -135,6 +135,7 @@ mod tests {
                 topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
+                owner_namespace: None,
             }])
         });
         mock.expect_update_status()
@@ -169,6 +170,7 @@ mod tests {
                 topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
+                owner_namespace: None,
             }])
         });
         mock.expect_remove_worker()
@@ -201,6 +203,7 @@ mod tests {
                 topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
+                owner_namespace: None,
             }])
         });
         // No update_status or remove_worker calls expected

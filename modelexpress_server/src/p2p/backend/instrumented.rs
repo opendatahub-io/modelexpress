@@ -50,6 +50,7 @@ impl MetadataBackend for InstrumentedMetadataBackend {
         pod_name: &str,
         pod_uid: &str,
         pod_namespace: &str,
+        owner_namespace: Option<String>,
     ) -> MetadataResult<()> {
         self.metrics
             .time(
@@ -62,6 +63,7 @@ impl MetadataBackend for InstrumentedMetadataBackend {
                     pod_name,
                     pod_uid,
                     pod_namespace,
+                    owner_namespace,
                 ),
             )
             .await
@@ -233,7 +235,7 @@ mod tests {
         mock.expect_connect().times(1).returning(|| Ok(()));
         mock.expect_publish_metadata()
             .times(1)
-            .returning(|_, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _, _| Ok(()));
         mock.expect_get_metadata()
             .times(1)
             .returning(|_, _| Ok(None));
@@ -267,6 +269,7 @@ mod tests {
                 "pod",
                 "uid",
                 "namespace",
+                None,
             )
             .await;
         let _ = backend.get_metadata("source-0", "worker-0").await;

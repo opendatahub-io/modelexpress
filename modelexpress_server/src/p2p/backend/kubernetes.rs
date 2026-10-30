@@ -24,6 +24,17 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
+/// Label recording the namespace that published a worker.
+const OWNER_NAMESPACE_LABEL: &str = "modelexpress.nvidia.com/owner-namespace";
+
+fn owner_namespace_of(cr: &ModelMetadata) -> Option<String> {
+    cr.metadata
+        .labels
+        .as_ref()?
+        .get(OWNER_NAMESPACE_LABEL)
+        .cloned()
+}
+
 /// Kubernetes backend for metadata storage
 pub struct KubernetesBackend {
     client: Client,
@@ -217,7 +228,9 @@ impl MetadataBackend for KubernetesBackend {
         pod_name: &str,
         pod_uid: &str,
         pod_namespace: &str,
+        owner_namespace: Option<String>,
     ) -> MetadataResult<()> {
+        let owner_namespace = owner_namespace.as_deref();
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let source_id = source_id.as_str();
         let model_name = &identity.model_name;
@@ -247,6 +260,9 @@ impl MetadataBackend for KubernetesBackend {
                             "modelexpress.nvidia.com/mx-worker-id".to_string(),
                             worker_id.to_string(),
                         );
+                        if let Some(owner) = owner_namespace {
+                            labels.insert(OWNER_NAMESPACE_LABEL.to_string(), owner.to_string());
+                        }
                         labels
                     }),
                     owner_references: pod_owner_references.clone(),
@@ -287,6 +303,17 @@ impl MetadataBackend for KubernetesBackend {
                 &cr_name,
                 &PatchParams::default(),
                 &Patch::Merge(&owner_patch),
+            )
+            .await?;
+        }
+        if let Some(owner) = owner_namespace
+            && owner_namespace_of(&cr).as_deref() != Some(owner)
+        {
+            let label_patch = json!({ "metadata": { "labels": { OWNER_NAMESPACE_LABEL: owner } } });
+            api.patch(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::Merge(&label_patch),
             )
             .await?;
         }
@@ -424,6 +451,8 @@ impl MetadataBackend for KubernetesBackend {
             }
         };
 
+        let owner_namespace = owner_namespace_of(&cr);
+
         let status = match cr.status {
             Some(s) => s,
             None => {
@@ -509,6 +538,7 @@ impl MetadataBackend for KubernetesBackend {
             model_name: cr.spec.model_name.clone(),
             workers,
             published_at,
+            owner_namespace,
             // K8s CRD backend doesn't yet round-trip the full SourceIdentity.
             // v2 RL clients fall back to the sidecar transport (synthetic
             // TensorDescriptor named __mx_v2_meta__) until the CRD schema is
@@ -610,6 +640,8 @@ impl MetadataBackend for KubernetesBackend {
                 .map(|w| w.topology.clone())
                 .unwrap_or_default();
 
+            let owner_namespace = owner_namespace_of(&cr);
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -624,6 +656,7 @@ impl MetadataBackend for KubernetesBackend {
                 // SourceIdentity.extra_parameters.
                 training_step: None,
                 layout_signature: None,
+                owner_namespace,
             });
         }
 
