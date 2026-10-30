@@ -1243,7 +1243,7 @@ spec:
                     allowedServiceAccounts:
                       description: "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS (rendered `ns:sa,...`)."
                       items:
-                        description: "An allowed caller, rendered as `<namespace>:<serviceAccount>`. maxLength bounds keep the regex rules inside the apiserver's CEL cost budget; unbounded strings get costed at worst case and rejected."
+                        description: "An allowed caller, rendered as `<namespace>:<serviceAccount>`. `serviceAccount: \"*\"` admits every ServiceAccount in the namespace. maxLength bounds keep the regex rules inside the apiserver's CEL cost budget; unbounded strings get costed at worst case and rejected."
                         properties:
                           namespace:
                             maxLength: 63
@@ -1255,8 +1255,8 @@ spec:
                             maxLength: 253
                             type: string
                             x-kubernetes-validations:
-                              - message: serviceAccount must be a DNS-1123 subdomain
-                                rule: "self.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')"
+                              - message: "serviceAccount must be '*' or a DNS-1123 subdomain"
+                                rule: "self == '*' || self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')"
                         required:
                           - namespace
                           - serviceAccount

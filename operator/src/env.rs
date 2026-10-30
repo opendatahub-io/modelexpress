@@ -453,6 +453,10 @@ mod tests {
                     namespace: "llm-d".into(),
                     service_account: "prefill".into(),
                 },
+                ServiceAccountRef {
+                    namespace: "tenant-a".into(),
+                    service_account: "*".into(),
+                },
             ],
             cache_ttl_secs: Some(120),
         });
@@ -492,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             value_of(&env, MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS),
-            Some("llm-d:decode,llm-d:prefill")
+            Some("llm-d:decode,llm-d:prefill,tenant-a:*")
         );
         assert_eq!(
             value_of(&env, MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS),

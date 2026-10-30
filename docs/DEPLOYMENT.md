@@ -368,7 +368,7 @@ spec:
     tenantIsolation: enforce
     tokenAudiences: ["modelexpress"]
     allowedServiceAccounts:
-      - {namespace: tenant-a, serviceAccount: worker}
+      - {namespace: tenant-a, serviceAccount: "*"}
       - {namespace: tenant-b, serviceAccount: worker}
 ```
 
