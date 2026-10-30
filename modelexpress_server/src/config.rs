@@ -21,11 +21,112 @@ pub enum AuthMode {
     Enforce,
 }
 
-/// A `<namespace>:<serviceaccount>` pair, parsed from `ns:sa`.
+/// `[a-z0-9]([-a-z0-9]*[a-z0-9])?`, the label pattern Kubernetes names use.
+fn matches_dns1123_label(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn is_dns1123_label(s: &str) -> bool {
+    s.len() <= 63 && matches_dns1123_label(s)
+}
+
+/// Kubernetes' IsDNS1123Subdomain: dot-separated labels, 253 bytes overall.
+fn is_dns1123_subdomain(s: &str) -> bool {
+    s.len() <= 253 && s.split('.').all(matches_dns1123_label)
+}
+
+/// The account half of an allowlist entry: one named ServiceAccount, or `*`
+/// for every ServiceAccount in the namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ServiceAccountMatch {
+    Any,
+    Named(String),
+}
+
+impl ServiceAccountMatch {
+    #[must_use]
+    pub fn admits(&self, service_account: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Named(name) => name == service_account,
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceAccountMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Any => f.write_str("*"),
+            Self::Named(name) => f.write_str(name),
+        }
+    }
+}
+
+impl TryFrom<String> for ServiceAccountMatch {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value == "*" {
+            Ok(Self::Any)
+        } else if is_dns1123_subdomain(&value) {
+            Ok(Self::Named(value))
+        } else {
+            Err(format!(
+                "service account '{value}' must be '*' or a DNS-1123 subdomain"
+            ))
+        }
+    }
+}
+
+impl From<ServiceAccountMatch> for String {
+    fn from(value: ServiceAccountMatch) -> Self {
+        value.to_string()
+    }
+}
+
+/// An allowlist entry, `<namespace>:<serviceaccount>` or `<namespace>:*`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ServiceAccountRefFields")]
 pub struct ServiceAccountRef {
     pub namespace: String,
-    pub service_account: String,
+    pub service_account: ServiceAccountMatch,
+}
+
+#[derive(Deserialize)]
+struct ServiceAccountRefFields {
+    namespace: String,
+    service_account: String,
+}
+
+impl TryFrom<ServiceAccountRefFields> for ServiceAccountRef {
+    type Error = String;
+
+    fn try_from(fields: ServiceAccountRefFields) -> Result<Self, Self::Error> {
+        Self::new(&fields.namespace, fields.service_account)
+    }
+}
+
+impl ServiceAccountRef {
+    pub fn new(namespace: &str, service_account: impl Into<String>) -> Result<Self, String> {
+        if !is_dns1123_label(namespace) {
+            return Err(format!("namespace '{namespace}' must be a DNS-1123 label"));
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            service_account: ServiceAccountMatch::try_from(service_account.into())?,
+        })
+    }
+
+    #[must_use]
+    pub fn admits(&self, namespace: &str, service_account: &str) -> bool {
+        self.namespace == namespace && self.service_account.admits(service_account)
+    }
 }
 
 impl std::fmt::Display for ServiceAccountRef {
@@ -41,17 +142,8 @@ impl std::str::FromStr for ServiceAccountRef {
         let (namespace, service_account) = s
             .split_once(':')
             .ok_or_else(|| format!("expected '<namespace>:<serviceaccount>', got '{s}'"))?;
-        let namespace = namespace.trim();
-        let service_account = service_account.trim();
-        if namespace.is_empty() || service_account.is_empty() {
-            return Err(format!(
-                "namespace and service account must both be non-empty in '{s}'"
-            ));
-        }
-        Ok(Self {
-            namespace: namespace.to_string(),
-            service_account: service_account.to_string(),
-        })
+        Self::new(namespace.trim(), service_account.trim())
+            .map_err(|error| format!("invalid allowlist entry '{s}': {error}"))
     }
 }
 
@@ -159,7 +251,8 @@ pub struct SecurityArgs {
     )]
     pub token_audiences: Option<CommaList<String>>,
 
-    /// Comma-separated allowed callers as `<namespace>:<serviceaccount>`.
+    /// Comma-separated allowed callers as `<namespace>:<serviceaccount>`, or
+    /// `<namespace>:*` for every ServiceAccount in a namespace.
     #[arg(
         long = "security-allowed-service-accounts",
         env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
@@ -697,7 +790,7 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::*;
     use chrono::Duration;
     use clap::Parser;
     use modelexpress_common::config::{DurationConfig, parse_duration_string};
@@ -1105,28 +1198,145 @@ mod tests {
     fn service_account_ref_parses_namespace_and_sa() {
         let parsed: ServiceAccountRef = "vllm:worker".parse().expect("valid ns:sa");
         assert_eq!(parsed.namespace, "vllm");
-        assert_eq!(parsed.service_account, "worker");
+        assert_eq!(
+            parsed.service_account,
+            ServiceAccountMatch::Named("worker".to_string())
+        );
         assert_eq!(parsed.to_string(), "vllm:worker");
         let trimmed: ServiceAccountRef = "  ns : sa ".parse().expect("trims");
         assert_eq!(trimmed, "ns:sa".parse().expect("valid"));
+        let dotted: ServiceAccountRef = "ns:a.b-c".parse().expect("subdomain");
+        assert_eq!(dotted.to_string(), "ns:a.b-c");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn service_account_ref_parses_a_namespace_wildcard() {
+        let parsed: ServiceAccountRef = "tenant-a:*".parse().expect("valid ns:*");
+        assert_eq!(parsed.namespace, "tenant-a");
+        assert_eq!(parsed.service_account, ServiceAccountMatch::Any);
+        assert_eq!(parsed.to_string(), "tenant-a:*");
+        assert!(parsed.admits("tenant-a", "qwen-kserve"));
+        assert!(parsed.admits("tenant-a", "default"));
+        assert!(!parsed.admits("tenant-b", "qwen-kserve"));
+        assert!(!parsed.admits("tenant-a-x", "qwen-kserve"));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn named_entry_admits_only_that_account() {
+        let parsed: ServiceAccountRef = "vllm:worker".parse().expect("valid");
+        assert!(parsed.admits("vllm", "worker"));
+        assert!(!parsed.admits("vllm", "worker2"));
+        assert!(!parsed.admits("vllm2", "worker"));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_mixed_allowlist_admits_by_namespace_and_by_account() {
+        let entries: CommaList<ServiceAccountRef> = "tenant-a:*,tenant-b:worker,tenant-b:router"
+            .parse()
+            .expect("valid list");
+        let entries = entries.into_inner();
+        let admits = |namespace: &str, service_account: &str| {
+            entries
+                .iter()
+                .any(|entry| entry.admits(namespace, service_account))
+        };
+        assert!(admits("tenant-a", "anything"));
+        assert!(admits("tenant-b", "worker"));
+        assert!(admits("tenant-b", "router"));
+        assert!(!admits("tenant-b", "anything"));
+        assert!(!admits("tenant-c", "worker"));
     }
 
     #[test]
     fn service_account_ref_rejects_malformed() {
-        assert!("noseparator".parse::<ServiceAccountRef>().is_err());
-        assert!(":sa".parse::<ServiceAccountRef>().is_err());
-        assert!("ns:".parse::<ServiceAccountRef>().is_err());
+        let too_long_namespace = format!("{}:sa", "a".repeat(64));
+        let too_long_account = format!("ns:{}", "a".repeat(254));
+        for bad in [
+            "noseparator",
+            ":sa",
+            "ns:",
+            "*:sa",
+            "*:*",
+            "ns:worker-*",
+            "ns:**",
+            "NS:sa",
+            "ns:Worker",
+            "ns:-sa",
+            "ns:sa-",
+            "ns:sa_x",
+            "ns:a..b",
+            "-ns:sa",
+            "n.s:sa",
+            "ns:a:b",
+            too_long_namespace.as_str(),
+            too_long_account.as_str(),
+        ] {
+            assert!(
+                bad.parse::<ServiceAccountRef>().is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        let longest_namespace = format!("{}:sa", "a".repeat(63));
+        assert!(longest_namespace.parse::<ServiceAccountRef>().is_ok());
+        let longest_account = format!("ns:{}", "a".repeat(253));
+        assert!(longest_account.parse::<ServiceAccountRef>().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn service_account_ref_round_trips_through_the_config_file_form() {
+        let entries: Vec<ServiceAccountRef> = serde_json::from_value(serde_json::json!([
+            {"namespace": "vllm", "service_account": "worker"},
+            {"namespace": "tenant-a", "service_account": "*"},
+        ]))
+        .expect("valid entries");
+        assert_eq!(
+            entries,
+            vec![
+                "vllm:worker".parse().expect("valid"),
+                "tenant-a:*".parse().expect("valid"),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&entries).expect("serializes"),
+            serde_json::json!([
+                {"namespace": "vllm", "service_account": "worker"},
+                {"namespace": "tenant-a", "service_account": "*"},
+            ])
+        );
+        for bad in [
+            serde_json::json!({"namespace": "*", "service_account": "worker"}),
+            serde_json::json!({"namespace": "vllm", "service_account": "Worker"}),
+            serde_json::json!({"namespace": "vllm", "service_account": "w*"}),
+        ] {
+            assert!(
+                serde_json::from_value::<ServiceAccountRef>(bad.clone()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]
     #[allow(clippy::expect_used)]
     fn comma_list_parses_and_skips_blanks() {
         let list: CommaList<ServiceAccountRef> =
-            "a:one, b:two ,, c:three".parse().expect("valid list");
+            "a:one, b:two ,, c:three, d:*".parse().expect("valid list");
         let items = list.into_inner();
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
         assert_eq!(items[1].namespace, "b");
-        assert_eq!(items[2].service_account, "three");
+        assert_eq!(
+            items[2].service_account,
+            ServiceAccountMatch::Named("three".to_string())
+        );
+        assert_eq!(items[3].service_account, ServiceAccountMatch::Any);
+        assert!(
+            "a:one,B:two"
+                .parse::<CommaList<ServiceAccountRef>>()
+                .is_err()
+        );
 
         let empty: CommaList<String> = "  ".parse().expect("empty");
         assert!(empty.into_inner().is_empty());
@@ -1145,7 +1355,7 @@ mod tests {
 
         security.allowed_service_accounts = vec![ServiceAccountRef {
             namespace: "vllm".to_string(),
-            service_account: "worker".to_string(),
+            service_account: ServiceAccountMatch::Named("worker".to_string()),
         }];
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
@@ -1163,7 +1373,7 @@ mod tests {
             token_audiences: vec!["modelexpress".to_string()],
             allowed_service_accounts: vec![ServiceAccountRef {
                 namespace: "vllm".to_string(),
-                service_account: "worker".to_string(),
+                service_account: ServiceAccountMatch::Any,
             }],
             tenant_isolation: Some(AuthMode::Enforce),
             ..SecurityConfig::default()

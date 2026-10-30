@@ -123,17 +123,22 @@ fn unauthenticated_review() -> TokenReview {
     }
 }
 
-fn security_config() -> SecurityConfig {
+fn security_config_allowing(entry: &str) -> SecurityConfig {
     SecurityConfig {
         mode: Some(AuthMode::Enforce),
         token_audiences: vec!["modelexpress".to_string()],
-        allowed_service_accounts: vec![ServiceAccountRef {
-            namespace: "vllm".to_string(),
-            service_account: "worker".to_string(),
-        }],
+        allowed_service_accounts: vec![
+            entry
+                .parse::<ServiceAccountRef>()
+                .expect("valid allowlist entry"),
+        ],
         cache_ttl_secs: 60,
         tenant_isolation: None,
     }
+}
+
+fn security_config() -> SecurityConfig {
+    security_config_allowing("vllm:worker")
 }
 
 fn grpc_code(error: &Error) -> Option<tonic::Code> {
@@ -198,4 +203,27 @@ async fn token_auth_end_to_end() {
         "expected UNAUTHENTICATED, got: {error}"
     );
     stop_and_join(shutdown, handle).await;
+
+    // A namespace entry admits any ServiceAccount in that namespace, and only there.
+    for (username, expected) in [
+        ("system:serviceaccount:vllm:router", None),
+        ("system:serviceaccount:vllm:qwen-kserve", None),
+        (
+            "system:serviceaccount:vllm-b:router",
+            Some(tonic::Code::PermissionDenied),
+        ),
+    ] {
+        let port = free_port();
+        let (kube_client, _calls) = fake_kube_client_for_review(token_review_for(username));
+        let (shutdown, handle) =
+            start_auth_server(port, kube_client, security_config_allowing("vllm:*"));
+        let mut client = connect_client(port).await;
+        let result = client.health_check().await;
+        assert_eq!(
+            result.as_ref().err().and_then(|error| grpc_code(error)),
+            expected,
+            "{username} under vllm:* got {result:?}"
+        );
+        stop_and_join(shutdown, handle).await;
+    }
 }

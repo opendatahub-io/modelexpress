@@ -247,13 +247,14 @@ See the [RL checkpoint cache reference](rl/CONFIGURATION.md#generator-refit-chec
 
 Optional, off by default. When enabled, the server authenticates every gRPC caller
 (except health checks) against a Kubernetes ServiceAccount token and authorizes them
-against an exact-match allowlist. No sidecar or service mesh is required: the server
-calls the Kubernetes `TokenReview` API in-process.
+against an allowlist of ServiceAccounts and namespaces. No sidecar or service mesh is
+required: the server calls the Kubernetes `TokenReview` API in-process.
 
 - **AuthN**: the caller presents a projected ServiceAccount token; the server verifies it
   via `TokenReview` and extracts `system:serviceaccount:<namespace>:<serviceaccount>`.
-- **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
-  entry.
+- **AuthZ**: that `<namespace>:<serviceaccount>` must match a configured allowlist
+  entry: either the same `<namespace>:<serviceaccount>`, or `<namespace>:*`, which admits
+  every ServiceAccount in that namespace.
 
 > **Warning: only enable auth over an encrypted transport.** The server and clients
 > speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
@@ -285,13 +286,16 @@ Other properties to be aware of:
 |---------|---------|-------------|
 | `MODEL_EXPRESS_SECURITY_MODE` | `off` | `off` \| `enforce` |
 | `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
-| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated allowlist of `<namespace>:<serviceaccount>` or `<namespace>:*` entries. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
 | `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
 
 `enforce` fails config validation if either the audience list or the allowlist is empty,
-so an omitted list can't silently deny-all or accept-any-audience. Configured values
-still need to be correct.
+so an omitted list can't silently deny-all or accept-any-audience. Every entry is
+validated at startup: the namespace must be a DNS-1123 label and the ServiceAccount a
+DNS-1123 subdomain or exactly `*`. There is no cluster-wide wildcard (`*:*`, `*:sa`)
+and no partial pattern (`ns:worker-*`). A `<namespace>:*` entry admits every
+ServiceAccount in that namespace, including ones created later.
 
 With `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION=enforce`, `PublishMetadata` records the
 caller's verified namespace as the worker's owner, and `ListSources`, `GetMetadata` and
@@ -351,9 +355,10 @@ How to configure a server whose callers come from more than one namespace:
 | One server shared by several namespaces | `MODEL_EXPRESS_SECURITY_MODE=enforce` and `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION=enforce`. |
 | One server per namespace | A NetworkPolicy that admits only the server's own namespace to its gRPC port. |
 
-On a shared server, every tenant's ServiceAccount must be in the allowlist; isolation
-then scopes each caller to its own namespace. With the Helm chart, set
-`MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through `extraEnv`.
+On a shared server, every tenant must be in the allowlist, per ServiceAccount or as
+`<namespace>:*`; isolation then scopes each caller to its own namespace, whichever entry
+admitted it. With the Helm chart, set `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through
+`extraEnv`.
 
 Tenant isolation covers the central server. Engine pods serve the worker gRPC (6555+) and
 the NIXL metadata listener (5555+) directly, so on a multi-tenant cluster restrict those
@@ -1513,7 +1518,7 @@ For a server deployed as `modelexpress-server` in a namespace named `modelexpres
 Three consequences:
 
 - **Ownership falls back to the reaper.** Kubernetes does not let a Pod own a namespaced object in another namespace, so `ModelMetadata` CRs published by workers outside the server's `MX_METADATA_NAMESPACE` carry no `ownerReference` — the cross-namespace identity behavior described under [Distributed backend selection](#distributed-backend-selection). Rather than disappearing with the Pod, those records go STALE after `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s) and are garbage-collected after `MX_GC_TIMEOUT_SECS` (default 3600s); see [Source Lifecycle](metadata.md#source-lifecycle). Setting `POD_NAME` / `POD_UID` / `POD_NAMESPACE` on such workers is harmless — ignored for ownership, and used if the worker later moves into the server's namespace.
-- **The auth allowlist is per ServiceAccount.** `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` is an exact-match list of `<namespace>:<serviceaccount>`, so under `enforce` a shared server needs one entry per allowed ServiceAccount in each workload namespace — two entries for `vllm:worker` and `vllm:router`, not one for `vllm`. Every workload namespace adds its own entries. See [ServiceAccount Authentication](#serviceaccount-authentication).
+- **The auth allowlist names every workload namespace.** Under `enforce`, `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` needs either one `<namespace>:<serviceaccount>` entry per allowed ServiceAccount (`vllm:worker` and `vllm:router`) or one `vllm:*` entry for the whole namespace. Every workload namespace adds its own entries. See [ServiceAccount Authentication](#serviceaccount-authentication).
 - **Model files stay per namespace.** PersistentVolumeClaims are namespaced, and the engine reads the model's config and tokenizer from the `--model` path even when every weight arrives over RDMA. That path must still resolve inside the worker's own namespace.
 
 #### K8s-Service-Routed Backend
