@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod manifest;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, interval};
@@ -9,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::cache::manifest::DownloadManifest;
 use crate::registry::backend::ModelRecord;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -437,6 +440,10 @@ impl CacheEvictionService {
                 .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
         }
 
+        if let Err(e) = DownloadManifest::remove(&self.cache_directory, entry_key) {
+            warn!("Failed to remove the download manifest for '{entry_key}': {e:#}");
+        }
+
         // Only remove from registry after successful filesystem deletion
         self.registry.delete_model(entry_key).await?;
 
@@ -490,10 +497,15 @@ pub struct CacheStats {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use crate::cache::*;
     use crate::registry::backend::MockRegistryBackend;
     use modelexpress_common::models::ModelProvider;
     use tempfile::TempDir;
+
+    #[cfg(feature = "memory-backend")]
+    use crate::registry::backend::{
+        ClaimOutcome, RegistryBackend, memory::InMemoryRegistryBackend,
+    };
 
     fn service_with_mock(
         mock: MockRegistryBackend,
@@ -882,6 +894,68 @@ mod tests {
             evict_and_report_surviving_snapshots(&key(Some("abc123"), false), vec![])
                 .await
                 .is_empty()
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn test_evict_removes_only_its_own_download_manifest() {
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let cache_dir = TempDir::new().expect("Failed to create cache directory");
+        let evicted = key(Some("abc123"), false);
+        let kept = key(Some("def456"), false);
+        for (entry_key, commit) in [(&evicted, "abc123"), (&kept, "def456")] {
+            assert_eq!(
+                backend
+                    .try_claim_for_download(
+                        entry_key,
+                        ModelProvider::HuggingFace,
+                        "claim",
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("claim"),
+                ClaimOutcome::Claimed
+            );
+            assert!(
+                backend
+                    .finish_download_claim(
+                        entry_key,
+                        ModelProvider::HuggingFace,
+                        "claim",
+                        ModelStatus::DOWNLOADED,
+                        None,
+                    )
+                    .await
+                    .expect("finish claim")
+            );
+            let snapshot = cache_dir
+                .path()
+                .join("models--test--model/snapshots")
+                .join(commit);
+            std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+            std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+            DownloadManifest::new(entry_key.as_str(), [(PathBuf::from("config.json"), 2)])
+                .write(cache_dir.path())
+                .expect("Failed to write manifest");
+        }
+
+        let service = CacheEvictionService::new(
+            Arc::new(RegistryManager::with_backend(backend.clone())),
+            CacheEvictionConfig::default(),
+            cache_dir.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
+        service.evict_model(&evicted).await.expect("evict");
+
+        assert_eq!(DownloadManifest::read(cache_dir.path(), &evicted), None);
+        assert!(DownloadManifest::read(cache_dir.path(), &kept).is_some());
+        assert!(
+            backend
+                .get_model_record(&evicted)
+                .await
+                .expect("read record")
+                .is_none()
         );
     }
 

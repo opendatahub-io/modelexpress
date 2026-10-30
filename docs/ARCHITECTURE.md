@@ -84,6 +84,8 @@ ModelExpress/
 │       ├── config.rs                   # ServerConfig, layered loading, validation
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
+│       ├── cache/
+│       │   └── manifest.rs             # Per-volume record of each completed download's files
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
 │       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
 │       ├── metrics/
@@ -337,7 +339,7 @@ Six proto files define the server's gRPC services, all compiled via `tonic-build
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
-`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. Each completed download writes a manifest of the files it left in the snapshot, with their sizes, to `<cache>/.modelexpress/downloads/<sha256(entry key)>.json`. The registry is shared by every replica and outlives an `emptyDir` cache, so a record is a cache hit only when this replica's manifest for it exists and every listed file is present at its recorded size. Otherwise (the volume was replaced, a `model clear` removed local storage, or a metadata-only download repopulated the snapshot without weights) the stale record is deleted and the download is re-claimed. If the record cannot be cleared, the request fails. A download that leaves no files is recorded as `ERROR`, and eviction removes the entry's manifest.
 
 #### Pinned revisions
 
