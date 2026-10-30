@@ -288,7 +288,7 @@ Other properties to be aware of:
 | `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated allowlist of `<namespace>:<serviceaccount>` or `<namespace>:*` entries. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
-| `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
+| `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source and the model cache to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
 
 `enforce` fails config validation if either the audience list or the allowlist is empty,
 so an omitted list can't silently deny-all or accept-any-audience. Every entry is
@@ -359,6 +359,28 @@ On a shared server, every tenant must be in the allowlist, per ServiceAccount or
 `<namespace>:*`; isolation then scopes each caller to its own namespace, whichever entry
 admitted it. With the Helm chart, set `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through
 `extraEnv`.
+
+### Model cache on a shared server
+
+With isolation on, the server keeps a separate cache partition per caller namespace,
+`<cache>/.modelexpress/tenants/<namespace>`. `EnsureModelDownloaded`, `ListModelFiles`,
+`StreamModelFiles` and `DeleteModel` only see the caller's partition, so `model clear`
+removes only that namespace's entries. Models cached before isolation was turned on
+stay at the cache root and are not served to any namespace. Eviction and the download
+manifest check work per partition.
+
+Partitions share nothing: two namespaces using the same model each download and store a
+copy, so size the cache volume for the number of namespaces using each model. There are
+no per-namespace quotas.
+
+Downloads use the server's own credentials (`HF_TOKEN` or the Hugging Face token file,
+`NGC_API_KEY`, GCS application default credentials, the S3 credential chain), so every
+allowlisted namespace can fetch anything those credentials can reach. Give a shared
+server only credentials that every allowlisted namespace may use, or none. A namespace
+that needs models under its own credentials should run its own server or download on
+the client side.
+
+### Engine pods
 
 Tenant isolation covers the central server. Engine pods serve the worker gRPC (6555+) and
 the NIXL metadata listener (5555+) directly, so on a multi-tenant cluster restrict those

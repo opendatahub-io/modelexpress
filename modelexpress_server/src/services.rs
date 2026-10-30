@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::auth::CallerIdentity;
 use crate::cache::manifest::DownloadManifest;
 use crate::metrics::grpc::RpcOutcome;
 use crate::metrics::registry::{DownloadMetrics, RegistryMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
-use crate::registry::entry_key::EntryKey;
+use crate::registry::entry_key::{EntryKey, Tenant, partition};
 use crate::registry::state::RegistryManager;
 use modelexpress_common::{
     cache::{CacheConfig, resolve_model_path},
@@ -40,7 +41,7 @@ static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 /// download, so it should complete quickly or not at all.
 const REVISION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Get the configured cache directory for model downloads
+/// Get the configured cache root for model downloads
 fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     // Try to get cache configuration
     if let Ok(config) = CacheConfig::discover() {
@@ -90,6 +91,7 @@ fn record_download(
 /// drift when a tag moves.
 #[derive(Debug, Clone)]
 pub struct DownloadTarget {
+    pub tenant: Option<Tenant>,
     pub model_name: String,
     pub provider: ModelProvider,
     pub revision: Option<String>,
@@ -104,8 +106,14 @@ impl DownloadTarget {
             self.revision.clone(),
             self.ignore_weights,
         )
+        .in_tenant(self.tenant.clone())
         .to_string()
     }
+}
+
+/// `tenant`'s cache partition, or the cache root when isolation is off.
+fn cache_dir_for(tenant: Option<&Tenant>) -> Option<PathBuf> {
+    get_server_cache_dir().map(|root| partition(&root, tenant))
 }
 
 /// Resolve a requested revision to the immutable revision the download will use.
@@ -254,12 +262,50 @@ impl ApiService for ApiServiceImpl {
 #[derive(Clone)]
 pub struct ModelServiceImpl {
     tracker: Arc<ModelDownloadTracker>,
+    /// Confine every request to the caller's cache partition.
+    tenant_isolation: bool,
 }
 
 impl ModelServiceImpl {
     /// Each server owns its tracker, so multiple servers can run in one process.
     pub fn new(tracker: Arc<ModelDownloadTracker>) -> Self {
-        Self { tracker }
+        Self::with_tenant_isolation(tracker, false)
+    }
+
+    pub fn with_tenant_isolation(
+        tracker: Arc<ModelDownloadTracker>,
+        tenant_isolation: bool,
+    ) -> Self {
+        Self {
+            tracker,
+            tenant_isolation,
+        }
+    }
+
+    /// The cache partition a request is confined to, or `None` when isolation is off.
+    /// Fails with `UNAUTHENTICATED` when isolation is on and the request carries no
+    /// verified caller.
+    #[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+    fn scope<T>(&self, request: &Request<T>) -> Result<Option<Tenant>, Status> {
+        if !self.tenant_isolation {
+            return Ok(None);
+        }
+        let Some(caller) = request.extensions().get::<CallerIdentity>() else {
+            error!(
+                "tenant isolation is enabled but the request carries no verified caller \
+                 identity; rejecting"
+            );
+            return Err(Status::unauthenticated(
+                "tenant isolation requires an authenticated caller",
+            ));
+        };
+        Tenant::new(&caller.namespace).map(Some).ok_or_else(|| {
+            error!(
+                "caller namespace '{}' is not a DNS-1123 label; rejecting",
+                caller.namespace
+            );
+            Status::permission_denied("caller namespace is not a valid namespace")
+        })
     }
 }
 
@@ -358,6 +404,7 @@ impl ModelService for ModelServiceImpl {
         request: Request<ModelDownloadRequest>,
     ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
         info!("Starting model download stream");
+        let tenant = self.scope(&request)?;
         let model_request = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
@@ -378,12 +425,13 @@ impl ModelService for ModelServiceImpl {
         let revision = resolve_target_revision(
             &model_name,
             provider,
-            get_server_cache_dir(),
+            cache_dir_for(tenant.as_ref()),
             model_request.revision.as_deref(),
         )
         .await?;
 
         let target = DownloadTarget {
+            tenant,
             model_name: model_name.clone(),
             provider,
             revision: revision.clone(),
@@ -426,6 +474,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+        let tenant = self.scope(&request)?;
         let files_request = request.into_inner();
         let chunk_size = if files_request.chunk_size == 0 {
             constants::DEFAULT_TRANSFER_CHUNK_SIZE
@@ -450,8 +499,7 @@ impl ModelService for ModelServiceImpl {
             model_name, chunk_size
         );
 
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request. A requested revision
@@ -622,6 +670,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<ModelFileList>, Status> {
+        let tenant = self.scope(&request)?;
         let files_request = request.into_inner();
 
         // Convert gRPC provider to our enum
@@ -638,8 +687,7 @@ impl ModelService for ModelServiceImpl {
 
         info!("Listing files for model: {}", model_name);
 
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request
@@ -679,6 +727,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<DeleteModelRequest>,
     ) -> Result<Response<DeleteModelResponse>, Status> {
+        let tenant = self.scope(&request)?;
         let delete_request = request.into_inner();
 
         let grpc_provider = GrpcModelProvider::try_from(delete_request.provider).map_err(|_| {
@@ -695,7 +744,9 @@ impl ModelService for ModelServiceImpl {
         // for metadata-only downloads). `model clear` means "forget this model", so drop
         // all of them rather than only the unpinned full-weight entry.
         let tracker = self.tracker.clone();
-        let outcome = tracker.delete_model_entries(&model_name).await;
+        let outcome = tracker
+            .delete_model_entries(tenant.as_ref(), &model_name)
+            .await;
         let removed = outcome.removed;
         info!("Deleted {removed} registry record(s) for model '{model_name}'");
 
@@ -916,21 +967,28 @@ impl ModelDownloadTracker {
         deleted
     }
 
-    /// Deletes every registry entry belonging to `model_name`, whatever revision or
-    /// weight mode each entry covers.
+    /// Deletes every registry entry belonging to `model_name` in `tenant`'s partition,
+    /// whatever revision or weight mode each entry covers.
     ///
     /// The registry-listing failure is swallowed on purpose: the fallback still
     /// clears the common case, which is better than refusing outright. It is
     /// reported in the return value so the caller can say so, because otherwise a
     /// backend outage and a model with no entries are the same `0`.
-    pub async fn delete_model_entries(&self, model_name: &str) -> DeleteEntriesOutcome {
+    pub async fn delete_model_entries(
+        &self,
+        tenant: Option<&Tenant>,
+        model_name: &str,
+    ) -> DeleteEntriesOutcome {
         let records = match self.registry.get_models_by_last_used(None).await {
             Ok(records) => records,
             Err(e) => {
                 error!("Failed to list registry records for '{model_name}': {e}");
                 // Fall back to the unpinned full-weight key so the common case still
                 // clears rather than failing outright.
-                self.delete_status(model_name).await;
+                let fallback = EntryKey::new(model_name, None, false)
+                    .in_tenant(tenant.cloned())
+                    .to_string();
+                self.delete_status(&fallback).await;
                 return DeleteEntriesOutcome {
                     removed: 0,
                     degraded: true,
@@ -940,7 +998,7 @@ impl ModelDownloadTracker {
 
         let mut removed: usize = 0;
         for record in records {
-            if EntryKey::parse(&record.model_name).belongs_to(model_name) {
+            if EntryKey::parse(&record.model_name).belongs_to(tenant, model_name) {
                 // Deleting a record mid-download is a real exit from DOWNLOADING,
                 // and the only one the claim lifecycle cannot see: once the key
                 // is gone, finish_download_claim finds nothing to fence and
@@ -973,13 +1031,14 @@ impl ModelDownloadTracker {
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let entry_key = target.entry_key();
+            let cache_dir = cache_dir_for(target.tenant.as_ref());
             let DownloadTarget {
                 model_name,
                 provider,
                 revision,
                 ignore_weights,
+                ..
             } = target;
-            let cache_dir = get_server_cache_dir();
             let download = download::download_model_revision(
                 &model_name,
                 provider,
@@ -1129,7 +1188,7 @@ impl ModelDownloadTracker {
                     break (ModelStatus::DOWNLOADING, true);
                 }
                 Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)) => {
-                    if model_files_present(get_server_cache_dir(), target).await {
+                    if model_files_present(cache_dir_for(target.tenant.as_ref()), target).await {
                         // Returning an existing downloaded model is a cache hit for LRU purposes.
                         self.touch_and_log(entry_key).await;
                         break (ModelStatus::DOWNLOADED, false);
@@ -1415,6 +1474,7 @@ mod tests {
     /// Unpinned, full-weight target: its entry key is the bare model name.
     fn test_target(model_name: &str) -> DownloadTarget {
         DownloadTarget {
+            tenant: None,
             model_name: model_name.to_string(),
             provider: ModelProvider::HuggingFace,
             revision: None,
@@ -1657,7 +1717,7 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker.delete_model_entries(None, "m").await;
         assert_eq!(outcome.removed, 1);
         assert!(!outcome.degraded);
 
@@ -1684,7 +1744,7 @@ mod tests {
             .returning(|_| Err("backend unreachable".into()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        tracker.delete_model_entries("m").await;
+        tracker.delete_model_entries(None, "m").await;
 
         let encoded = encoded_metrics(&metrics_registry);
         assert_eq!(
@@ -1706,7 +1766,7 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker.delete_model_entries(None, "m").await;
         assert_eq!(outcome.removed, 1, "the record is still removed");
 
         let encoded = encoded_metrics(&metrics_registry);
@@ -1778,6 +1838,7 @@ mod tests {
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
         tracker.spawn_download_task(
             DownloadTarget {
+                tenant: None,
                 model_name: "not-a-valid-ngc-artifact".to_string(),
                 provider: ModelProvider::Ngc,
                 revision: None,
@@ -2831,5 +2892,537 @@ mod tests {
         assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
         assert!(first_chunk.is_last_chunk);
         assert!(first_chunk.is_last_file);
+    }
+
+    fn tenant(namespace: &str) -> Tenant {
+        Tenant::new(namespace).expect("valid namespace")
+    }
+
+    fn pinned_target_in(namespace: &str, ignore_weights: bool) -> DownloadTarget {
+        DownloadTarget {
+            tenant: Some(tenant(namespace)),
+            ..pinned_target(ignore_weights)
+        }
+    }
+
+    fn partition_of(cache: &Path, namespace: &str) -> PathBuf {
+        partition(cache, Some(&tenant(namespace)))
+    }
+
+    fn as_caller<T>(message: T, namespace: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(CallerIdentity {
+            namespace: namespace.to_string(),
+            service_account: "worker".to_string(),
+            pod_name: None,
+            pod_uid: None,
+        });
+        request
+    }
+
+    fn files_request() -> ModelFilesRequest {
+        ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+            chunk_size: 0,
+            file_selector: None,
+            ignore_weights: false,
+            revision: Some(REVISION.to_string()),
+        }
+    }
+
+    fn download_request() -> ModelDownloadRequest {
+        ModelDownloadRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+            ignore_weights: false,
+            revision: Some(REVISION.to_string()),
+        }
+    }
+
+    fn delete_request() -> DeleteModelRequest {
+        DeleteModelRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn listed(
+        service: &ModelServiceImpl,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Vec<String>, tonic::Code> {
+        let mut files: Vec<String> = service
+            .list_model_files(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .files
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect();
+        files.sort();
+        Ok(files)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn streamed(
+        service: &ModelServiceImpl,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Vec<String>, tonic::Code> {
+        let chunks: Vec<FileChunk> = service
+            .stream_model_files(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .map(|chunk| chunk.expect("Expected chunk"))
+            .collect()
+            .await;
+        let mut files: Vec<String> = chunks
+            .into_iter()
+            .map(|chunk| chunk.relative_path)
+            .collect();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn all_file_names() -> Vec<String> {
+        let mut names: Vec<String> = all_files()
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_verified_caller_fail_closed_under_isolation() {
+        let service = ModelServiceImpl::with_tenant_isolation(test_model_service().tracker, true);
+        let code = |result: Result<_, Status>| result.err().map(|status| status.code());
+        assert_eq!(
+            code(
+                service
+                    .ensure_model_downloaded(Request::new(download_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .stream_model_files(Request::new(files_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .list_model_files(Request::new(files_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .delete_model(Request::new(delete_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_namespace_that_is_not_a_namespace_is_rejected() {
+        let service = ModelServiceImpl::with_tenant_isolation(test_model_service().tracker, true);
+        for namespace in ["..", "a/b", ""] {
+            let status = service
+                .list_model_files(as_caller(files_request(), namespace))
+                .await
+                .expect_err("must be rejected");
+            assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "{namespace:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_record_is_satisfied_only_by_its_own_partition() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let a = pinned_target_in("tenant-a", false);
+        let a_partition = partition_of(cache.path(), "tenant-a");
+
+        install(cache.path(), &a, &all_files());
+        install(&partition_of(cache.path(), "tenant-b"), &a, &all_files());
+        assert!(!model_files_present(Some(a_partition.clone()), &a).await);
+
+        install(&a_partition, &a, &all_files());
+        assert!(model_files_present(Some(a_partition), &a).await);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn service_over(
+        backend: Arc<crate::registry::backend::memory::InMemoryRegistryBackend>,
+        tenant_isolation: bool,
+    ) -> ModelServiceImpl {
+        ModelServiceImpl::with_tenant_isolation(Arc::new(tracker_over(backend)), tenant_isolation)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn final_status(
+        service: &ModelServiceImpl,
+        request: Request<ModelDownloadRequest>,
+    ) -> Result<i32, tonic::Code> {
+        let updates: Vec<ModelStatusUpdate> = service
+            .ensure_model_downloaded(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .map(|update| update.expect("Expected an ok status update"))
+            .collect()
+            .await;
+        Ok(updates.last().expect("at least one update").status)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn isolation_off_keeps_the_existing_keys_and_cache_layout() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+
+        let legacy_key = "mx1:abc123:-:test/model";
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        record_downloaded_before_restart(&backend, &pinned_target(false)).await;
+        let before = backend
+            .get_model_record(legacy_key)
+            .await
+            .expect("Failed to read record")
+            .expect("an isolation-off entry key changed");
+        let snapshot = write_snapshot(cache.path(), &all_files());
+        DownloadManifest::new(
+            legacy_key,
+            collect_model_files(&snapshot, &snapshot, None, false),
+        )
+        .write(cache.path())
+        .expect("Failed to write legacy manifest");
+        assert!(cache.path().join(".modelexpress/downloads").is_dir());
+
+        let service = service_over(Arc::clone(&backend), false);
+        assert_eq!(
+            final_status(&service, Request::new(download_request())).await,
+            Ok(downloaded)
+        );
+        assert_eq!(
+            listed(&service, Request::new(files_request())).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            streamed(&service, Request::new(files_request())).await,
+            Ok(all_file_names())
+        );
+        assert!(!cache.path().join(".modelexpress/tenants").exists());
+        let after = backend
+            .get_model_record(legacy_key)
+            .await
+            .expect("Failed to read record")
+            .expect("Expected the legacy record");
+        assert_eq!(
+            after.created_at, before.created_at,
+            "the legacy record was re-downloaded instead of served"
+        );
+        assert_eq!(
+            backend
+                .get_models_by_last_used(None)
+                .await
+                .expect("Failed to list")
+                .into_iter()
+                .map(|record| record.model_name)
+                .collect::<Vec<_>>(),
+            vec![legacy_key.to_string()]
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_tenant_download_lands_in_its_own_partition() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let a_partition = partition_of(cache.path(), "tenant-a");
+        let snapshot = write_snapshot(&a_partition, &all_files());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(Arc::clone(&backend), true);
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-a")).await,
+            Ok(modelexpress_common::grpc::model::ModelStatus::Downloaded as i32)
+        );
+
+        let key = "mxt1:tenant-a:abc123:-:test/model";
+        assert_eq!(key, pinned_target_in("tenant-a", false).entry_key());
+        let record = backend
+            .get_model_record(key)
+            .await
+            .expect("Failed to read record")
+            .expect("Expected the tenant's record");
+        assert_eq!(record.status, ModelStatus::DOWNLOADED);
+        assert!(
+            DownloadManifest::read(&a_partition, key)
+                .expect("Expected the partition's manifest")
+                .is_satisfied_by(&snapshot)
+        );
+        assert_eq!(DownloadManifest::read(cache.path(), key), None);
+        assert!(!cache.path().join("models--test--model").exists());
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tenants_cannot_download_list_or_stream_each_others_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", false),
+            &all_files(),
+        );
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(Arc::clone(&backend), true);
+
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert!(
+            !partition_of(cache.path(), "tenant-b")
+                .join("models--test--model")
+                .exists()
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn isolation_hides_the_unpartitioned_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(cache.path(), &pinned_target(false), &all_files());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(backend, true);
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Err(tonic::Code::NotFound)
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn clearing_a_model_only_touches_the_callers_partition() {
+        use crate::registry::backend::RegistryBackend;
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let a = pinned_target_in("tenant-a", false);
+        let a_metadata = pinned_target_in("tenant-a", true);
+        let b = pinned_target_in("tenant-b", false);
+        let open = pinned_target(false);
+        for target in [&a, &a_metadata, &b, &open] {
+            record_downloaded_before_restart(&backend, target).await;
+        }
+        let keys = async || {
+            let mut keys: Vec<String> = backend
+                .get_models_by_last_used(None)
+                .await
+                .expect("Failed to list")
+                .into_iter()
+                .map(|record| record.model_name)
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let service = service_over(Arc::clone(&backend), true);
+        let response = service
+            .delete_model(as_caller(delete_request(), "tenant-b"))
+            .await
+            .expect("delete")
+            .into_inner();
+        assert!(response.success);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("1 record"))
+        );
+        let mut expected = vec![a.entry_key(), a_metadata.entry_key(), open.entry_key()];
+        expected.sort();
+        assert_eq!(keys().await, expected);
+
+        service
+            .delete_model(as_caller(delete_request(), "tenant-a"))
+            .await
+            .expect("delete");
+        assert_eq!(keys().await, vec![open.entry_key()]);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_partition_that_lost_its_weights_re_downloads_after_a_restart() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let full = pinned_target_in("tenant-a", false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", true),
+            METADATA_FILES,
+        );
+        install(cache.path(), &full, &all_files());
+        install(&partition_of(cache.path(), "tenant-b"), &full, &all_files());
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tracker.ensure_model_downloaded(&full, &tx),
+        )
+        .await
+        .expect("ensure_model_downloaded did not finish");
+        drop(tx);
+
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+        let record = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Download failed")),
+            "unexpected message: {:?}",
+            record.message
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_recorded_partition_download_is_served_after_a_restart_without_the_hub() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let full = pinned_target_in("tenant-a", false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(&partition_of(cache.path(), "tenant-a"), &full, &all_files());
+        let created_at = |record: Option<crate::registry::backend::ModelRecord>| {
+            record.expect("Expected the tenant's record").created_at
+        };
+        let before = created_at(
+            backend
+                .get_model_record(&full.entry_key())
+                .await
+                .expect("Failed to read record"),
+        );
+
+        let service = service_over(Arc::clone(&backend), true);
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-a")).await,
+            Ok(modelexpress_common::grpc::model::ModelStatus::Downloaded as i32)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            created_at(
+                backend
+                    .get_model_record(&full.entry_key())
+                    .await
+                    .expect("Failed to read record")
+            ),
+            before,
+            "the partition's record was re-downloaded instead of served"
+        );
     }
 }
