@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! ServiceAccount `TokenReview` authentication plus an exact-match allowlist.
+//! ServiceAccount `TokenReview` authentication plus an allowlist of
+//! ServiceAccounts and whole namespaces.
 
 mod layer;
 mod token;
@@ -9,7 +10,6 @@ mod token;
 pub use layer::AuthLayer;
 pub use token::CallerIdentity;
 
-use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -82,7 +82,7 @@ impl Hash for TokenCacheKey {
 pub struct AuthState {
     client: Client,
     audiences: Vec<String>,
-    allowlist: HashSet<ServiceAccountRef>,
+    allowlist: Vec<ServiceAccountRef>,
     token_cache: Cache<TokenCacheKey, CallerIdentity>,
     negative_cache: Cache<TokenCacheKey, ()>,
 }
@@ -96,7 +96,7 @@ impl AuthState {
         Self {
             client,
             audiences: config.token_audiences.clone(),
-            allowlist: config.allowed_service_accounts.iter().cloned().collect(),
+            allowlist: config.allowed_service_accounts.clone(),
             token_cache: Cache::builder()
                 .time_to_live(ttl)
                 .max_capacity(Self::TOKEN_CACHE_MAX_ENTRIES)
@@ -137,11 +137,11 @@ impl AuthState {
             }
         };
 
-        let caller = ServiceAccountRef {
-            namespace: identity.namespace.clone(),
-            service_account: identity.service_account.clone(),
-        };
-        if !self.allowlist.contains(&caller) {
+        if !self
+            .allowlist
+            .iter()
+            .any(|entry| entry.admits(&identity.namespace, &identity.service_account))
+        {
             return Err(Denial::PermissionDenied(format!(
                 "service account {}:{} is not in the allowlist",
                 identity.namespace, identity.service_account
@@ -170,10 +170,7 @@ pub(crate) mod test_util {
     use crate::config::{AuthMode, SecurityConfig, ServiceAccountRef};
 
     pub(crate) fn allowed_ref(namespace: &str, service_account: &str) -> ServiceAccountRef {
-        ServiceAccountRef {
-            namespace: namespace.to_string(),
-            service_account: service_account.to_string(),
-        }
+        ServiceAccountRef::new(namespace, service_account).expect("valid allowlist entry")
     }
 
     pub(crate) fn security_config(allowed: Vec<ServiceAccountRef>) -> SecurityConfig {
@@ -292,7 +289,7 @@ pub(crate) mod test_util {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use crate::auth::*;
     use std::sync::atomic::Ordering;
 
     use test_util::{
@@ -393,5 +390,51 @@ mod tests {
             Err(Denial::Unavailable)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_any_account_in_an_allowlisted_namespace() {
+        let (client, calls) = fake_kube_client(vec![
+            token_review_for("system:serviceaccount:tenant-a:qwen-kserve"),
+            token_review_for("system:serviceaccount:tenant-a:llama-kserve"),
+        ]);
+        let config = security_config(vec![allowed_ref("tenant-a", "*")]);
+        let state = AuthState::new(client, &config);
+
+        let qwen = state
+            .verify(&bearer_headers("qwen-token"))
+            .await
+            .expect("namespace entry admits qwen-kserve");
+        let llama = state
+            .verify(&bearer_headers("llama-token"))
+            .await
+            .expect("namespace entry admits llama-kserve");
+
+        assert_eq!(
+            (qwen.namespace.as_str(), qwen.service_account.as_str()),
+            ("tenant-a", "qwen-kserve")
+        );
+        assert_eq!(
+            (llama.namespace.as_str(), llama.service_account.as_str()),
+            ("tenant-a", "llama-kserve")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_namespace_entry_denies_other_namespaces() {
+        let (client, _calls) = fake_kube_client(vec![token_review_for(
+            "system:serviceaccount:tenant-b:qwen-kserve",
+        )]);
+        let config = security_config(vec![allowed_ref("tenant-a", "*")]);
+        let state = AuthState::new(client, &config);
+
+        let error = state
+            .verify(&bearer_headers("tenant-b-token"))
+            .await
+            .expect_err("tenant-a:* must not admit tenant-b");
+        assert!(
+            matches!(error, Denial::PermissionDenied(message) if message.contains("tenant-b:qwen-kserve"))
+        );
     }
 }
