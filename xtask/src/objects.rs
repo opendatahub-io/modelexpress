@@ -10,12 +10,16 @@ use k8s_openapi::api::core::v1::{
     PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
 };
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicySpec,
+};
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use modelexpress_operator::crd::API_GROUP;
+use modelexpress_operator::deployment::{default_monitoring_peers, tcp_port};
 use modelexpress_operator::telemetry;
 use std::collections::BTreeMap;
 
@@ -219,11 +223,16 @@ fn container_security_context() -> SecurityContext {
     }
 }
 
+/// The operator pods' labels, and the selector of everything that targets
+/// them.
+pub fn pod_labels() -> BTreeMap<String, String> {
+    [("app.kubernetes.io/name".to_string(), NAME.to_string())]
+        .into_iter()
+        .collect()
+}
+
 pub fn deployment(image: &str) -> Deployment {
-    let selector: BTreeMap<String, String> =
-        [("app.kubernetes.io/name".to_string(), NAME.to_string())]
-            .into_iter()
-            .collect();
+    let selector = pod_labels();
     Deployment {
         metadata: ObjectMeta {
             name: Some(NAME.to_string()),
@@ -312,11 +321,7 @@ pub fn metrics_service() -> Service {
             ..ObjectMeta::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(
-                [("app.kubernetes.io/name".to_string(), NAME.to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
+            selector: Some(pod_labels()),
             ports: Some(vec![ServicePort {
                 name: Some(telemetry::METRICS_PORT_NAME.to_string()),
                 port: telemetry::METRICS_PORT,
@@ -331,10 +336,39 @@ pub fn metrics_service() -> Service {
     }
 }
 
+/// Ingress to `metrics_port` from the monitoring namespaces.
+pub fn metrics_ingress(metrics_port: i32) -> Vec<NetworkPolicyIngressRule> {
+    vec![NetworkPolicyIngressRule {
+        from: Some(default_monitoring_peers()),
+        ports: Some(vec![tcp_port(metrics_port)]),
+    }]
+}
+
+/// The operator pods' NetworkPolicy: metrics ingress from the monitoring
+/// namespaces and allow-all egress.
+pub fn network_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(NAME.to_string()),
+            labels: Some(labels()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: LabelSelector {
+                match_labels: Some(pod_labels()),
+                ..LabelSelector::default()
+            },
+            policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
+            ingress: Some(metrics_ingress(telemetry::METRICS_PORT)),
+            egress: Some(vec![NetworkPolicyEgressRule::default()]),
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use crate::objects::*;
 
     /// nameReference only resolves if both hold: subject namespace unset, and
     /// the referenced ServiceAccount free to follow the overlay.
@@ -359,5 +393,57 @@ mod tests {
             sa.metadata.namespace, None,
             "the referent must stay free to follow the overlay namespace"
         );
+    }
+
+    #[test]
+    fn network_policy_selects_the_operator_pods_and_not_its_operands() {
+        let spec = network_policy().spec.expect("spec");
+        let deployment = deployment(DEFAULT_IMAGE).spec.expect("spec");
+        assert_eq!(
+            spec.pod_selector.match_labels,
+            deployment.selector.match_labels
+        );
+        assert!(crate::bundle_policy::selects(
+            &spec.pod_selector,
+            &deployment
+                .template
+                .metadata
+                .and_then(|meta| meta.labels)
+                .expect("pod labels")
+        ));
+        assert!(!crate::bundle_policy::selects(
+            &spec.pod_selector,
+            &modelexpress_operator::labels::managed_labels("mx")
+        ));
+    }
+
+    #[test]
+    fn network_policy_admits_only_metrics_from_monitoring() {
+        let spec = network_policy().spec.expect("spec");
+        assert_eq!(
+            spec.policy_types,
+            Some(vec!["Ingress".to_string(), "Egress".to_string()])
+        );
+        assert_eq!(spec.ingress, Some(metrics_ingress(telemetry::METRICS_PORT)));
+        let rule = &spec.ingress.expect("ingress")[0];
+        assert_eq!(rule.from, Some(default_monitoring_peers()));
+        assert_eq!(
+            rule.ports,
+            Some(vec![tcp_port(telemetry::METRICS_PORT)]),
+            "only the metrics port admits pod traffic"
+        );
+        assert_eq!(spec.egress, Some(vec![NetworkPolicyEgressRule::default()]));
+    }
+
+    #[test]
+    fn cluster_role_grants_every_network_policy_verb() {
+        let rule = cluster_role_rules()
+            .into_iter()
+            .find(|rule| rule.resources.as_deref() == Some(&["networkpolicies".to_string()][..]))
+            .expect("a networkpolicies rule");
+        assert_eq!(rule.api_groups, Some(vec!["networking.k8s.io".to_string()]));
+        let mut verbs = rule.verbs.clone();
+        verbs.sort();
+        assert_eq!(verbs, crate::bundle_policy::NETWORK_POLICY_VERBS);
     }
 }

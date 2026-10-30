@@ -705,6 +705,21 @@ when that namespace holds only the server's callers. Egress is allow-all, becaus
 server downloads from Hugging Face, S3, GCS, NGC and image registries at addresses a
 NetworkPolicy cannot name.
 
+The operator's own install bundle (`config/manifests`, including `overlays/odh` and
+`overlays/odh-xks`) ships a NetworkPolicy named `modelexpress-operator` for the operator
+pod. The platform that installs the bundle applies and removes it; the operator does not
+reconcile it.
+
+| Direction | Port | Peers |
+|---|---|---|
+| Ingress | metrics: 8443/TCP on OpenShift, 8080/TCP elsewhere | `openshift-monitoring`, `openshift-user-workload-monitoring`, `redhat-ods-monitoring` |
+| Ingress | health: 8081/TCP | Kubelet probes only; NetworkPolicy always admits the pod's own node. |
+| Egress | all | Allow-all |
+
+`cargo xtask check-bundle <rendered.yaml>` checks a kustomize render of the bundle
+against the ADR-0016 bundle rules, and `ci/check-manifest-overlays.sh` runs it on every
+overlay.
+
 NetworkPolicy covers the pod network only. NIXL traffic over RDMA or another secondary
 network is not filtered by it.
 

@@ -185,7 +185,7 @@ pub fn render(
 }
 
 /// A TCP `NetworkPolicyPort` for one port.
-fn tcp_port(port: i32) -> NetworkPolicyPort {
+pub fn tcp_port(port: i32) -> NetworkPolicyPort {
     NetworkPolicyPort {
         port: Some(IntOrString::Int(port)),
         protocol: Some("TCP".to_string()),
@@ -194,8 +194,9 @@ fn tcp_port(port: i32) -> NetworkPolicyPort {
 }
 
 /// Default metrics-port sources: the monitoring namespaces, by their immutable
-/// `kubernetes.io/metadata.name` label. Used when `monitoringFrom` is unset.
-fn default_monitoring_peers() -> Vec<NetworkPolicyPeer> {
+/// `kubernetes.io/metadata.name` label. Used when `monitoringFrom` is unset,
+/// and for the operator's own metrics port.
+pub fn default_monitoring_peers() -> Vec<NetworkPolicyPeer> {
     vec![NetworkPolicyPeer {
         namespace_selector: Some(LabelSelector {
             match_expressions: Some(vec![LabelSelectorRequirement {
