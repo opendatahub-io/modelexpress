@@ -182,6 +182,7 @@ pub(crate) mod test_util {
             token_audiences: vec!["modelexpress".to_string()],
             allowed_service_accounts: allowed,
             cache_ttl_secs: 60,
+            tenant_isolation: None,
         }
     }
 

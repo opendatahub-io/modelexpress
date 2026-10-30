@@ -132,6 +132,7 @@ fn security_config() -> SecurityConfig {
             service_account: "worker".to_string(),
         }],
         cache_ttl_secs: 60,
+        tenant_isolation: None,
     }
 }
 

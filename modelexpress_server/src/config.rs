@@ -87,6 +87,7 @@ pub struct SecurityConfig {
     pub token_audiences: Vec<String>,
     pub allowed_service_accounts: Vec<ServiceAccountRef>,
     pub cache_ttl_secs: u64,
+    pub tenant_isolation: Option<AuthMode>,
 }
 
 impl Default for SecurityConfig {
@@ -96,6 +97,7 @@ impl Default for SecurityConfig {
             token_audiences: Vec::new(),
             allowed_service_accounts: Vec::new(),
             cache_ttl_secs: 60,
+            tenant_isolation: None,
         }
     }
 }
@@ -104,6 +106,11 @@ impl SecurityConfig {
     #[must_use]
     pub fn resolve_mode(&self) -> AuthMode {
         self.mode.unwrap_or(AuthMode::Off)
+    }
+
+    #[must_use]
+    pub fn resolve_tenant_isolation(&self) -> AuthMode {
+        self.tenant_isolation.unwrap_or(AuthMode::Off)
     }
 
     pub fn validate_resolved(&self, mode: AuthMode) -> Result<(), String> {
@@ -122,6 +129,14 @@ impl SecurityConfig {
                         .to_string(),
                 );
             }
+        }
+        if self.resolve_tenant_isolation() == AuthMode::Enforce && mode != AuthMode::Enforce {
+            return Err(
+                "security tenant_isolation 'enforce' requires security mode 'enforce': \
+                namespace scoping is keyed on the TokenReview-verified caller identity, \
+                which only exists when auth is enforced"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -157,6 +172,16 @@ pub struct SecurityArgs {
         env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
     )]
     pub cache_ttl_secs: Option<u64>,
+
+    /// Namespace tenant isolation (off, enforce). Off by default. 'enforce'
+    /// scopes every P2P source to the caller's verified namespace and requires
+    /// security mode 'enforce'.
+    #[arg(
+        long = "security-tenant-isolation",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_TENANT_ISOLATION,
+        value_enum
+    )]
+    pub tenant_isolation: Option<AuthMode>,
 }
 
 /// TLS termination for the gRPC listener. Off unless a certificate is set.
@@ -517,6 +542,9 @@ impl ServerConfig {
         if let Some(cache_ttl_secs) = args.security.cache_ttl_secs {
             config.security.cache_ttl_secs = cache_ttl_secs;
         }
+        if let Some(tenant_isolation) = args.security.tenant_isolation {
+            config.security.tenant_isolation = Some(tenant_isolation);
+        }
 
         if let Some(cert_file) = args.tls.cert_file {
             config.tls.cert_file = Some(cert_file);
@@ -636,6 +664,10 @@ impl ServerConfig {
                 .join(", ")
         );
         info!("  Cache TTL: {}s", self.security.cache_ttl_secs);
+        info!(
+            "  Tenant isolation: {:?}",
+            self.security.resolve_tenant_isolation()
+        );
 
         info!("TLS Configuration:");
         match self.tls.key_pair() {
@@ -1115,6 +1147,27 @@ mod tests {
             namespace: "vllm".to_string(),
             service_account: "worker".to_string(),
         }];
+        assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
+    }
+
+    #[test]
+    fn tenant_isolation_enforce_requires_auth_enforce() {
+        let security = SecurityConfig {
+            tenant_isolation: Some(AuthMode::Enforce),
+            ..SecurityConfig::default()
+        };
+        assert!(security.validate_resolved(AuthMode::Off).is_err());
+
+        let security = SecurityConfig {
+            mode: Some(AuthMode::Enforce),
+            token_audiences: vec!["modelexpress".to_string()],
+            allowed_service_accounts: vec![ServiceAccountRef {
+                namespace: "vllm".to_string(),
+                service_account: "worker".to_string(),
+            }],
+            tenant_isolation: Some(AuthMode::Enforce),
+            ..SecurityConfig::default()
+        };
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
 
