@@ -31,7 +31,7 @@ fn matches_dns1123_label(s: &str) -> bool {
         && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
 }
 
-fn is_dns1123_label(s: &str) -> bool {
+pub(crate) fn is_dns1123_label(s: &str) -> bool {
     s.len() <= 63 && matches_dns1123_label(s)
 }
 
@@ -267,8 +267,8 @@ pub struct SecurityArgs {
     pub cache_ttl_secs: Option<u64>,
 
     /// Namespace tenant isolation (off, enforce). Off by default. 'enforce'
-    /// scopes every P2P source to the caller's verified namespace and requires
-    /// security mode 'enforce'.
+    /// scopes every P2P source and the model cache to the caller's verified
+    /// namespace and requires security mode 'enforce'.
     #[arg(
         long = "security-tenant-isolation",
         env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_TENANT_ISOLATION,

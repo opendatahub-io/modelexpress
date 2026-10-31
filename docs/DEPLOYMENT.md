@@ -288,7 +288,7 @@ Other properties to be aware of:
 | `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated allowlist of `<namespace>:<serviceaccount>` or `<namespace>:*` entries. Required for `enforce`. |
 | `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
-| `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
+| `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` | `off` | `off` \| `enforce`. `enforce` scopes every P2P source and the model cache to the caller's verified namespace; requires `MODEL_EXPRESS_SECURITY_MODE=enforce`. |
 
 `enforce` fails config validation if either the audience list or the allowlist is empty,
 so an omitted list can't silently deny-all or accept-any-audience. Every entry is
@@ -378,8 +378,40 @@ What isolation covers:
 | Service | Scoped to the caller's namespace |
 |---|---|
 | P2P metadata (`PublishMetadata`, `ListSources`, `GetMetadata`, `UpdateStatus`) | Yes |
-| Model cache (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`, `DeleteModel`) | No: every allowlisted caller shares one cache and can list, stream or delete any cached model |
+| Model cache (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`, `DeleteModel`) | Yes, one cache partition per namespace (below) |
 | Refit and collective refit (Redis backend only) | No: RL workloads are not supported on a server shared by several namespaces |
+
+### Model cache on a shared server
+
+With isolation on, the server keeps a separate cache partition per caller namespace,
+`<cache>/.modelexpress/tenants/<namespace>`. `EnsureModelDownloaded`, `ListModelFiles`,
+`StreamModelFiles` and `DeleteModel` only see the caller's partition, so `model clear`
+removes only that namespace's entries. Models cached before isolation was turned on
+stay at the cache root and are not served to any namespace. Eviction and the download
+manifest check work per partition.
+
+Partitions share nothing: two namespaces using the same model each download and store a
+copy, so size the cache volume for the number of namespaces using each model. There are
+no per-namespace quotas.
+
+Clients have to read from their own partition. A client in the default shared-storage
+mode resolves the model under its own cache path, so a client that mounts the cache root
+finds nothing. Either:
+
+- point the client's cache path at the namespace's partition: mount the server's cache
+  volume and set `MODEL_EXPRESS_CACHE_DIRECTORY` (and `HF_HUB_CACHE` for the engine) to
+  `<mount>/.modelexpress/tenants/<namespace>`; or
+- set `MODEL_EXPRESS_NO_SHARED_STORAGE=true` so the client streams the files from the
+  server into its own cache.
+
+Downloads use the server's own credentials (`HF_TOKEN` or the Hugging Face token file,
+`NGC_API_KEY`, GCS application default credentials, the S3 credential chain), so every
+allowlisted namespace can fetch anything those credentials can reach. Give a shared
+server only credentials that every allowlisted namespace may use, or none. A namespace
+that needs models under its own credentials should run its own server or download on
+the client side.
+
+### Engine pods
 
 Engine pods serve the worker gRPC (6555+) and the NIXL metadata listener (5555+) directly,
 outside the server, so on a multi-tenant cluster restrict those ports to the pod's own

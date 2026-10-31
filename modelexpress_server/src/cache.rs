@@ -397,15 +397,17 @@ impl CacheEvictionService {
             .ok_or_else(|| format!("model '{entry_key}' not found in registry"))?;
 
         let key = EntryKey::parse(entry_key);
+        let cache_dir = key.cache_dir(&self.cache_directory);
 
-        // Entries that outlive this one and belong to the same model. Which files we can
-        // delete depends entirely on what they still reference.
+        // Entries that outlive this one and belong to the same model in the same
+        // partition. Which files we can delete depends entirely on what they still
+        // reference.
         let siblings = self.registry.get_models_by_last_used(None).await?;
         let survivors: Vec<EntryKey> = siblings
             .iter()
             .filter(|sibling| sibling.model_name != entry_key)
             .map(|sibling| EntryKey::parse(&sibling.model_name))
-            .filter(|other| other.model_name == key.model_name)
+            .filter(|other| other.model_name == key.model_name && other.tenant == key.tenant)
             .collect();
 
         // An entry with no revision covers every snapshot of its model, so it shares
@@ -435,12 +437,12 @@ impl CacheEvictionService {
 
         if let Some(revision) = delete_revision {
             get_provider(record.provider)
-                .delete_model_revision(&key.model_name, self.cache_directory.clone(), revision)
+                .delete_model_revision(&key.model_name, cache_dir.clone(), revision)
                 .await
                 .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
         }
 
-        if let Err(e) = DownloadManifest::remove(&self.cache_directory, entry_key) {
+        if let Err(e) = DownloadManifest::remove(&cache_dir, entry_key) {
             warn!("Failed to remove the download manifest for '{entry_key}': {e:#}");
         }
 
@@ -1100,6 +1102,185 @@ mod tests {
             evictions_for(&encoded, "count_limit"),
             0,
             "a failed eviction freed nothing and must not be counted: {encoded}"
+        );
+    }
+
+    /// Leave a completed download of `entry_key` in `dir`: a snapshot and its manifest.
+    #[cfg(feature = "memory-backend")]
+    fn install_entry(dir: &std::path::Path, entry_key: &str, revision: &str) {
+        let snapshot = dir.join("models--test--model/snapshots").join(revision);
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        DownloadManifest::new(entry_key, [(PathBuf::from("config.json"), 2)])
+            .write(dir)
+            .expect("Failed to write manifest");
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn record_downloaded(
+        backend: &crate::registry::backend::memory::InMemoryRegistryBackend,
+        entry_key: &str,
+    ) {
+        use crate::registry::backend::{ClaimOutcome, RegistryBackend};
+        let lease = std::time::Duration::from_secs(30);
+        assert_eq!(
+            backend
+                .try_claim_for_download(entry_key, ModelProvider::HuggingFace, "claim", lease)
+                .await
+                .expect("claim"),
+            ClaimOutcome::Claimed
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    entry_key,
+                    ModelProvider::HuggingFace,
+                    "claim",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("finish")
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn eviction_stays_inside_the_entrys_partition() {
+        use crate::registry::backend::RegistryBackend;
+        use crate::registry::entry_key::{Tenant, partition};
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let cache = TempDir::new().expect("Failed to create cache directory");
+        let service = CacheEvictionService::new(
+            Arc::new(RegistryManager::with_backend(backend.clone())),
+            CacheEvictionConfig::default(),
+            cache.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
+        let tenant = |namespace: &str| Tenant::new(namespace).expect("valid namespace");
+        let key_in = |namespace: Option<&str>| {
+            EntryKey::new("test/model", Some("abc123".to_string()), false)
+                .in_tenant(namespace.map(tenant))
+                .to_string()
+        };
+        let dir_of =
+            |namespace: Option<&str>| partition(cache.path(), namespace.map(tenant).as_ref());
+        for namespace in [Some("tenant-a"), Some("tenant-b"), None] {
+            record_downloaded(&backend, &key_in(namespace)).await;
+            install_entry(&dir_of(namespace), &key_in(namespace), "abc123");
+        }
+
+        service
+            .evict_model(&key_in(Some("tenant-a")))
+            .await
+            .expect("evict");
+
+        assert!(
+            !dir_of(Some("tenant-a"))
+                .join("models--test--model")
+                .exists()
+        );
+        assert_eq!(
+            DownloadManifest::read(&dir_of(Some("tenant-a")), &key_in(Some("tenant-a"))),
+            None
+        );
+        for namespace in [Some("tenant-b"), None] {
+            assert!(
+                dir_of(namespace)
+                    .join("models--test--model/snapshots/abc123/config.json")
+                    .is_file(),
+                "{namespace:?} lost its files"
+            );
+            assert!(
+                DownloadManifest::read(&dir_of(namespace), &key_in(namespace)).is_some(),
+                "{namespace:?} lost its manifest"
+            );
+        }
+        let mut remaining: Vec<String> = backend
+            .get_models_by_last_used(None)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|record| record.model_name)
+            .collect();
+        remaining.sort();
+        let mut expected = vec![key_in(Some("tenant-b")), key_in(None)];
+        expected.sort();
+        assert_eq!(remaining, expected);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn eviction_keeps_files_a_same_partition_sibling_uses() {
+        use crate::registry::entry_key::{Tenant, partition};
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let cache = TempDir::new().expect("Failed to create cache directory");
+        let service = CacheEvictionService::new(
+            Arc::new(RegistryManager::with_backend(backend.clone())),
+            CacheEvictionConfig::default(),
+            cache.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
+        let tenant_a = Tenant::new("tenant-a").expect("valid namespace");
+        let dir = partition(cache.path(), Some(&tenant_a));
+        let full = EntryKey::new("test/model", Some("abc123".to_string()), false)
+            .in_tenant(Some(tenant_a.clone()))
+            .to_string();
+        let metadata = EntryKey::new("test/model", Some("abc123".to_string()), true)
+            .in_tenant(Some(tenant_a))
+            .to_string();
+        record_downloaded(&backend, &full).await;
+        record_downloaded(&backend, &metadata).await;
+        install_entry(&dir, &full, "abc123");
+        install_entry(&dir, &metadata, "abc123");
+
+        service.evict_model(&full).await.expect("evict");
+
+        assert!(
+            dir.join("models--test--model/snapshots/abc123/config.json")
+                .is_file()
+        );
+        assert_eq!(DownloadManifest::read(&dir, &full), None);
+        assert!(DownloadManifest::read(&dir, &metadata).is_some());
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn eviction_does_not_follow_a_revision_out_of_its_partition() {
+        use crate::registry::entry_key::{Tenant, partition};
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let cache = TempDir::new().expect("Failed to create cache directory");
+        let service = CacheEvictionService::new(
+            Arc::new(RegistryManager::with_backend(backend.clone())),
+            CacheEvictionConfig::default(),
+            cache.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
+        let tenant = |namespace: &str| Tenant::new(namespace).expect("valid namespace");
+        let key_in = |namespace: &str, revision: &str| {
+            EntryKey::new("test/model", Some(revision.to_string()), false)
+                .in_tenant(Some(tenant(namespace)))
+                .to_string()
+        };
+        let dir_a = partition(cache.path(), Some(&tenant("tenant-a")));
+        let dir_b = partition(cache.path(), Some(&tenant("tenant-b")));
+        record_downloaded(&backend, &key_in("tenant-a", "abc123")).await;
+        install_entry(&dir_a, &key_in("tenant-a", "abc123"), "abc123");
+        record_downloaded(&backend, &key_in("tenant-b", "def456")).await;
+        install_entry(&dir_b, &key_in("tenant-b", "def456"), "def456");
+        let a_snapshot = dir_a.join("models--test--model/snapshots/abc123");
+        let escaping = key_in("tenant-b", a_snapshot.to_str().expect("utf-8 path"));
+        record_downloaded(&backend, &escaping).await;
+
+        assert!(service.evict_model(&escaping).await.is_err());
+        assert!(a_snapshot.join("config.json").is_file());
+        assert!(
+            dir_b
+                .join("models--test--model/snapshots/def456/config.json")
+                .is_file()
         );
     }
 }

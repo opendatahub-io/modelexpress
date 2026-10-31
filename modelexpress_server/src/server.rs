@@ -248,7 +248,9 @@ pub async fn run_server(
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
     let stats_tracker = tracker.clone();
-    let model_service = ModelServiceImpl::new(tracker);
+    let tenant_isolation =
+        config.security.resolve_tenant_isolation() == crate::config::AuthMode::Enforce;
+    let model_service = ModelServiceImpl::with_tenant_isolation(tracker, tenant_isolation);
 
     // Create standard gRPC health service (grpc.health.v1.Health)
     let (health_reporter, health_service_v1) = tonic_health::server::health_reporter();
@@ -346,8 +348,6 @@ pub async fn run_server(
         }
     }
 
-    let tenant_isolation =
-        config.security.resolve_tenant_isolation() == crate::config::AuthMode::Enforce;
     let p2p_service = P2pServiceImpl::with_tenant_isolation(p2p_state.clone(), tenant_isolation);
 
     // Start reaper for stale source detection
