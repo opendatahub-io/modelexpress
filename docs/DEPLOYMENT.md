@@ -358,8 +358,16 @@ How to configure a server whose callers come from more than one namespace:
 
 On a shared server, every tenant must be in the allowlist, per ServiceAccount or as
 `<namespace>:*`; isolation then scopes each caller to its own namespace, whichever entry
-admitted it. With the Helm chart, set `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through
-`extraEnv`.
+admitted it, in the services listed below. With the Helm chart, set
+`MODEL_EXPRESS_SECURITY_TENANT_ISOLATION` through `extraEnv`.
+
+What isolation covers:
+
+| Service | Scoped to the caller's namespace |
+|---|---|
+| P2P metadata (`PublishMetadata`, `ListSources`, `GetMetadata`, `UpdateStatus`) | Yes |
+| Model cache (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`, `DeleteModel`) | Yes, one cache partition per namespace (below) |
+| Refit and collective refit (Redis backend only) | No: RL workloads are not supported on a server shared by several namespaces |
 
 ### Model cache on a shared server
 
@@ -383,9 +391,9 @@ the client side.
 
 ### Engine pods
 
-Tenant isolation covers the central server. Engine pods serve the worker gRPC (6555+) and
-the NIXL metadata listener (5555+) directly, so on a multi-tenant cluster restrict those
-ports to the pod's own namespace with a NetworkPolicy.
+Engine pods serve the worker gRPC (6555+) and the NIXL metadata listener (5555+) directly,
+outside the server, so on a multi-tenant cluster restrict those ports to the pod's own
+namespace with a NetworkPolicy.
 
 ## Docker
 
