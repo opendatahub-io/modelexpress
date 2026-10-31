@@ -74,6 +74,7 @@ fn full_spec() -> ModelExpressServerSpec {
         }),
         security: Some(SecurityConfig {
             mode: AuthMode::Enforce,
+            tenant_isolation: AuthMode::Enforce,
             token_audiences: vec!["mx".into()],
             allowed_service_accounts: vec![ServiceAccountRef {
                 namespace: "llm-d".into(),

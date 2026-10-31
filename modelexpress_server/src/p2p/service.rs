@@ -6,6 +6,7 @@
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
+use crate::auth::CallerIdentity;
 use crate::metrics::grpc::RpcOutcome;
 use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
@@ -41,12 +42,43 @@ fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
 /// P2P Service implementation
 pub struct P2pServiceImpl {
     state: Arc<P2pStateManager>,
+    /// Scope every operation to the caller's verified namespace.
+    tenant_isolation: bool,
 }
 
 impl P2pServiceImpl {
     /// Create a new P2P service
     pub fn new(state: Arc<P2pStateManager>) -> Self {
-        Self { state }
+        Self::with_tenant_isolation(state, false)
+    }
+
+    pub fn with_tenant_isolation(state: Arc<P2pStateManager>, tenant_isolation: bool) -> Self {
+        Self {
+            state,
+            tenant_isolation,
+        }
+    }
+
+    /// The namespace a request is scoped to, or `None` when isolation is off.
+    /// Fails with `UNAUTHENTICATED` when isolation is on and the request
+    /// carries no verified caller.
+    #[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+    fn scope_namespace<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
+        if !self.tenant_isolation {
+            return Ok(None);
+        }
+        match request.extensions().get::<CallerIdentity>() {
+            Some(caller) => Ok(Some(caller.namespace.clone())),
+            None => {
+                error!(
+                    "tenant isolation is enabled but the request carries no verified \
+                     caller identity; rejecting"
+                );
+                Err(Status::unauthenticated(
+                    "tenant isolation requires an authenticated caller",
+                ))
+            }
+        }
     }
 }
 
@@ -61,6 +93,12 @@ fn ready_source_is_fresh(
 
     let age_ms = now_ms.saturating_sub(info.updated_at).max(0) as u64;
     age_ms <= heartbeat_timeout_ms
+}
+
+/// Whether a record owned by `owner` is visible in `scope`. Everything is
+/// visible without a scope; a record without an owner is visible in none.
+fn owner_in_scope(scope: Option<&str>, owner: Option<&str>) -> bool {
+    scope.is_none_or(|namespace| owner == Some(namespace))
 }
 
 fn worker_tensor_count(worker: &WorkerMetadata) -> usize {
@@ -84,6 +122,7 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<PublishMetadataRequest>,
     ) -> Result<Response<PublishMetadataResponse>, Status> {
+        let owner_namespace = self.scope_namespace(&request)?;
         let req = request.into_inner();
 
         let identity = match req.identity {
@@ -160,6 +199,44 @@ impl P2pService for P2pServiceImpl {
         let worker_rank = worker.worker_rank;
         let tensor_count = worker_tensor_count(&worker);
 
+        if owner_namespace.is_some() {
+            match self.state.get_metadata(&source_id, &worker_id).await {
+                Ok(Some(record))
+                    if !owner_in_scope(
+                        owner_namespace.as_deref(),
+                        record.owner_namespace.as_deref(),
+                    ) =>
+                {
+                    info!(
+                        "PublishMetadata denied cross-namespace write to source_id={} worker_id={}",
+                        source_id, worker_id
+                    );
+                    return tagged(
+                        PublishMetadataResponse {
+                            success: false,
+                            message: "worker_id is registered in another namespace".to_string(),
+                            mx_source_id: String::new(),
+                            worker_id: String::new(),
+                        },
+                        RpcOutcome::InvalidArgument,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to resolve owner for publish_metadata: {}", e);
+                    return tagged(
+                        PublishMetadataResponse {
+                            success: false,
+                            message: format!("Failed to publish metadata: {e}"),
+                            mx_source_id: String::new(),
+                            worker_id: String::new(),
+                        },
+                        RpcOutcome::BackendError,
+                    );
+                }
+            }
+        }
+
         match self
             .state
             .publish_metadata(
@@ -169,6 +246,7 @@ impl P2pService for P2pServiceImpl {
                 &req.pod_name,
                 &req.pod_uid,
                 &req.pod_namespace,
+                owner_namespace,
             )
             .await
         {
@@ -209,6 +287,7 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<ListSourcesRequest>,
     ) -> Result<Response<ListSourcesResponse>, Status> {
+        let scope = self.scope_namespace(&request)?;
         let req = request.into_inner();
 
         // Resolve optional source_id filter
@@ -235,6 +314,8 @@ impl P2pService for P2pServiceImpl {
         let status_filter = req
             .status_filter
             .and_then(|s| SourceStatus::try_from(s).ok());
+        let limit = req.limit.map(|value| value as usize);
+        let backend_limit = if scope.is_some() { None } else { limit };
 
         let workers: Vec<SourceInstanceInfo> = match self
             .state
@@ -245,7 +326,7 @@ impl P2pService for P2pServiceImpl {
                 req.worker_rank_filter,
                 req.min_training_step,
                 req.min_updated_at,
-                req.limit.map(|value| value as usize),
+                backend_limit,
             )
             .await
         {
@@ -275,6 +356,8 @@ impl P2pService for P2pServiceImpl {
 
         let refs: Vec<SourceInstanceRef> = workers
             .into_iter()
+            .filter(|info| owner_in_scope(scope.as_deref(), info.owner_namespace.as_deref()))
+            .take(limit.filter(|value| *value > 0).unwrap_or(usize::MAX))
             .map(|info| SourceInstanceRef {
                 mx_source_id: info.source_id,
                 worker_id: info.worker_id,
@@ -298,6 +381,7 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<GetMetadataRequest>,
     ) -> Result<Response<GetMetadataResponse>, Status> {
+        let scope = self.scope_namespace(&request)?;
         let req = request.into_inner();
 
         if req.mx_source_id.is_empty() || req.worker_id.is_empty() {
@@ -318,6 +402,24 @@ impl P2pService for P2pServiceImpl {
             .get_metadata(&req.mx_source_id, &req.worker_id)
             .await
         {
+            Ok(Some(record))
+                if !owner_in_scope(scope.as_deref(), record.owner_namespace.as_deref()) =>
+            {
+                info!(
+                    "GetMetadata denied cross-namespace access to source_id={} worker_id={}",
+                    req.mx_source_id, req.worker_id
+                );
+                tagged(
+                    GetMetadataResponse {
+                        found: false,
+                        worker: None,
+                        mx_source_id: req.mx_source_id,
+                        worker_id: req.worker_id,
+                        identity: None,
+                    },
+                    RpcOutcome::NotFound,
+                )
+            }
             Ok(Some(record)) => {
                 // Each worker_id maps to exactly one worker record; take the first.
                 let identity = record.identity.clone();
@@ -386,6 +488,7 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<UpdateStatusRequest>,
     ) -> Result<Response<UpdateStatusResponse>, Status> {
+        let scope = self.scope_namespace(&request)?;
         let req = request.into_inner();
 
         if req.mx_source_id.is_empty() {
@@ -429,6 +532,42 @@ impl P2pService for P2pServiceImpl {
             .source_load
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0));
+
+        if scope.is_some() {
+            let owned = match self
+                .state
+                .get_metadata(&req.mx_source_id, &req.worker_id)
+                .await
+            {
+                Ok(Some(record)) => {
+                    owner_in_scope(scope.as_deref(), record.owner_namespace.as_deref())
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    error!("Failed to resolve owner for update_status: {}", e);
+                    return tagged(
+                        UpdateStatusResponse {
+                            success: false,
+                            message: format!("Failed to update status: {e}"),
+                        },
+                        RpcOutcome::BackendError,
+                    );
+                }
+            };
+            if !owned {
+                info!(
+                    "UpdateStatus denied cross-namespace write to source_id={} worker_id={}",
+                    req.mx_source_id, req.worker_id
+                );
+                return tagged(
+                    UpdateStatusResponse {
+                        success: false,
+                        message: "worker not found".to_string(),
+                    },
+                    RpcOutcome::NotFound,
+                );
+            }
+        }
 
         match self
             .state
@@ -576,11 +715,11 @@ mod tests {
     async fn test_publish_metadata_success() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace, _| {
                 pod_name == "vllm-worker-0" && pod_uid == "pod-uid-1" && pod_namespace == "default"
             })
             .once()
-            .returning(|_, _, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _, _| Ok(()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -615,7 +754,7 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
             .once()
-            .returning(|_, _, _, _, _, _| Err("storage unavailable".into()));
+            .returning(|_, _, _, _, _, _, _| Err("storage unavailable".into()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -683,6 +822,7 @@ mod tests {
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
+                    owner_namespace: None,
                     identity: Some(returned_identity.clone()),
                 }))
             });
@@ -866,6 +1006,7 @@ mod tests {
                         topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
+                        owner_namespace: None,
                     },
                     SourceInstanceInfo {
                         source_id: "abc123def456abcd".to_string(),
@@ -879,6 +1020,7 @@ mod tests {
                         topology: Default::default(),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
+                        owner_namespace: None,
                     },
                 ])
             });
@@ -943,6 +1085,7 @@ mod tests {
                     topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
+                    owner_namespace: None,
                 }])
             });
 
@@ -984,6 +1127,7 @@ mod tests {
                         topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
+                        owner_namespace: None,
                     },
                     SourceInstanceInfo {
                         source_id: "abc123def456abcd".to_string(),
@@ -997,6 +1141,7 @@ mod tests {
                         topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
+                        owner_namespace: None,
                     },
                 ])
             });
@@ -1050,6 +1195,7 @@ mod tests {
                         ),
                     }],
                     published_at: 1234567890,
+                    owner_namespace: None,
                     identity: Some(test_artifact_identity()),
                 }))
             });
@@ -1195,6 +1341,7 @@ mod tests {
                     model_name: "my-model".to_string(),
                     workers: vec![],
                     published_at: 0,
+                    owner_namespace: None,
                     identity: None,
                 }))
             });
@@ -1243,5 +1390,414 @@ mod tests {
             .into_inner();
         assert!(!resp.success);
         assert!(resp.message.contains("write failed"));
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn isolated_service() -> P2pServiceImpl {
+        let state = P2pStateManager::with_backend(Arc::new(
+            crate::p2p::backend::memory::InMemoryMetadataBackend::new(),
+        ));
+        P2pServiceImpl::with_tenant_isolation(Arc::new(state), true)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn open_service() -> P2pServiceImpl {
+        let state = P2pStateManager::with_backend(Arc::new(
+            crate::p2p::backend::memory::InMemoryMetadataBackend::new(),
+        ));
+        P2pServiceImpl::new(Arc::new(state))
+    }
+
+    fn caller(namespace: &str) -> CallerIdentity {
+        CallerIdentity {
+            namespace: namespace.to_string(),
+            service_account: "worker".to_string(),
+            pod_name: None,
+            pod_uid: None,
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn worker_meta(rank: u32) -> WorkerMetadata {
+        WorkerMetadata {
+            worker_rank: rank,
+            backend_metadata: None,
+            source_payload: empty_tensor_source(),
+            status: SourceStatus::Ready as i32,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn publish_as(svc: &P2pServiceImpl, namespace: &str, worker_id: &str) -> String {
+        let mut req = Request::new(PublishMetadataRequest {
+            identity: Some(test_identity()),
+            worker: Some(worker_meta(0)),
+            worker_id: worker_id.to_string(),
+            pod_namespace: "claimed-by-client".to_string(),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(caller(namespace));
+        let resp = svc.publish_metadata(req).await.expect("rpc").into_inner();
+        assert!(resp.success, "publish failed: {}", resp.message);
+        resp.mx_source_id
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn list_as(svc: &P2pServiceImpl, namespace: &str) -> Vec<String> {
+        let mut req = Request::new(ListSourcesRequest::default());
+        req.extensions_mut().insert(caller(namespace));
+        svc.list_sources(req)
+            .await
+            .expect("rpc")
+            .into_inner()
+            .instances
+            .into_iter()
+            .map(|instance| instance.worker_id)
+            .collect()
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn get_found(
+        svc: &P2pServiceImpl,
+        namespace: &str,
+        source_id: &str,
+        worker_id: &str,
+    ) -> bool {
+        let mut req = Request::new(GetMetadataRequest {
+            mx_source_id: source_id.to_string(),
+            worker_id: worker_id.to_string(),
+        });
+        req.extensions_mut().insert(caller(namespace));
+        svc.get_metadata(req).await.expect("rpc").into_inner().found
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn update_ok(
+        svc: &P2pServiceImpl,
+        namespace: &str,
+        source_id: &str,
+        worker_id: &str,
+        status: SourceStatus,
+    ) -> bool {
+        let mut req = Request::new(UpdateStatusRequest {
+            mx_source_id: source_id.to_string(),
+            worker_id: worker_id.to_string(),
+            worker_rank: 0,
+            status: status as i32,
+            source_load: None,
+        });
+        req.extensions_mut().insert(caller(namespace));
+        svc.update_status(req)
+            .await
+            .expect("rpc")
+            .into_inner()
+            .success
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn list_hides_other_namespace_sources() {
+        let svc = isolated_service();
+        publish_as(&svc, "tenant-a", "worker-a").await;
+
+        assert_eq!(
+            list_as(&svc, "tenant-a").await,
+            vec!["worker-a".to_string()]
+        );
+        assert!(list_as(&svc, "tenant-b").await.is_empty());
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn get_metadata_denies_cross_namespace() {
+        let svc = isolated_service();
+        let source_id = publish_as(&svc, "tenant-a", "worker-a").await;
+
+        assert!(get_found(&svc, "tenant-a", &source_id, "worker-a").await);
+        assert!(
+            !get_found(&svc, "tenant-b", &source_id, "worker-a").await,
+            "tenant-b must not read tenant-a's worker"
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn update_status_denies_cross_namespace() {
+        let svc = isolated_service();
+        let source_id = publish_as(&svc, "tenant-a", "worker-a").await;
+
+        assert!(
+            !update_ok(
+                &svc,
+                "tenant-b",
+                &source_id,
+                "worker-a",
+                SourceStatus::Stale
+            )
+            .await,
+            "tenant-b must not mutate tenant-a's worker"
+        );
+        assert!(
+            update_ok(
+                &svc,
+                "tenant-a",
+                &source_id,
+                "worker-a",
+                SourceStatus::Stale
+            )
+            .await,
+            "owner may mutate its own worker"
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn same_model_across_namespaces_stays_isolated() {
+        let svc = isolated_service();
+        let source_a = publish_as(&svc, "tenant-a", "worker-a").await;
+        let source_b = publish_as(&svc, "tenant-b", "worker-b").await;
+        assert_eq!(source_a, source_b, "same model must collide on source_id");
+
+        assert_eq!(
+            list_as(&svc, "tenant-a").await,
+            vec!["worker-a".to_string()]
+        );
+        assert_eq!(
+            list_as(&svc, "tenant-b").await,
+            vec!["worker-b".to_string()]
+        );
+        assert!(!get_found(&svc, "tenant-a", &source_a, "worker-b").await);
+        assert!(!get_found(&svc, "tenant-b", &source_b, "worker-a").await);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn missing_caller_identity_fails_closed() {
+        let svc = isolated_service();
+        let status = svc
+            .publish_metadata(Request::new(PublishMetadataRequest {
+                identity: Some(test_identity()),
+                worker: Some(worker_meta(0)),
+                worker_id: "worker-a".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("isolation without identity must reject");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        let codes = [
+            svc.list_sources(Request::new(ListSourcesRequest::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            svc.get_metadata(Request::new(GetMetadataRequest::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            svc.update_status(Request::new(UpdateStatusRequest::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+        ];
+        assert_eq!(codes, [Some(tonic::Code::Unauthenticated); 3]);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn disabled_isolation_shares_sources() {
+        let svc = open_service();
+        let resp = svc
+            .publish_metadata(Request::new(PublishMetadataRequest {
+                identity: Some(test_identity()),
+                worker: Some(worker_meta(0)),
+                worker_id: "worker-a".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.success);
+
+        let instances = svc
+            .list_sources(Request::new(ListSourcesRequest::default()))
+            .await
+            .expect("rpc")
+            .into_inner()
+            .instances;
+        assert_eq!(instances.len(), 1);
+        assert!(
+            get_found(&svc, "anyone", &resp.mx_source_id, "worker-a").await,
+            "with isolation off, any caller resolves the source"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CrossNamespacePublish {
+        b_publish_accepted: bool,
+        a_still_finds_worker: bool,
+        a_still_lists_worker: bool,
+        b_reads_rank: Option<u32>,
+    }
+
+    async fn publish_into_another_namespaces_worker(
+        svc: &P2pServiceImpl,
+        identity: SourceIdentity,
+        worker_id: &str,
+    ) -> CrossNamespacePublish {
+        let publish = async |namespace: &str, rank: u32| {
+            let mut req = Request::new(PublishMetadataRequest {
+                identity: Some(identity.clone()),
+                worker: Some(WorkerMetadata {
+                    worker_rank: rank,
+                    source_payload: empty_tensor_source(),
+                    status: SourceStatus::Ready as i32,
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                    ..Default::default()
+                }),
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(caller(namespace));
+            svc.publish_metadata(req).await.expect("rpc").into_inner()
+        };
+        let get = async |namespace: &str, source_id: &str| {
+            let mut req = Request::new(GetMetadataRequest {
+                mx_source_id: source_id.to_string(),
+                worker_id: worker_id.to_string(),
+            });
+            req.extensions_mut().insert(caller(namespace));
+            svc.get_metadata(req).await.expect("rpc").into_inner()
+        };
+        let lists = async |namespace: &str| {
+            let mut req = Request::new(ListSourcesRequest::default());
+            req.extensions_mut().insert(caller(namespace));
+            svc.list_sources(req)
+                .await
+                .expect("rpc")
+                .into_inner()
+                .instances
+                .iter()
+                .any(|instance| instance.worker_id == worker_id)
+        };
+
+        let a = publish("tenant-a", 0).await;
+        assert!(a.success, "tenant-a publish failed: {}", a.message);
+        let b = publish("tenant-b", 1).await;
+        let b_view = get("tenant-b", &a.mx_source_id).await;
+        CrossNamespacePublish {
+            b_publish_accepted: b.success,
+            a_still_finds_worker: get("tenant-a", &a.mx_source_id).await.found,
+            a_still_lists_worker: lists("tenant-a").await,
+            b_reads_rank: b_view
+                .found
+                .then(|| b_view.worker.map(|worker| worker.worker_rank))
+                .flatten(),
+        }
+    }
+
+    fn worker_left_with_its_owner() -> CrossNamespacePublish {
+        CrossNamespacePublish {
+            b_publish_accepted: false,
+            a_still_finds_worker: true,
+            a_still_lists_worker: true,
+            b_reads_rank: None,
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn memory_publish_cannot_take_another_namespaces_worker() {
+        let svc = isolated_service();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, test_identity(), "worker-a").await,
+            worker_left_with_its_owner()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn redis_publish_cannot_take_another_namespaces_worker() {
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = crate::p2p::backend::redis::RedisBackend::new(&redis_url);
+        crate::p2p::backend::MetadataBackend::connect(&backend)
+            .await
+            .expect("connect");
+        let svc = P2pServiceImpl::with_tenant_isolation(
+            Arc::new(P2pStateManager::with_backend(Arc::new(backend))),
+            true,
+        );
+        let mut identity = test_identity();
+        identity.model_name = format!("cross-namespace/{}", uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, identity, &worker_id).await,
+            worker_left_with_its_owner()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a cluster with the ModelMetadata CRD and MX_TEST_K8S_NAMESPACE"]
+    async fn kubernetes_publish_cannot_take_another_namespaces_worker() {
+        let namespace = std::env::var("MX_TEST_K8S_NAMESPACE").expect("MX_TEST_K8S_NAMESPACE");
+        let backend = crate::p2p::backend::kubernetes::KubernetesBackend::new(&namespace)
+            .await
+            .expect("kube client");
+        let svc = P2pServiceImpl::with_tenant_isolation(
+            Arc::new(P2pStateManager::with_backend(Arc::new(backend))),
+            true,
+        );
+        let mut identity = test_identity();
+        identity.model_name = format!("cross-namespace-{}", uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, identity, &worker_id).await,
+            worker_left_with_its_owner()
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn limit_counts_only_the_callers_sources() {
+        let svc = isolated_service();
+        for (namespace, worker_id, updated_at) in [
+            ("tenant-a", "worker-a", 1_000),
+            ("tenant-b", "worker-b", 2_000),
+        ] {
+            let mut req = Request::new(PublishMetadataRequest {
+                identity: Some(test_identity()),
+                worker: Some(WorkerMetadata {
+                    updated_at,
+                    ..worker_meta(0)
+                }),
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(caller(namespace));
+            assert!(
+                svc.publish_metadata(req)
+                    .await
+                    .expect("rpc")
+                    .into_inner()
+                    .success
+            );
+        }
+        let mut req = Request::new(ListSourcesRequest {
+            limit: Some(1),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(caller("tenant-a"));
+        let listed: Vec<String> = svc
+            .list_sources(req)
+            .await
+            .expect("rpc")
+            .into_inner()
+            .instances
+            .into_iter()
+            .map(|instance| instance.worker_id)
+            .collect();
+        assert_eq!(listed, vec!["worker-a".to_string()]);
     }
 }

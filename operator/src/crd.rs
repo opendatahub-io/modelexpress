@@ -354,10 +354,17 @@ pub struct MetadataOverrides {
 #[cel_validate(rule = Rule::new(
     "!(has(self.mode) && self.mode == 'enforce') || (has(self.tokenAudiences) && size(self.tokenAudiences) > 0 && has(self.allowedServiceAccounts) && size(self.allowedServiceAccounts) > 0)"
 ).message("enforce mode requires tokenAudiences and allowedServiceAccounts"))]
+#[cel_validate(rule = Rule::new(
+    "!(has(self.tenantIsolation) && self.tenantIsolation == 'enforce') || (has(self.mode) && self.mode == 'enforce')"
+).message("tenantIsolation enforce requires mode enforce"))]
 pub struct SecurityConfig {
     /// MODEL_EXPRESS_SECURITY_MODE.
     #[serde(default)]
     pub mode: AuthMode,
+    /// MODEL_EXPRESS_SECURITY_TENANT_ISOLATION. Scopes P2P sources to the
+    /// caller's verified namespace; requires `mode: enforce`.
+    #[serde(default)]
+    pub tenant_isolation: AuthMode,
     /// MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 32))]
@@ -420,6 +427,7 @@ impl AuthMode {
 }
 
 /// An allowed caller, rendered as `<namespace>:<serviceAccount>`.
+/// `serviceAccount: "*"` admits every ServiceAccount in the namespace.
 /// maxLength bounds keep the regex rules inside the apiserver's CEL cost
 /// budget; unbounded strings get costed at worst case and rejected.
 #[derive(CELSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -430,8 +438,9 @@ pub struct ServiceAccountRef {
         .message("namespace must be a DNS-1123 label"))]
     pub namespace: String,
     #[schemars(length(max = 253))]
-    #[cel_validate(rule = Rule::new("self.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')")
-        .message("serviceAccount must be a DNS-1123 subdomain"))]
+    #[cel_validate(rule = Rule::new(
+        "self == '*' || self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')"
+    ).message("serviceAccount must be '*' or a DNS-1123 subdomain"))]
     pub service_account: String,
 }
 
@@ -638,6 +647,8 @@ mod tests {
         let json = crd_json();
         for rule in [
             "!(has(self.mode) && self.mode == 'enforce')",
+            "!(has(self.tenantIsolation) && self.tenantIsolation == 'enforce') || (has(self.mode) && self.mode == 'enforce')",
+            "self == '*' || self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')",
             "self.heartbeatTimeoutSecs > self.scanIntervalSecs",
             "self.gcTimeoutSecs >= self.heartbeatTimeoutSecs",
             "self.startsWith('redis://')",

@@ -1279,7 +1279,7 @@ spec:
                   allowedServiceAccounts:
                     description: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS (rendered `ns:sa,...`).
                     items:
-                      description: An allowed caller, rendered as `<namespace>:<serviceAccount>`. maxLength bounds keep the regex rules inside the apiserver's CEL cost budget; unbounded strings get costed at worst case and rejected.
+                      description: 'An allowed caller, rendered as `<namespace>:<serviceAccount>`. `serviceAccount: "*"` admits every ServiceAccount in the namespace. maxLength bounds keep the regex rules inside the apiserver''s CEL cost budget; unbounded strings get costed at worst case and rejected.'
                       properties:
                         namespace:
                           maxLength: 63
@@ -1291,8 +1291,8 @@ spec:
                           maxLength: 253
                           type: string
                           x-kubernetes-validations:
-                          - message: serviceAccount must be a DNS-1123 subdomain
-                            rule: self.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')
+                          - message: serviceAccount must be '*' or a DNS-1123 subdomain
+                            rule: self == '*' || self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')
                       required:
                       - namespace
                       - serviceAccount
@@ -1313,6 +1313,13 @@ spec:
                     - disabled
                     - enforce
                     type: string
+                  tenantIsolation:
+                    default: disabled
+                    description: 'MODEL_EXPRESS_SECURITY_TENANT_ISOLATION. Scopes P2P sources to the caller''s verified namespace; requires `mode: enforce`.'
+                    enum:
+                    - disabled
+                    - enforce
+                    type: string
                   tokenAudiences:
                     description: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES (rendered comma-separated).
                     items:
@@ -1323,6 +1330,8 @@ spec:
                 x-kubernetes-validations:
                 - message: enforce mode requires tokenAudiences and allowedServiceAccounts
                   rule: '!(has(self.mode) && self.mode == ''enforce'') || (has(self.tokenAudiences) && size(self.tokenAudiences) > 0 && has(self.allowedServiceAccounts) && size(self.allowedServiceAccounts) > 0)'
+                - message: tenantIsolation enforce requires mode enforce
+                  rule: '!(has(self.tenantIsolation) && self.tenantIsolation == ''enforce'') || (has(self.mode) && self.mode == ''enforce'')'
               serviceAccountName:
                 description: Run the server as an existing ServiceAccount instead of the generated `<cr-name>-server`. Binding the metadata Role to it becomes your job.
                 maxLength: 253
