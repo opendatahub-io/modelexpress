@@ -5,7 +5,7 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{
+use crate::p2p::backend::{
     ArtifactSourceMetadataRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
     TensorRecord, WorkerRecord,
 };
@@ -293,6 +293,27 @@ impl MetadataBackend for KubernetesBackend {
 
         // Get CR UID for ownerReferences on ConfigMaps
         let cr = api.get(&cr_name).await?;
+        if let Some(owner) = owner_namespace {
+            match owner_namespace_of(&cr) {
+                Some(existing) if existing == owner => {}
+                Some(existing) => {
+                    return Err(format!(
+                        "ModelMetadata CR '{cr_name}' belongs to namespace '{existing}'"
+                    )
+                    .into());
+                }
+                None => {
+                    let label_patch =
+                        json!({ "metadata": { "labels": { OWNER_NAMESPACE_LABEL: owner } } });
+                    api.patch(
+                        &cr_name,
+                        &PatchParams::default(),
+                        &Patch::Merge(&label_patch),
+                    )
+                    .await?;
+                }
+            }
+        }
         if let Some(owner_references) = &pod_owner_references
             && cr.metadata.owner_references.as_ref() != Some(owner_references)
         {
@@ -303,17 +324,6 @@ impl MetadataBackend for KubernetesBackend {
                 &cr_name,
                 &PatchParams::default(),
                 &Patch::Merge(&owner_patch),
-            )
-            .await?;
-        }
-        if let Some(owner) = owner_namespace
-            && owner_namespace_of(&cr).as_deref() != Some(owner)
-        {
-            let label_patch = json!({ "metadata": { "labels": { OWNER_NAMESPACE_LABEL: owner } } });
-            api.patch(
-                &cr_name,
-                &PatchParams::default(),
-                &Patch::Merge(&label_patch),
             )
             .await?;
         }
@@ -888,8 +898,9 @@ impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use crate::p2p::backend::kubernetes::*;
 
     #[test]
     fn artifact_status_rejects_total_size_above_k8s_int64() {
@@ -960,5 +971,80 @@ mod tests {
         assert_eq!(owner_references[0].kind, "Pod");
         assert_eq!(owner_references[0].name, "pod-0");
         assert_eq!(owner_references[0].uid, "pod-uid");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a cluster with the ModelMetadata CRD and MX_TEST_K8S_NAMESPACE"]
+    async fn publish_leaves_a_cr_owned_by_another_namespace_alone() {
+        use modelexpress_common::grpc::p2p::MxSourceType;
+
+        let namespace = std::env::var("MX_TEST_K8S_NAMESPACE").expect("MX_TEST_K8S_NAMESPACE");
+        let backend = KubernetesBackend::new(&namespace)
+            .await
+            .expect("kube client");
+        let identity = SourceIdentity {
+            mx_version: "0.8.0".to_string(),
+            mx_source_type: MxSourceType::Weights as i32,
+            model_name: format!("owner-guard-{}", uuid::Uuid::new_v4()),
+            backend_framework: 1,
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            dtype: "bfloat16".to_string(),
+            ..Default::default()
+        };
+        let worker = |rank: u32| WorkerMetadata {
+            worker_rank: rank,
+            status: SourceStatus::Ready as i32,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        let source_id =
+            crate::p2p::source_identity::compute_mx_source_id(&identity).expect("source id");
+
+        backend
+            .publish_metadata(
+                &identity,
+                &worker_id,
+                worker(0),
+                "",
+                "",
+                "",
+                Some("tenant-a".to_string()),
+            )
+            .await
+            .expect("tenant-a publish");
+        assert!(
+            backend
+                .publish_metadata(
+                    &identity,
+                    &worker_id,
+                    worker(1),
+                    "pod-b",
+                    "uid-b",
+                    &namespace,
+                    Some("tenant-b".to_string()),
+                )
+                .await
+                .is_err()
+        );
+
+        let cr = backend
+            .model_metadata_api()
+            .get(&format!("mx-source-{source_id}-{worker_id}"))
+            .await
+            .expect("get CR");
+        assert_eq!(owner_namespace_of(&cr).as_deref(), Some("tenant-a"));
+        assert_eq!(cr.metadata.owner_references, None);
+        assert_eq!(
+            cr.status
+                .and_then(|status| status.worker)
+                .map(|worker| worker.worker_rank),
+            Some(0)
+        );
+        backend
+            .remove_worker(&source_id, &worker_id)
+            .await
+            .expect("cleanup");
     }
 }

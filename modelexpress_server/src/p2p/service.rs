@@ -199,6 +199,44 @@ impl P2pService for P2pServiceImpl {
         let worker_rank = worker.worker_rank;
         let tensor_count = worker_tensor_count(&worker);
 
+        if owner_namespace.is_some() {
+            match self.state.get_metadata(&source_id, &worker_id).await {
+                Ok(Some(record))
+                    if !owner_in_scope(
+                        owner_namespace.as_deref(),
+                        record.owner_namespace.as_deref(),
+                    ) =>
+                {
+                    info!(
+                        "PublishMetadata denied cross-namespace write to source_id={} worker_id={}",
+                        source_id, worker_id
+                    );
+                    return tagged(
+                        PublishMetadataResponse {
+                            success: false,
+                            message: "worker_id is registered in another namespace".to_string(),
+                            mx_source_id: String::new(),
+                            worker_id: String::new(),
+                        },
+                        RpcOutcome::InvalidArgument,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to resolve owner for publish_metadata: {}", e);
+                    return tagged(
+                        PublishMetadataResponse {
+                            success: false,
+                            message: format!("Failed to publish metadata: {e}"),
+                            mx_source_id: String::new(),
+                            worker_id: String::new(),
+                        },
+                        RpcOutcome::BackendError,
+                    );
+                }
+            }
+        }
+
         match self
             .state
             .publish_metadata(
@@ -1367,7 +1405,6 @@ mod tests {
         P2pServiceImpl::new(Arc::new(state))
     }
 
-    #[cfg(feature = "memory-backend")]
     fn caller(namespace: &str) -> CallerIdentity {
         CallerIdentity {
             namespace: namespace.to_string(),
@@ -1590,6 +1627,131 @@ mod tests {
         assert!(
             get_found(&svc, "anyone", &resp.mx_source_id, "worker-a").await,
             "with isolation off, any caller resolves the source"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CrossNamespacePublish {
+        b_publish_accepted: bool,
+        a_still_finds_worker: bool,
+        a_still_lists_worker: bool,
+        b_reads_rank: Option<u32>,
+    }
+
+    async fn publish_into_another_namespaces_worker(
+        svc: &P2pServiceImpl,
+        identity: SourceIdentity,
+        worker_id: &str,
+    ) -> CrossNamespacePublish {
+        let publish = async |namespace: &str, rank: u32| {
+            let mut req = Request::new(PublishMetadataRequest {
+                identity: Some(identity.clone()),
+                worker: Some(WorkerMetadata {
+                    worker_rank: rank,
+                    source_payload: empty_tensor_source(),
+                    status: SourceStatus::Ready as i32,
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                    ..Default::default()
+                }),
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(caller(namespace));
+            svc.publish_metadata(req).await.expect("rpc").into_inner()
+        };
+        let get = async |namespace: &str, source_id: &str| {
+            let mut req = Request::new(GetMetadataRequest {
+                mx_source_id: source_id.to_string(),
+                worker_id: worker_id.to_string(),
+            });
+            req.extensions_mut().insert(caller(namespace));
+            svc.get_metadata(req).await.expect("rpc").into_inner()
+        };
+        let lists = async |namespace: &str| {
+            let mut req = Request::new(ListSourcesRequest::default());
+            req.extensions_mut().insert(caller(namespace));
+            svc.list_sources(req)
+                .await
+                .expect("rpc")
+                .into_inner()
+                .instances
+                .iter()
+                .any(|instance| instance.worker_id == worker_id)
+        };
+
+        let a = publish("tenant-a", 0).await;
+        assert!(a.success, "tenant-a publish failed: {}", a.message);
+        let b = publish("tenant-b", 1).await;
+        let b_view = get("tenant-b", &a.mx_source_id).await;
+        CrossNamespacePublish {
+            b_publish_accepted: b.success,
+            a_still_finds_worker: get("tenant-a", &a.mx_source_id).await.found,
+            a_still_lists_worker: lists("tenant-a").await,
+            b_reads_rank: b_view
+                .found
+                .then(|| b_view.worker.map(|worker| worker.worker_rank))
+                .flatten(),
+        }
+    }
+
+    fn worker_left_with_its_owner() -> CrossNamespacePublish {
+        CrossNamespacePublish {
+            b_publish_accepted: false,
+            a_still_finds_worker: true,
+            a_still_lists_worker: true,
+            b_reads_rank: None,
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn memory_publish_cannot_take_another_namespaces_worker() {
+        let svc = isolated_service();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, test_identity(), "worker-a").await,
+            worker_left_with_its_owner()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn redis_publish_cannot_take_another_namespaces_worker() {
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = crate::p2p::backend::redis::RedisBackend::new(&redis_url);
+        crate::p2p::backend::MetadataBackend::connect(&backend)
+            .await
+            .expect("connect");
+        let svc = P2pServiceImpl::with_tenant_isolation(
+            Arc::new(P2pStateManager::with_backend(Arc::new(backend))),
+            true,
+        );
+        let mut identity = test_identity();
+        identity.model_name = format!("cross-namespace/{}", uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, identity, &worker_id).await,
+            worker_left_with_its_owner()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a cluster with the ModelMetadata CRD and MX_TEST_K8S_NAMESPACE"]
+    async fn kubernetes_publish_cannot_take_another_namespaces_worker() {
+        let namespace = std::env::var("MX_TEST_K8S_NAMESPACE").expect("MX_TEST_K8S_NAMESPACE");
+        let backend = crate::p2p::backend::kubernetes::KubernetesBackend::new(&namespace)
+            .await
+            .expect("kube client");
+        let svc = P2pServiceImpl::with_tenant_isolation(
+            Arc::new(P2pStateManager::with_backend(Arc::new(backend))),
+            true,
+        );
+        let mut identity = test_identity();
+        identity.model_name = format!("cross-namespace-{}", uuid::Uuid::new_v4());
+        let worker_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            publish_into_another_namespaces_worker(&svc, identity, &worker_id).await,
+            worker_left_with_its_owner()
         );
     }
 }
