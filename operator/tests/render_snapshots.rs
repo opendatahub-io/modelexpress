@@ -138,6 +138,7 @@ fn full_spec() -> ModelExpressServerSpec {
                 }))
                 .expect("peer"),
             ],
+            monitoring_from: vec![],
         }),
         service_account_name: None,
         pod_security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
@@ -187,10 +188,7 @@ fn full_redis_backend() {
     insta::assert_yaml_snapshot!("full_deployment", state.deployment);
     insta::assert_yaml_snapshot!("full_service", state.service);
     insta::assert_yaml_snapshot!("full_pvc", state.pvc.expect("managed pvc"));
-    insta::assert_yaml_snapshot!(
-        "full_networkpolicy",
-        state.network_policy.expect("network policy")
-    );
+    insta::assert_yaml_snapshot!("full_networkpolicy", state.network_policy);
 }
 
 #[test]

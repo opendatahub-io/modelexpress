@@ -3,7 +3,9 @@
 
 //! config/manifests/openshift: the operator as deployed on OpenShift.
 
-use crate::objects::{METRICS_SERVICE_NAME, NAME, PARAMS_CONFIGMAP, SERVER_IMAGE_PARAM, labels};
+use crate::objects::{
+    METRICS_SERVICE_NAME, NAME, PARAMS_CONFIGMAP, SERVER_IMAGE_PARAM, labels, metrics_ingress,
+};
 use modelexpress_operator::telemetry;
 use modelexpress_operator_openshift::images::SERVER_IMAGE_ENV;
 use modelexpress_operator_openshift::servicemonitor;
@@ -104,8 +106,9 @@ pub fn overlay() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 /// Kustomize Component: strategic-merge patches and extra objects that turn
-/// the metrics endpoint into service-ca TLS, and the RBAC the operator needs
-/// to read the cluster TLS profile. Namespace-agnostic, so every overlay that
+/// the metrics endpoint into service-ca TLS (and move the NetworkPolicy's
+/// metrics rule with it), and the RBAC the operator needs to read the cluster
+/// TLS profile. Namespace-agnostic, so every overlay that
 /// targets OpenShift shares it.
 pub fn component() -> Vec<(&'static str, serde_json::Value)> {
     vec![
@@ -121,6 +124,7 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
                 "patches": [
                     {"path": "deployment-patch.yaml", "target": {"kind": "Deployment", "name": NAME}},
                     {"path": "service-patch.yaml", "target": {"kind": "Service", "name": METRICS_SERVICE_NAME}},
+                    {"path": "networkpolicy-patch.yaml", "target": {"kind": "NetworkPolicy", "name": NAME}},
                 ],
             }),
         ),
@@ -168,6 +172,15 @@ pub fn component() -> Vec<(&'static str, serde_json::Value)> {
                     "port": telemetry::METRICS_TLS_PORT,
                     "targetPort": telemetry::METRICS_TLS_PORT_NAME,
                 }]},
+            }),
+        ),
+        (
+            "networkpolicy-patch.yaml",
+            json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": NAME},
+                "spec": {"ingress": metrics_ingress(telemetry::METRICS_TLS_PORT)},
             }),
         ),
         (
@@ -312,6 +325,31 @@ mod tests {
                 "{file} ships {name}, which the platform owns"
             );
         }
+    }
+
+    #[test]
+    fn component_moves_the_metrics_rule_to_the_tls_port() {
+        let files = component();
+        let kustomization = &files[0].1;
+        let patches = kustomization["patches"].as_array().expect("patches");
+        assert!(patches.iter().any(|patch| {
+            patch["path"] == "networkpolicy-patch.yaml"
+                && patch["target"]
+                    == serde_json::json!({"kind": "NetworkPolicy", "name": crate::objects::NAME})
+        }));
+        let patch = &files
+            .iter()
+            .find(|(file, _)| *file == "networkpolicy-patch.yaml")
+            .expect("has a NetworkPolicy patch")
+            .1;
+        assert_eq!(
+            patch["spec"]["ingress"],
+            serde_json::to_value(crate::objects::metrics_ingress(
+                modelexpress_operator::telemetry::METRICS_TLS_PORT
+            ))
+            .expect("serializes")
+        );
+        assert_eq!(patch["spec"].as_object().map(|spec| spec.len()), Some(1));
     }
 
     #[test]

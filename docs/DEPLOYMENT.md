@@ -733,6 +733,56 @@ helm/deploy.sh --namespace my-ns --values helm/values-local-storage.yaml
 
 See [`../helm/README.md`](../helm/README.md) for the full parameter reference and installation guide.
 
+### Operator NetworkPolicies
+
+The ModelExpress operator reconciles a NetworkPolicy for every `ModelExpressServer`,
+named after the CR and selecting its server pods. The CR owns it, the operator recreates
+it if it is deleted, and the CR reports not ready while it cannot be applied. Its
+`NetworkPolicyReady` condition is `True` once the policy is applied. A same-named
+NetworkPolicy the CR does not control is left untouched: `NetworkPolicyReady` goes
+`False` with reason `NotOwned`, and the rest of the server is still applied with `Ready`
+unaffected. `spec.networkPolicy` selects the profile:
+
+- **Compatibility** (`allowFrom` unset or empty): the gRPC port (`spec.port`), port
+  15008 and the metrics port (9401) admit any source.
+- **Restrictive** (`allowFrom` set): the gRPC port and port 15008 admit only `allowFrom`,
+  and the metrics port admits only `monitoringFrom`, which defaults to
+  `openshift-monitoring`, `openshift-user-workload-monitoring` and `redhat-ods-monitoring`.
+
+Port 15008 is Istio ambient's HBONE port: when the server's namespace is enrolled in
+ambient mode, traffic from other mesh workloads arrives on it instead of on the gRPC
+port, so it gets the same peers.
+
+```yaml
+spec:
+  networkPolicy:
+    allowFrom:
+      - podSelector: {}   # every pod in the server's own namespace
+```
+
+`podSelector: {}` admits the server's whole namespace and nothing outside it; use it
+when that namespace holds only the server's callers. Egress is allow-all, because the
+server downloads from Hugging Face, S3, GCS, NGC and image registries at addresses a
+NetworkPolicy cannot name.
+
+The operator's own install bundle (`config/manifests`, including `overlays/odh` and
+`overlays/odh-xks`) ships a NetworkPolicy named `modelexpress-operator` for the operator
+pod. The platform that installs the bundle applies and removes it; the operator does not
+reconcile it.
+
+| Direction | Port | Peers |
+|---|---|---|
+| Ingress | metrics: 8443/TCP on OpenShift, 8080/TCP elsewhere | `openshift-monitoring`, `openshift-user-workload-monitoring`, `redhat-ods-monitoring` |
+| Ingress | health: 8081/TCP | Kubelet probes only; NetworkPolicy always admits the pod's own node. |
+| Egress | all | Allow-all |
+
+`cargo xtask check-bundle <rendered.yaml>` checks a kustomize render of the bundle
+against the ADR-0016 bundle rules, and `ci/check-manifest-overlays.sh` runs it on every
+overlay.
+
+NetworkPolicy covers the pod network only. NIXL traffic over RDMA or another secondary
+network is not filtered by it.
+
 ### Monitoring
 
 The chart defaults to `prometheus.io/*` pod annotations, which

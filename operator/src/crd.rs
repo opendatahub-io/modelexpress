@@ -139,8 +139,12 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
 
-    /// Opt-in NetworkPolicy for the gRPC port. Governs the metadata plane
-    /// only; worker-to-worker RDMA never crosses the CNI.
+    /// Profile of the NetworkPolicy the operator always applies to the server
+    /// pods. Unset or with an empty allowFrom (compatibility profile), the gRPC
+    /// port, Istio ambient's HBONE port 15008 and the metrics port 9401 admit
+    /// any source. With allowFrom (restrictive profile), gRPC and 15008 admit
+    /// only allowFrom and the metrics port only monitoringFrom. Governs the
+    /// metadata plane only; worker-to-worker RDMA never crosses the CNI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<NetworkPolicyConfig>,
 
@@ -162,17 +166,25 @@ pub struct ModelExpressServerSpec {
     pub service_account_name: Option<String>,
 }
 
-/// Restricts ingress to the server's gRPC port to the listed peers. Peers are
-/// verbatim networking/v1 NetworkPolicyPeer, so namespaceSelector/podSelector/
-/// ipBlock all work. Enforcement is up to the cluster CNI.
+/// Selects the server NetworkPolicy's profile: compatibility when allowFrom
+/// is empty, restrictive otherwise. Peers are verbatim networking/v1
+/// NetworkPolicyPeer, so namespaceSelector/podSelector/ipBlock all work.
+/// Enforcement is up to the cluster CNI.
 #[derive(CELSchema, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyConfig {
-    /// Who may connect. Deliberately required and non-empty: an empty `from`
-    /// in a NetworkPolicy rule means allow-everywhere, which is what *not*
-    /// setting networkPolicy already gives you.
-    #[schemars(length(min = 1, max = 32))]
+    /// Sources admitted to the gRPC port and to Istio ambient's HBONE port
+    /// 15008. Empty admits any source (compatibility profile); non-empty
+    /// admits only these (restrictive profile).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
     pub allow_from: Vec<k8s_openapi::api::networking::v1::NetworkPolicyPeer>,
+    /// Sources admitted to the metrics port in the restrictive profile.
+    /// Defaults to openshift-monitoring, openshift-user-workload-monitoring
+    /// and redhat-ods-monitoring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
+    pub monitoring_from: Vec<k8s_openapi::api::networking::v1::NetworkPolicyPeer>,
 }
 
 fn default_replicas() -> i32 {
@@ -529,7 +541,8 @@ pub struct SecretKeyRef {
 pub struct ModelExpressServerStatus {
     /// Generation last acted on by the controller.
     pub observed_generation: Option<i64>,
-    /// Standard conditions; Ready is the rollup.
+    /// Standard conditions. Ready reports whether the server's resources were
+    /// applied, NetworkPolicyReady whether its NetworkPolicy was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
     /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as

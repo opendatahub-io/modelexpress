@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod bundle_policy;
 mod objects;
 mod odh;
 mod openshift;
@@ -28,6 +29,16 @@ enum XtaskError {
     Stale { path: PathBuf, cmd: &'static str },
     #[error("{path}: not a valid .yaml file name")]
     BadFileName { path: PathBuf },
+    #[error("{path}: {source}")]
+    Bundle {
+        path: PathBuf,
+        source: bundle_policy::BundleError,
+    },
+    #[error("{path} breaks ODH ADR-0016:\n  {}", violations.join("\n  "))]
+    BundlePolicy {
+        path: PathBuf,
+        violations: Vec<String>,
+    },
 }
 
 type Result<T> = std::result::Result<T, XtaskError>;
@@ -63,6 +74,12 @@ enum Cmd {
         /// Controller image to render, e.g. a release digest
         #[arg(long, default_value = objects::DEFAULT_IMAGE)]
         image: String,
+    },
+    /// Check a `kustomize build` of the operator bundle against the ODH
+    /// ADR-0016 module-bundle NetworkPolicy and RBAC rules
+    CheckBundle {
+        /// Rendered multi-document YAML
+        rendered: PathBuf,
     },
 }
 
@@ -124,7 +141,27 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Crdgen { check } => write_or_check(all_crds()?, check, "crdgen"),
         Cmd::Manifests { check, image } => write_or_check(manifests(&image)?, check, "manifests"),
+        Cmd::CheckBundle { rendered } => check_bundle(&rendered),
     }
+}
+
+fn check_bundle(path: &Path) -> Result<()> {
+    let rendered = std::fs::read_to_string(path).map_err(io_err(path))?;
+    let bundle = bundle_policy::Bundle::parse(&rendered).map_err(|source| XtaskError::Bundle {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let violations = bundle_policy::violations(&bundle);
+    if !violations.is_empty() {
+        return Err(XtaskError::BundlePolicy {
+            path: path.to_path_buf(),
+            violations,
+        });
+    }
+    for line in bundle_policy::summary(&bundle) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// All CRDs the operator installs: ours, plus the upstream backend CRDs
@@ -183,6 +220,10 @@ fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
         (
             config.join("manager/service.yaml"),
             to_yaml(&objects::metrics_service())?,
+        ),
+        (
+            config.join("manager/networkpolicy.yaml"),
+            to_yaml(&objects::network_policy())?,
         ),
         (config.join("base/params.env"), objects::params_env(image)),
     ]
