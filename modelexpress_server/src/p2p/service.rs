@@ -314,6 +314,8 @@ impl P2pService for P2pServiceImpl {
         let status_filter = req
             .status_filter
             .and_then(|s| SourceStatus::try_from(s).ok());
+        let limit = req.limit.map(|value| value as usize);
+        let backend_limit = if scope.is_some() { None } else { limit };
 
         let workers: Vec<SourceInstanceInfo> = match self
             .state
@@ -324,7 +326,7 @@ impl P2pService for P2pServiceImpl {
                 req.worker_rank_filter,
                 req.min_training_step,
                 req.min_updated_at,
-                req.limit.map(|value| value as usize),
+                backend_limit,
             )
             .await
         {
@@ -355,6 +357,7 @@ impl P2pService for P2pServiceImpl {
         let refs: Vec<SourceInstanceRef> = workers
             .into_iter()
             .filter(|info| owner_in_scope(scope.as_deref(), info.owner_namespace.as_deref()))
+            .take(limit.filter(|value| *value > 0).unwrap_or(usize::MAX))
             .map(|info| SourceInstanceRef {
                 mx_source_id: info.source_id,
                 worker_id: info.worker_id,
@@ -1753,5 +1756,48 @@ mod tests {
             publish_into_another_namespaces_worker(&svc, identity, &worker_id).await,
             worker_left_with_its_owner()
         );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn limit_counts_only_the_callers_sources() {
+        let svc = isolated_service();
+        for (namespace, worker_id, updated_at) in [
+            ("tenant-a", "worker-a", 1_000),
+            ("tenant-b", "worker-b", 2_000),
+        ] {
+            let mut req = Request::new(PublishMetadataRequest {
+                identity: Some(test_identity()),
+                worker: Some(WorkerMetadata {
+                    updated_at,
+                    ..worker_meta(0)
+                }),
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(caller(namespace));
+            assert!(
+                svc.publish_metadata(req)
+                    .await
+                    .expect("rpc")
+                    .into_inner()
+                    .success
+            );
+        }
+        let mut req = Request::new(ListSourcesRequest {
+            limit: Some(1),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(caller("tenant-a"));
+        let listed: Vec<String> = svc
+            .list_sources(req)
+            .await
+            .expect("rpc")
+            .into_inner()
+            .instances
+            .into_iter()
+            .map(|instance| instance.worker_id)
+            .collect();
+        assert_eq!(listed, vec!["worker-a".to_string()]);
     }
 }
