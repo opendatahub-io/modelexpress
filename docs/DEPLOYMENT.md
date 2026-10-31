@@ -298,8 +298,9 @@ and no partial pattern (`ns:worker-*`). A `<namespace>:*` entry admits every
 ServiceAccount in that namespace, including ones created later.
 
 With `MODEL_EXPRESS_SECURITY_TENANT_ISOLATION=enforce`, `PublishMetadata` records the
-caller's verified namespace as the worker's owner, and `ListSources`, `GetMetadata` and
-`UpdateStatus` only see workers owned by the caller's namespace. A `GetMetadata` for
+caller's verified namespace as the worker's owner and rejects a publish to a worker that
+another namespace owns, and `ListSources`, `GetMetadata` and `UpdateStatus` only see
+workers owned by the caller's namespace. A `GetMetadata` for
 another namespace's worker returns not found. Ownership is per worker: `mx_source_id`
 carries no namespace, so the same model published from two namespaces shares a source id
 with separate workers. Isolation requires `MODEL_EXPRESS_SECURITY_MODE=enforce` and is off
