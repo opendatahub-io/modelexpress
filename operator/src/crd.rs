@@ -527,7 +527,8 @@ pub struct SecretKeyRef {
 pub struct ModelExpressServerStatus {
     /// Generation last acted on by the controller.
     pub observed_generation: Option<i64>,
-    /// Standard conditions; Ready is the rollup.
+    /// Standard conditions. Ready reports whether the server's resources were
+    /// applied, NetworkPolicyReady whether its NetworkPolicy was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
     /// gRPC endpoint clients should set MODEL_EXPRESS_ENDPOINT to, as

@@ -684,8 +684,11 @@ See [`../helm/README.md`](../helm/README.md) for the full parameter reference an
 
 The ModelExpress operator reconciles a NetworkPolicy for every `ModelExpressServer`,
 named after the CR and selecting its server pods. The CR owns it, the operator recreates
-it if it is deleted, and the CR reports not ready while it cannot be applied.
-`spec.networkPolicy` selects the profile:
+it if it is deleted, and the CR reports not ready while it cannot be applied. Its
+`NetworkPolicyReady` condition is `True` once the policy is applied. A same-named
+NetworkPolicy the CR does not control is left untouched: `NetworkPolicyReady` goes
+`False` with reason `NotOwned`, and the rest of the server is still applied with `Ready`
+unaffected. `spec.networkPolicy` selects the profile:
 
 - **Compatibility** (`allowFrom` unset or empty): the gRPC port (`spec.port`), port
   15008 and the metrics port (9401) admit any source.

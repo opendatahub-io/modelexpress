@@ -1497,7 +1497,7 @@ spec:
             nullable: true
             properties:
               conditions:
-                description: Standard conditions; Ready is the rollup.
+                description: Standard conditions. Ready reports whether the server's resources were applied, NetworkPolicyReady whether its NetworkPolicy was.
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
                   properties:

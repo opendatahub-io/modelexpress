@@ -171,23 +171,9 @@ async fn reconcile_inner(cr: Arc<ModelExpressServer>, ctx: Arc<Ctx>) -> Result<A
     }
 
     let result = apply(&cr, &ns, &name, &ctx).await;
-    let (condition, endpoint, observed_generation) = match &result {
-        Ok(()) => (
-            ready_condition(&cr, "True", "Applied", "resources applied"),
-            Some(endpoint(&name, &ns, cr.spec.port, cr.spec.tls.is_some())),
-            cr.metadata.generation,
-        ),
-        Err(err) => (
-            ready_condition(&cr, "False", reason(err), &err.to_string()),
-            None,
-            // clients compare this against metadata.generation to decide
-            // whether the current spec has been acted on
-            cr.status.as_ref().and_then(|s| s.observed_generation),
-        ),
-    };
-    write_status(&ns, &name, &ctx, condition, endpoint, observed_generation).await?;
+    write_status(&ns, &name, &ctx, status_for(&cr, &ns, &name, &result)).await?;
 
-    result.map(|()| Action::requeue(Duration::from_secs(300)))
+    result.map(|_| Action::requeue(Duration::from_secs(300)))
 }
 
 /// What clients set MODEL_EXPRESS_ENDPOINT to. The Service is always named
@@ -210,8 +196,21 @@ fn server_image<'a>(
         .ok_or(Error::ServerImageUnset)
 }
 
+/// What became of the server NetworkPolicy in an apply that succeeded.
+#[derive(Debug)]
+enum NetworkPolicyOutcome {
+    Applied,
+    /// A same-named policy this CR does not control was left in place.
+    NotOwned,
+}
+
 #[tracing::instrument(skip_all)]
-async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Result<(), Error> {
+async fn apply(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    ctx: &Ctx,
+) -> Result<NetworkPolicyOutcome, Error> {
     check_existing_claim(cr, ns, ctx).await?;
     let uid = cr.metadata.uid.clone().ok_or(Error::MissingUid)?;
 
@@ -259,16 +258,26 @@ async fn apply(cr: &ModelExpressServer, ns: &str, name: &str, ctx: &Ctx) -> Resu
     api.patch(name, &params, &Patch::Apply(&service)).await?;
 
     let api = Api::<NetworkPolicy>::namespaced(ctx.client.clone(), ns);
-    stamp(
-        &mut network_policy.metadata,
-        ns,
-        cr.controller_owner_ref(&()),
-    );
-    api.patch(name, &params, &Patch::Apply(&network_policy))
-        .await?;
+    let existing = api.get_opt(name).await?;
+    let outcome = if may_apply(existing.as_ref().map(|np| &np.metadata), &uid) {
+        stamp(
+            &mut network_policy.metadata,
+            ns,
+            cr.controller_owner_ref(&()),
+        );
+        api.patch(name, &params, &Patch::Apply(&network_policy))
+            .await?;
+        NetworkPolicyOutcome::Applied
+    } else {
+        tracing::warn!(
+            name,
+            "NetworkPolicy not controlled by this CR, leaving it in place"
+        );
+        NetworkPolicyOutcome::NotOwned
+    };
 
     tracing::debug!("desired state applied");
-    Ok(())
+    Ok(outcome)
 }
 
 #[tracing::instrument(skip_all)]
@@ -430,9 +439,7 @@ async fn delete_if_managed(
 }
 
 /// Cleanup targets names derived from the CR, not names the operator can prove
-/// it created. `spec.networkPolicy` is unset by default, so without this check
-/// the netpol branch deletes a user's unrelated same-named policy on every
-/// reconcile.
+/// it created, so an unrelated object that shares the name is left in place.
 async fn delete_if_owned<K>(api: &Api<K>, name: &str, owner_uid: &str) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -457,6 +464,16 @@ fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
         .iter()
         .flatten()
         .any(|owner| owner.uid == owner_uid)
+}
+
+/// True when nothing exists at the name yet or this CR is its controller.
+fn may_apply(existing: Option<&ObjectMeta>, owner_uid: &str) -> bool {
+    existing.is_none_or(|meta| {
+        meta.owner_references
+            .iter()
+            .flatten()
+            .any(|owner| owner.controller == Some(true) && owner.uid == owner_uid)
+    })
 }
 
 /// The admission rules can't see an existing claim's access modes; enforce the
@@ -521,13 +538,15 @@ fn reason(err: &Error) -> &'static str {
 }
 
 pub const READY_CONDITION: &str = "Ready";
+pub const NETWORK_POLICY_CONDITION: &str = "NetworkPolicyReady";
 
 /// Carries lastTransitionTime forward while the condition holds, per the API
 /// conventions. Restamping it makes every status write differ from the stored
 /// object, and since the controller watches its own CR that write schedules
 /// the next reconcile: an unbounded loop the requeue never gates.
-fn ready_condition(
+fn condition(
     cr: &ModelExpressServer,
+    type_: &str,
     status: &str,
     reason: &str,
     message: &str,
@@ -535,7 +554,7 @@ fn ready_condition(
     let previous = cr
         .status
         .as_ref()
-        .and_then(|s| s.conditions.iter().find(|c| c.type_ == READY_CONDITION));
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == type_));
     let last_transition_time = match previous {
         Some(prev) if prev.status == status && prev.reason == reason && prev.message == message => {
             prev.last_transition_time.clone()
@@ -544,7 +563,7 @@ fn ready_condition(
     };
 
     Condition {
-        type_: READY_CONDITION.to_string(),
+        type_: type_.to_string(),
         status: status.to_string(),
         reason: reason.to_string(),
         message: message.to_string(),
@@ -553,20 +572,66 @@ fn ready_condition(
     }
 }
 
+/// The status a reconcile writes for its apply result.
+fn status_for(
+    cr: &ModelExpressServer,
+    ns: &str,
+    name: &str,
+    result: &Result<NetworkPolicyOutcome, Error>,
+) -> ModelExpressServerStatus {
+    match result {
+        Ok(outcome) => {
+            let network_policy = match outcome {
+                NetworkPolicyOutcome::Applied => condition(
+                    cr,
+                    NETWORK_POLICY_CONDITION,
+                    "True",
+                    "Applied",
+                    &format!("NetworkPolicy {name} applied"),
+                ),
+                NetworkPolicyOutcome::NotOwned => condition(
+                    cr,
+                    NETWORK_POLICY_CONDITION,
+                    "False",
+                    "NotOwned",
+                    &format!(
+                        "NetworkPolicy {name} is not controlled by this ModelExpressServer; \
+                         left in place"
+                    ),
+                ),
+            };
+            ModelExpressServerStatus {
+                observed_generation: cr.metadata.generation,
+                conditions: vec![
+                    condition(cr, READY_CONDITION, "True", "Applied", "resources applied"),
+                    network_policy,
+                ],
+                endpoint: Some(endpoint(name, ns, cr.spec.port, cr.spec.tls.is_some())),
+            }
+        }
+        Err(err) => ModelExpressServerStatus {
+            // clients compare this against metadata.generation to decide
+            // whether the current spec has been acted on
+            observed_generation: cr.status.as_ref().and_then(|s| s.observed_generation),
+            conditions: vec![condition(
+                cr,
+                READY_CONDITION,
+                "False",
+                reason(err),
+                &err.to_string(),
+            )],
+            endpoint: None,
+        },
+    }
+}
+
 #[tracing::instrument(skip_all)]
 async fn write_status(
     ns: &str,
     name: &str,
     ctx: &Ctx,
-    condition: Condition,
-    endpoint: Option<String>,
-    observed_generation: Option<i64>,
+    status: ModelExpressServerStatus,
 ) -> Result<(), Error> {
-    let status = ModelExpressServerStatus {
-        observed_generation,
-        conditions: vec![condition],
-        endpoint,
-    };
     let api = Api::<ModelExpressServer>::namespaced(ctx.client.clone(), ns);
     // from the Resource impl so the group is spelled once, in the derive
     let patch = serde_json::json!({
@@ -711,7 +776,7 @@ mod tests {
             !is_owned_by(&owned_by(&[OTHER]), UID),
             "owned by a different CR"
         );
-        // a user's own NetworkPolicy that merely shares the CR's name
+        // a user's own object that merely shares a derived name
         assert!(
             !is_owned_by(&ObjectMeta::default(), UID),
             "an unowned object must never be deleted"
@@ -722,7 +787,7 @@ mod tests {
     fn unchanged_condition_keeps_its_transition_time() {
         let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
         let cr = server(with_ready(stamped(earlier, "True", "Applied")));
-        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        let next = condition(&cr, READY_CONDITION, "True", "Applied", "resources applied");
         assert_eq!(
             next.last_transition_time,
             Time(earlier),
@@ -734,7 +799,13 @@ mod tests {
     fn flipping_status_restamps_transition_time() {
         let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
         let cr = server(with_ready(stamped(earlier, "True", "Applied")));
-        let next = ready_condition(&cr, "False", "ApplyFailed", "kube api: boom");
+        let next = condition(
+            &cr,
+            READY_CONDITION,
+            "False",
+            "ApplyFailed",
+            "kube api: boom",
+        );
         assert!(next.last_transition_time.0 > earlier);
     }
 
@@ -742,7 +813,13 @@ mod tests {
     fn same_status_but_new_reason_restamps() {
         let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
         let cr = server(with_ready(stamped(earlier, "False", "CacheClaimMissing")));
-        let next = ready_condition(&cr, "False", "ApplyFailed", "resources applied");
+        let next = condition(
+            &cr,
+            READY_CONDITION,
+            "False",
+            "ApplyFailed",
+            "resources applied",
+        );
         assert!(next.last_transition_time.0 > earlier);
     }
 
@@ -750,7 +827,13 @@ mod tests {
     fn same_status_and_reason_but_new_message_restamps() {
         let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
         let cr = server(with_ready(stamped(earlier, "False", "ApplyFailed")));
-        let next = ready_condition(&cr, "False", "ApplyFailed", "kube api: different");
+        let next = condition(
+            &cr,
+            READY_CONDITION,
+            "False",
+            "ApplyFailed",
+            "kube api: different",
+        );
         assert!(next.last_transition_time.0 > earlier);
     }
 
@@ -758,7 +841,7 @@ mod tests {
     fn first_reconcile_stamps_a_fresh_time() {
         let before = chrono::Utc::now();
         let cr = server(None);
-        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        let next = condition(&cr, READY_CONDITION, "True", "Applied", "resources applied");
         assert!(next.last_transition_time.0 >= before);
         assert_eq!(next.type_, READY_CONDITION);
         assert_eq!(next.observed_generation, Some(1));
@@ -771,7 +854,162 @@ mod tests {
         other.type_ = "Degraded".to_string();
         let before = chrono::Utc::now();
         let cr = server(with_ready(other));
-        let next = ready_condition(&cr, "True", "Applied", "resources applied");
+        let next = condition(&cr, READY_CONDITION, "True", "Applied", "resources applied");
         assert!(next.last_transition_time.0 >= before);
+    }
+
+    #[test]
+    fn network_policy_is_applied_only_when_absent_or_controlled_by_this_cr() {
+        const UID: &str = "11111111-2222-3333-4444-555555555555";
+        let mut cr = server(None);
+        cr.metadata.uid = Some(UID.to_string());
+        let ours = cr.controller_owner_ref(&()).expect("controller ref");
+        let plain_ref_to_us = cr.owner_ref(&()).expect("owner ref");
+        let other_controller = OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            name: "other-controller".to_string(),
+            uid: "99999999-8888-7777-6666-555555555555".to_string(),
+            controller: Some(true),
+            block_owner_deletion: None,
+        };
+        let other_plain = OwnerReference {
+            controller: None,
+            ..other_controller.clone()
+        };
+        let meta = |owners: Option<Vec<OwnerReference>>| ObjectMeta {
+            name: Some("mx".to_string()),
+            namespace: Some("ns".to_string()),
+            uid: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
+            owner_references: owners,
+            ..ObjectMeta::default()
+        };
+
+        assert!(may_apply(None, UID), "nothing at the name yet");
+        assert!(
+            may_apply(Some(&meta(Some(vec![ours.clone()]))), UID),
+            "already controlled by this CR"
+        );
+        assert!(
+            may_apply(
+                Some(&meta(Some(vec![other_plain.clone(), ours.clone()]))),
+                UID
+            ),
+            "controlled by this CR alongside a plain owner"
+        );
+        assert!(!may_apply(Some(&meta(None)), UID), "no owner at all");
+        assert!(
+            !may_apply(Some(&meta(Some(vec![]))), UID),
+            "empty ownerReferences"
+        );
+        assert!(
+            !may_apply(Some(&meta(Some(vec![other_controller.clone()]))), UID),
+            "controlled by something else"
+        );
+        assert!(
+            !may_apply(Some(&meta(Some(vec![plain_ref_to_us.clone()]))), UID),
+            "a non-controller reference to this CR"
+        );
+        assert!(
+            !may_apply(
+                Some(&meta(Some(vec![OwnerReference {
+                    controller: Some(false),
+                    ..ours.clone()
+                }]))),
+                UID
+            ),
+            "a reference to this CR with controller: false"
+        );
+        assert!(
+            !may_apply(
+                Some(&meta(Some(vec![other_controller, plain_ref_to_us]))),
+                UID
+            ),
+            "controlled by something else that also lists this CR"
+        );
+    }
+
+    #[test]
+    fn a_foreign_network_policy_leaves_ready_and_the_endpoint_alone() {
+        let cr = server(None);
+        let applied = status_for(&cr, "ns", "mx", &Ok(NetworkPolicyOutcome::Applied));
+        let not_owned = status_for(&cr, "ns", "mx", &Ok(NetworkPolicyOutcome::NotOwned));
+        for status in [&applied, &not_owned] {
+            assert_eq!(status.conditions.len(), 2);
+            let ready = &status.conditions[0];
+            assert_eq!(
+                ready.type_, READY_CONDITION,
+                "the printer columns read conditions[0]"
+            );
+            assert_eq!(ready.status, "True");
+            assert_eq!(ready.reason, "Applied");
+            assert_eq!(
+                status.endpoint.as_deref(),
+                Some("http://mx.ns.svc.cluster.local:8001")
+            );
+            assert_eq!(status.observed_generation, Some(1));
+        }
+
+        let netpol = &applied.conditions[1];
+        assert_eq!(netpol.type_, NETWORK_POLICY_CONDITION);
+        assert_eq!(netpol.status, "True");
+        assert_eq!(netpol.reason, "Applied");
+        assert_eq!(netpol.observed_generation, Some(1));
+
+        let netpol = &not_owned.conditions[1];
+        assert_eq!(netpol.type_, NETWORK_POLICY_CONDITION);
+        assert_eq!(netpol.status, "False");
+        assert_eq!(netpol.reason, "NotOwned");
+        assert!(
+            netpol.message.contains("NetworkPolicy mx "),
+            "message names the policy: {}",
+            netpol.message
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_reports_only_ready() {
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut cr = server(with_ready(stamped(earlier, "True", "Applied")));
+        cr.metadata.generation = Some(2);
+        let status = status_for(&cr, "ns", "mx", &Err(Error::ServerImageUnset));
+        assert_eq!(status.conditions.len(), 1);
+        let ready = &status.conditions[0];
+        assert_eq!(ready.type_, READY_CONDITION);
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "ServerImageUnset");
+        assert_eq!(status.endpoint, None);
+        assert_eq!(
+            status.observed_generation,
+            Some(1),
+            "a failed apply has not acted on generation 2"
+        );
+    }
+
+    #[test]
+    fn network_policy_condition_keeps_its_own_transition_time() {
+        let ready_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        let netpol_at = chrono::Utc::now() - chrono::Duration::hours(9);
+        let mut previous = status_for(
+            &server(None),
+            "ns",
+            "mx",
+            &Ok(NetworkPolicyOutcome::NotOwned),
+        );
+        previous.conditions[0].last_transition_time = Time(ready_at);
+        previous.conditions[1].last_transition_time = Time(netpol_at);
+        let cr = server(Some(previous));
+
+        let unchanged = status_for(&cr, "ns", "mx", &Ok(NetworkPolicyOutcome::NotOwned));
+        assert_eq!(unchanged.conditions[0].last_transition_time, Time(ready_at));
+        assert_eq!(
+            unchanged.conditions[1].last_transition_time,
+            Time(netpol_at),
+            "restamping an unchanged condition re-triggers our own watch"
+        );
+
+        let flipped = status_for(&cr, "ns", "mx", &Ok(NetworkPolicyOutcome::Applied));
+        assert_eq!(flipped.conditions[0].last_transition_time, Time(ready_at));
+        assert!(flipped.conditions[1].last_transition_time.0 > ready_at);
     }
 }
