@@ -1157,6 +1157,48 @@ impl ModelDownloadTracker {
         });
     }
 
+    /// True when this server's cache holds every file recorded for `target`.
+    async fn recorded_files_present(&self, target: &DownloadTarget, entry_key: &str) -> bool {
+        if !model_files_present(cache_dir_for(target.tenant.as_ref()), target).await {
+            return false;
+        }
+        // Returning an existing downloaded model is a cache hit for LRU purposes.
+        self.touch_and_log(entry_key).await;
+        true
+    }
+
+    /// Clears a `DOWNLOADED` record whose files this server's cache does not hold, so the
+    /// next claim downloads them here. Returns whether the record was removed.
+    async fn clear_stale_record(&self, model_name: &str, entry_key: &str) -> bool {
+        error!(
+            "Registry reports model '{model_name}' as DOWNLOADED but its files are missing \
+             from the cache; clearing the stale record and re-downloading"
+        );
+        self.delete_status(entry_key).await
+    }
+
+    async fn report_missing_files(
+        identity: &UpdateIdentity<'_>,
+        tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+    ) -> ModelStatus {
+        error!(
+            "Registry still reports model '{}' as DOWNLOADED after clearing it, but its files \
+             are missing from the cache",
+            identity.model_name
+        );
+        let _ = tx
+            .send(Ok(identity.status_update(
+                ModelStatus::ERROR,
+                Some(
+                    "Registry reports the model as downloaded but its files are missing from \
+                     the server cache"
+                        .to_string(),
+                ),
+            )))
+            .await;
+        ModelStatus::ERROR
+    }
+
     /// Initiates a download for a model and streams status updates.
     ///
     /// All registry operations key on the target's entry key rather than its model name,
@@ -1202,34 +1244,13 @@ impl ModelDownloadTracker {
                     break (ModelStatus::DOWNLOADING, true);
                 }
                 Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)) => {
-                    if model_files_present(cache_dir_for(target.tenant.as_ref()), target).await {
-                        // Returning an existing downloaded model is a cache hit for LRU purposes.
-                        self.touch_and_log(entry_key).await;
+                    if self.recorded_files_present(target, entry_key).await {
                         break (ModelStatus::DOWNLOADED, false);
                     }
                     if attempt >= MAX_CLAIM_ATTEMPTS {
-                        error!(
-                            "Registry still reports model '{model_name}' as DOWNLOADED after \
-                             clearing it, but its files are missing from the cache"
-                        );
-                        let _ = tx
-                            .send(Ok(identity.status_update(
-                                ModelStatus::ERROR,
-                                Some(
-                                    "Registry reports the model as downloaded but its files \
-                                     are missing from the server cache"
-                                        .to_string(),
-                                ),
-                            )))
-                            .await;
-                        return ModelStatus::ERROR;
+                        return Self::report_missing_files(&identity, tx).await;
                     }
-                    error!(
-                        "Registry reports model '{model_name}' as DOWNLOADED but its files \
-                         are missing from the cache; clearing the stale record and \
-                         re-downloading"
-                    );
-                    self.delete_status(entry_key).await;
+                    self.clear_stale_record(model_name, entry_key).await;
                 }
                 Ok(ClaimOutcome::AlreadyExists(existing)) => break (existing, false),
                 Err(e) => {
@@ -1310,6 +1331,14 @@ impl ModelDownloadTracker {
                     Ok(ClaimOutcome::Claimed | ClaimOutcome::TookOver) => {
                         self.spawn_download_task(target.clone(), false, claim_id);
                         claim_id = uuid::Uuid::new_v4().to_string();
+                    }
+                    Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)) => {
+                        if self.recorded_files_present(target, entry_key).await {
+                            return ModelStatus::DOWNLOADED;
+                        }
+                        if !self.clear_stale_record(model_name, entry_key).await {
+                            return Self::report_missing_files(&identity, tx).await;
+                        }
                     }
                     Ok(ClaimOutcome::AlreadyExists(current_status))
                         if current_status != ModelStatus::DOWNLOADING =>
@@ -2395,6 +2424,87 @@ mod tests {
         assert!(!drain_statuses(rx).await.contains(&downloaded));
         let record = backend
             .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Download failed")),
+            "unexpected message: {:?}",
+            record.message
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_waiter_does_not_report_a_download_another_server_holds() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        let key = full.entry_key();
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &key,
+                    full.provider,
+                    "other-server",
+                    DOWNLOAD_LEASE_DURATION
+                )
+                .await
+                .expect("Failed to claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let waiter = {
+            let full = full.clone();
+            tokio::spawn(async move { tracker.ensure_model_downloaded(&full, &tx).await })
+        };
+        let waiting = rx
+            .recv()
+            .await
+            .expect("Expected a status update")
+            .expect("Expected an ok status update");
+        assert_eq!(
+            waiting.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloading as i32
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    &key,
+                    full.provider,
+                    "other-server",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("Failed to finish claim")
+        );
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .expect("ensure_model_downloaded did not finish")
+            .expect("ensure_model_downloaded panicked");
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+        let record = backend
+            .get_model_record(&key)
             .await
             .expect("Failed to read record")
             .expect("Expected a record");
@@ -3546,5 +3656,68 @@ mod tests {
             listed(&service, Request::new(request)).await,
             Ok(all_file_names())
         );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_waiter_checks_its_own_partition_before_reporting_a_download() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let target = pinned_target_in("tenant-b", false);
+        let key = target.entry_key();
+        install(cache.path(), &target, &all_files());
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &key,
+                    target.provider,
+                    "other-server",
+                    DOWNLOAD_LEASE_DURATION
+                )
+                .await
+                .expect("Failed to claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let waiter = {
+            let target = target.clone();
+            tokio::spawn(async move { tracker.ensure_model_downloaded(&target, &tx).await })
+        };
+        rx.recv()
+            .await
+            .expect("Expected a status update")
+            .expect("Expected an ok status update");
+        assert!(
+            backend
+                .finish_download_claim(
+                    &key,
+                    target.provider,
+                    "other-server",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("Failed to finish claim")
+        );
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .expect("ensure_model_downloaded did not finish")
+            .expect("ensure_model_downloaded panicked");
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
     }
 }
