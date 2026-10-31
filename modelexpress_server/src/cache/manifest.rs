@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 use modelexpress_common::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 const MANIFEST_DIR: &str = ".modelexpress/downloads";
 
@@ -100,8 +100,28 @@ impl DownloadManifest {
 
     /// True when every recorded file is in `snapshot_dir` at its recorded size.
     pub fn is_satisfied_by(&self, snapshot_dir: &Path) -> bool {
-        self.files.iter().all(|file| {
-            fs::metadata(snapshot_dir.join(&file.path))
+        self.unsatisfied(snapshot_dir).next().is_none()
+    }
+
+    /// Delete the recorded files that are not in `snapshot_dir` at their recorded size. A
+    /// symlink is removed rather than its target.
+    pub fn remove_unsatisfied(&self, snapshot_dir: &Path) {
+        for file in self.unsatisfied(snapshot_dir) {
+            let path = snapshot_dir.join(&file.path);
+            match fs::remove_file(&path) {
+                Ok(()) => info!(
+                    "Removed '{}': it does not match its download manifest",
+                    path.display()
+                ),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to remove '{}': {e}", path.display()),
+            }
+        }
+    }
+
+    fn unsatisfied<'a>(&'a self, snapshot_dir: &'a Path) -> impl Iterator<Item = &'a ManifestFile> {
+        self.files.iter().filter(move |file| {
+            !fs::metadata(snapshot_dir.join(&file.path))
                 .is_ok_and(|meta| meta.is_file() && meta.len() == file.size)
         })
     }
@@ -283,6 +303,44 @@ mod tests {
 
         fs::remove_file(&blob).expect("remove blob");
         assert!(!manifest_of(&FILES[..2]).is_satisfied_by(&snapshot));
+    }
+
+    #[test]
+    fn removing_unsatisfied_files_keeps_the_intact_ones() {
+        let cache = TempDir::new().expect("tempdir");
+        let snapshot = snapshot_with(cache.path(), FILES);
+        fs::write(snapshot.join("model.safetensors"), b"trunc").expect("truncate");
+        let manifest = DownloadManifest::new(
+            KEY,
+            FILES
+                .iter()
+                .map(|(name, body)| (PathBuf::from(name), body.len() as u64))
+                .chain([(PathBuf::from("absent.json"), 1)]),
+        );
+
+        manifest.remove_unsatisfied(&snapshot);
+
+        assert!(!snapshot.join("model.safetensors").exists());
+        assert!(snapshot.join("config.json").exists());
+        assert!(snapshot.join("nested/tokenizer.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_unsatisfied_symlink_keeps_its_target() {
+        let cache = TempDir::new().expect("tempdir");
+        let snapshot = snapshot_with(cache.path(), &FILES[..1]);
+        let blob = cache.path().join("models--org--model/blobs/deadbeef");
+        fs::create_dir_all(blob.parent().expect("parent")).expect("mkdir");
+        fs::write(&blob, b"trunc").expect("write blob");
+        let link = snapshot.join("model.safetensors");
+        std::os::unix::fs::symlink(&blob, &link).expect("symlink");
+
+        manifest_of(&FILES[..2]).remove_unsatisfied(&snapshot);
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(blob.exists());
+        assert!(snapshot.join("config.json").exists());
     }
 
     #[test]

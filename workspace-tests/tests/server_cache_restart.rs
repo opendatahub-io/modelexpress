@@ -15,7 +15,7 @@
 #![allow(clippy::expect_used)]
 
 use std::num::NonZeroU16;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -53,6 +53,12 @@ fn redis_url() -> String {
 
 fn entry_key(metadata_only: bool) -> String {
     EntryKey::new(MODEL, Some(REVISION.to_string()), metadata_only).to_string()
+}
+
+fn snapshot_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir
+        .join("models--hf-internal-testing--tiny-random-gpt2/snapshots")
+        .join(REVISION)
 }
 
 fn free_ports<const N: usize>() -> [u16; N] {
@@ -413,10 +419,7 @@ async fn a_stale_entry_the_server_cannot_clear_is_an_error_not_a_hit() {
             .await
             .expect("finish")
     );
-    let snapshot = cache
-        .path()
-        .join("models--hf-internal-testing--tiny-random-gpt2/snapshots")
-        .join(REVISION);
+    let snapshot = snapshot_dir(cache.path());
     std::fs::create_dir_all(&snapshot).expect("snapshot dir");
     std::fs::write(snapshot.join("config.json"), b"{}").expect("config");
 
@@ -518,6 +521,58 @@ async fn a_waiter_on_another_servers_download_fetches_the_weights_itself() {
         "weights missing from this server's cache: {files:?}"
     );
     assert_eq!(streamed_size(&mut client, WEIGHTS).await, WEIGHTS_SIZE);
+
+    drop(client);
+    server.stop().await;
+    forget_model(&url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Redis at REDIS_URL and Hugging Face Hub access"]
+#[allow(clippy::await_holding_lock)]
+async fn a_truncated_weight_file_is_fetched_again() {
+    let cache = TempDir::new().expect("tempdir");
+    let _env = Environment::new(cache.path(), false);
+    let url = redis_url();
+    forget_model(&url).await;
+
+    let server = Server::start(cache.path(), &url);
+    let mut client = server.client().await;
+    assert_eq!(
+        final_status(&ensure(&mut client, false).await),
+        ModelStatus::Downloaded
+    );
+    let weights = snapshot_dir(cache.path()).join(WEIGHTS);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&weights)
+        .expect("open weights")
+        .set_len(1024)
+        .expect("truncate weights");
+
+    assert_eq!(
+        final_status(&ensure(&mut client, false).await),
+        ModelStatus::Downloaded
+    );
+    let files = list(&mut client, false).await;
+    assert!(
+        files.contains(&(WEIGHTS.to_string(), WEIGHTS_SIZE)),
+        "truncated weights were recorded instead of fetched again: {files:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&weights).expect("weights").len(),
+        WEIGHTS_SIZE
+    );
+    assert_eq!(streamed_size(&mut client, WEIGHTS).await, WEIGHTS_SIZE);
+    assert_eq!(
+        ensure(&mut client, false)
+            .await
+            .iter()
+            .map(|update| ModelStatus::try_from(update.status).expect("known status"))
+            .collect::<Vec<_>>(),
+        vec![ModelStatus::Downloaded, ModelStatus::Downloaded],
+        "the repaired download should be a cache hit"
+    );
 
     drop(client);
     server.stop().await;
