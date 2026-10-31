@@ -31,6 +31,9 @@ pub const TLS_VOLUME_NAME: &str = "tls";
 /// The server's built-in Prometheus port.
 const METRICS_PORT: i32 = 9401;
 
+/// Istio ambient's HBONE port, where ztunnel delivers mesh traffic.
+const HBONE_PORT: i32 = 15008;
+
 /// Namespaces admitted to the metrics port when `monitoringFrom` is unset.
 const DEFAULT_MONITORING_NAMESPACES: [&str; 3] = [
     "openshift-monitoring",
@@ -216,9 +219,9 @@ pub fn default_monitoring_peers() -> Vec<NetworkPolicyPeer> {
 }
 
 /// The server pods' NetworkPolicy. Without `allowFrom` (compatibility
-/// profile) the gRPC and metrics ports admit any source; with it (restrictive
-/// profile) gRPC admits `allowFrom` and metrics admits `monitoringFrom`.
-/// Egress is allow-all.
+/// profile) the gRPC, HBONE and metrics ports admit any source; with it
+/// (restrictive profile) gRPC and HBONE admit `allowFrom` and metrics admits
+/// `monitoringFrom`. Egress is allow-all.
 fn build_network_policy(cr_name: &str, spec: &ModelExpressServerSpec) -> NetworkPolicy {
     let ingress = match spec
         .network_policy
@@ -234,7 +237,7 @@ fn build_network_policy(cr_name: &str, spec: &ModelExpressServerSpec) -> Network
             vec![
                 NetworkPolicyIngressRule {
                     from: Some(np.allow_from.clone()),
-                    ports: Some(vec![tcp_port(spec.port)]),
+                    ports: Some(vec![tcp_port(spec.port), tcp_port(HBONE_PORT)]),
                 },
                 NetworkPolicyIngressRule {
                     from: Some(monitoring_from),
@@ -244,7 +247,11 @@ fn build_network_policy(cr_name: &str, spec: &ModelExpressServerSpec) -> Network
         }
         None => vec![NetworkPolicyIngressRule {
             from: None,
-            ports: Some(vec![tcp_port(spec.port), tcp_port(METRICS_PORT)]),
+            ports: Some(vec![
+                tcp_port(spec.port),
+                tcp_port(HBONE_PORT),
+                tcp_port(METRICS_PORT),
+            ]),
         }],
     };
 
@@ -1109,6 +1116,7 @@ mod tests {
             ports,
             vec![
                 Some(IntOrString::Int(9000)),
+                Some(IntOrString::Int(HBONE_PORT)),
                 Some(IntOrString::Int(METRICS_PORT))
             ]
         );
@@ -1210,6 +1218,50 @@ mod tests {
                 .map(String::as_str),
             Some("my-monitoring")
         );
+    }
+
+    fn sources_for(
+        ingress: &[NetworkPolicyIngressRule],
+        port: i32,
+    ) -> Vec<Option<Vec<NetworkPolicyPeer>>> {
+        ingress
+            .iter()
+            .filter(|rule| rule.ports.iter().flatten().any(|p| *p == tcp_port(port)))
+            .map(|rule| rule.from.clone())
+            .collect()
+    }
+
+    fn assert_hbone_admitted_like_grpc(spec: &ModelExpressServerSpec) {
+        let ingress = render("mx", spec, "img", &TlsSettings::default())
+            .network_policy
+            .spec
+            .expect("spec")
+            .ingress
+            .expect("ingress");
+        let hbone = sources_for(&ingress, 15008);
+        assert!(
+            !hbone.is_empty(),
+            "no ingress rule admits TCP 15008; rendered ingress = {ingress:?}"
+        );
+        assert_eq!(hbone, sources_for(&ingress, spec.port));
+    }
+
+    #[test]
+    fn network_policy_compatibility_profile_admits_ambient_hbone() {
+        assert_hbone_admitted_like_grpc(&base_spec());
+    }
+
+    #[test]
+    fn network_policy_restrictive_profile_admits_ambient_hbone_from_allow_from() {
+        let mut spec = base_spec();
+        spec.network_policy = Some(crate::crd::NetworkPolicyConfig {
+            allow_from: vec![NetworkPolicyPeer {
+                pod_selector: Some(LabelSelector::default()),
+                ..NetworkPolicyPeer::default()
+            }],
+            monitoring_from: vec![],
+        });
+        assert_hbone_admitted_like_grpc(&spec);
     }
 
     #[test]

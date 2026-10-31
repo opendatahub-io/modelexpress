@@ -1,6 +1,6 @@
 ---
 source: operator/tests/render_snapshots.rs
-expression: "state.network_policy.expect(\"network policy\")"
+expression: state.network_policy
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -21,6 +21,8 @@ spec:
               kubernetes.io/metadata.name: llm-d
       ports:
         - port: 8001
+          protocol: TCP
+        - port: 15008
           protocol: TCP
     - from:
         - namespaceSelector:

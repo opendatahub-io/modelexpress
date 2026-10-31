@@ -687,11 +687,15 @@ named after the CR and selecting its server pods. The CR owns it, the operator r
 it if it is deleted, and the CR reports not ready while it cannot be applied.
 `spec.networkPolicy` selects the profile:
 
-- **Compatibility** (`allowFrom` unset or empty): the gRPC port (`spec.port`) and the
-  metrics port (9401) admit any source.
-- **Restrictive** (`allowFrom` set): the gRPC port admits only `allowFrom`, and the
-  metrics port admits only `monitoringFrom`, which defaults to `openshift-monitoring`,
-  `openshift-user-workload-monitoring` and `redhat-ods-monitoring`.
+- **Compatibility** (`allowFrom` unset or empty): the gRPC port (`spec.port`), port
+  15008 and the metrics port (9401) admit any source.
+- **Restrictive** (`allowFrom` set): the gRPC port and port 15008 admit only `allowFrom`,
+  and the metrics port admits only `monitoringFrom`, which defaults to
+  `openshift-monitoring`, `openshift-user-workload-monitoring` and `redhat-ods-monitoring`.
+
+Port 15008 is Istio ambient's HBONE port: when the server's namespace is enrolled in
+ambient mode, traffic from other mesh workloads arrives on it instead of on the gRPC
+port, so it gets the same peers.
 
 ```yaml
 spec:
