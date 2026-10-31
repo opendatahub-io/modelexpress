@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end tests for a server restart that loses its cache while the Redis registry
-//! survives.
+//! End-to-end tests for `DOWNLOADED` registry records whose files the serving server's
+//! cache does not hold, such as after a restart that loses the cache while the Redis
+//! registry survives.
 //!
 //! Run with a Redis 7 server and Hugging Face Hub access:
 //!
@@ -164,18 +165,22 @@ async fn forget_model(redis_url: &str) {
     }
 }
 
+fn download_request(ignore_weights: bool) -> ModelDownloadRequest {
+    ModelDownloadRequest {
+        model_name: MODEL.to_string(),
+        provider: ModelProvider::HuggingFace as i32,
+        ignore_weights,
+        revision: Some(REVISION.to_string()),
+    }
+}
+
 async fn ensure(
     client: &mut ModelServiceClient<Channel>,
     ignore_weights: bool,
 ) -> Vec<ModelStatusUpdate> {
     let mut stream = tokio::time::timeout(
         Duration::from_secs(120),
-        client.ensure_model_downloaded(ModelDownloadRequest {
-            model_name: MODEL.to_string(),
-            provider: ModelProvider::HuggingFace as i32,
-            ignore_weights,
-            revision: Some(REVISION.to_string()),
-        }),
+        client.ensure_model_downloaded(download_request(ignore_weights)),
     )
     .await
     .expect("EnsureModelDownloaded did not answer")
@@ -437,5 +442,84 @@ async fn a_stale_entry_the_server_cannot_clear_is_an_error_not_a_hit() {
 
     server.stop().await;
     user.drop_user().await;
+    forget_model(&url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Redis at REDIS_URL and Hugging Face Hub access"]
+#[allow(clippy::await_holding_lock)]
+async fn a_waiter_on_another_servers_download_fetches_the_weights_itself() {
+    let cache = TempDir::new().expect("tempdir");
+    let _env = Environment::new(cache.path(), false);
+    let url = redis_url();
+    forget_model(&url).await;
+
+    let other_server = RedisRegistryBackend::new(&url);
+    other_server.connect().await.expect("connect to Redis");
+    let key = entry_key(false);
+    assert_eq!(
+        other_server
+            .try_claim_for_download(
+                &key,
+                Provider::HuggingFace,
+                "other-server",
+                Duration::from_secs(60)
+            )
+            .await
+            .expect("claim"),
+        ClaimOutcome::Claimed
+    );
+
+    let server = Server::start(cache.path(), &url);
+    let mut client = server.client().await;
+    let mut stream = client
+        .ensure_model_downloaded(download_request(false))
+        .await
+        .expect("EnsureModelDownloaded failed")
+        .into_inner();
+    let waiting = stream
+        .message()
+        .await
+        .expect("status update")
+        .expect("first update");
+    assert_eq!(
+        ModelStatus::try_from(waiting.status).expect("known status"),
+        ModelStatus::Downloading
+    );
+    assert!(
+        other_server
+            .finish_download_claim(
+                &key,
+                Provider::HuggingFace,
+                "other-server",
+                RecordStatus::DOWNLOADED,
+                None
+            )
+            .await
+            .expect("finish")
+    );
+
+    let terminal = loop {
+        let update = tokio::time::timeout(Duration::from_secs(300), stream.message())
+            .await
+            .expect("download stream stalled")
+            .expect("status update")
+            .expect("stream ended without a terminal status");
+        let status = ModelStatus::try_from(update.status).expect("known status");
+        if status != ModelStatus::Downloading {
+            break status;
+        }
+    };
+    drop(stream);
+    assert_eq!(terminal, ModelStatus::Downloaded);
+    let files = list(&mut client, false).await;
+    assert!(
+        files.contains(&(WEIGHTS.to_string(), WEIGHTS_SIZE)),
+        "weights missing from this server's cache: {files:?}"
+    );
+    assert_eq!(streamed_size(&mut client, WEIGHTS).await, WEIGHTS_SIZE);
+
+    drop(client);
+    server.stop().await;
     forget_model(&url).await;
 }
