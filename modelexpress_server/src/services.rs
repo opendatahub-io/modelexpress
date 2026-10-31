@@ -57,13 +57,36 @@ async fn model_files_present(cache_dir: Option<PathBuf>, target: &DownloadTarget
     let Some(cache_dir) = cache_dir else {
         return true;
     };
-    let Some(manifest) = DownloadManifest::read(&cache_dir, &target.entry_key()) else {
-        return false;
-    };
-    download::get_provider(target.provider)
-        .get_model_path_revision(&target.model_name, cache_dir, target.revision.as_deref())
+    recorded_snapshot(&cache_dir, target)
         .await
-        .is_ok_and(|snapshot| manifest.is_satisfied_by(&snapshot))
+        .is_some_and(|(manifest, snapshot)| manifest.is_satisfied_by(&snapshot))
+}
+
+/// Deletes the files recorded for `target` that are not in this cache at their recorded
+/// size, so downloading again fetches them instead of reusing them.
+async fn remove_damaged_files(cache_dir: Option<PathBuf>, target: &DownloadTarget) {
+    let Some(cache_dir) = cache_dir else {
+        return;
+    };
+    if let Some((manifest, snapshot)) = recorded_snapshot(&cache_dir, target).await {
+        manifest.remove_unsatisfied(&snapshot);
+    }
+}
+
+async fn recorded_snapshot(
+    cache_dir: &Path,
+    target: &DownloadTarget,
+) -> Option<(DownloadManifest, PathBuf)> {
+    let manifest = DownloadManifest::read(cache_dir, &target.entry_key())?;
+    let snapshot = download::get_provider(target.provider)
+        .get_model_path_revision(
+            &target.model_name,
+            cache_dir.to_path_buf(),
+            target.revision.as_deref(),
+        )
+        .await
+        .ok()?;
+    Some((manifest, snapshot))
 }
 
 /// Writes the manifest of the files the download of `entry_key` left in `snapshot`.
@@ -1094,13 +1117,16 @@ impl ModelDownloadTracker {
         true
     }
 
-    /// Clears a `DOWNLOADED` record whose files this server's cache does not hold, so the
-    /// next claim downloads them here. Returns whether the record was removed.
-    async fn clear_stale_record(&self, model_name: &str, entry_key: &str) -> bool {
+    /// Clears a `DOWNLOADED` record whose files this server's cache does not hold, after
+    /// deleting the damaged ones, so the next claim downloads them here. Returns whether the
+    /// record was removed.
+    async fn clear_stale_record(&self, target: &DownloadTarget, entry_key: &str) -> bool {
         error!(
-            "Registry reports model '{model_name}' as DOWNLOADED but its files are missing \
-             from the cache; clearing the stale record and re-downloading"
+            "Registry reports model '{}' as DOWNLOADED but its files are missing from the \
+             cache; clearing the stale record and re-downloading",
+            target.model_name
         );
+        remove_damaged_files(get_server_cache_dir(), target).await;
         self.delete_status(entry_key).await
     }
 
@@ -1177,7 +1203,7 @@ impl ModelDownloadTracker {
                     if attempt >= MAX_CLAIM_ATTEMPTS {
                         return Self::report_missing_files(&identity, tx).await;
                     }
-                    self.clear_stale_record(model_name, entry_key).await;
+                    self.clear_stale_record(target, entry_key).await;
                 }
                 Ok(ClaimOutcome::AlreadyExists(existing)) => break (existing, false),
                 Err(e) => {
@@ -1263,7 +1289,7 @@ impl ModelDownloadTracker {
                         if self.recorded_files_present(target, entry_key).await {
                             return ModelStatus::DOWNLOADED;
                         }
-                        if !self.clear_stale_record(model_name, entry_key).await {
+                        if !self.clear_stale_record(target, entry_key).await {
                             return Self::report_missing_files(&identity, tx).await;
                         }
                     }
@@ -2361,6 +2387,42 @@ mod tests {
             "unexpected message: {:?}",
             record.message
         );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_truncated_recorded_file_is_removed_before_downloading_again() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(cache.path(), &full, &all_files());
+        let snapshot = snapshot_dir(cache.path());
+        std::fs::write(snapshot.join("model.safetensors"), b"\x08").expect("Failed to truncate");
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&full, &tx).await,
+            ModelStatus::ERROR
+        );
+        assert!(
+            !snapshot.join("model.safetensors").exists(),
+            "the truncated weight file was kept for the next download to reuse"
+        );
+        for (name, _) in METADATA_FILES {
+            assert!(snapshot.join(name).exists(), "{name} was removed");
+        }
     }
 
     #[cfg(feature = "memory-backend")]
