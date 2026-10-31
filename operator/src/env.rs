@@ -20,6 +20,7 @@ pub const MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS: &str =
     "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS";
 pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS";
 pub const MODEL_EXPRESS_SECURITY_MODE: &str = "MODEL_EXPRESS_SECURITY_MODE";
+pub const MODEL_EXPRESS_SECURITY_TENANT_ISOLATION: &str = "MODEL_EXPRESS_SECURITY_TENANT_ISOLATION";
 pub const MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES: &str = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES";
 pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
 pub const MODEL_EXPRESS_TLS_CERT_FILE: &str = "MODEL_EXPRESS_TLS_CERT_FILE";
@@ -120,6 +121,10 @@ pub fn render_env(spec: &ModelExpressServerSpec, tls: Option<&ResolvedTls>) -> V
         env.push(literal(
             MODEL_EXPRESS_SECURITY_MODE,
             security.mode.as_env_value(),
+        ));
+        env.push(literal(
+            MODEL_EXPRESS_SECURITY_TENANT_ISOLATION,
+            security.tenant_isolation.as_env_value(),
         ));
         if !security.token_audiences.is_empty() {
             env.push(literal(
@@ -233,6 +238,10 @@ mod tests {
             (
                 MODEL_EXPRESS_SECURITY_MODE,
                 server::MODEL_EXPRESS_SECURITY_MODE,
+            ),
+            (
+                MODEL_EXPRESS_SECURITY_TENANT_ISOLATION,
+                server::MODEL_EXPRESS_SECURITY_TENANT_ISOLATION,
             ),
             (
                 MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
@@ -433,6 +442,7 @@ mod tests {
         });
         spec.security = Some(SecurityConfig {
             mode: AuthMode::Enforce,
+            tenant_isolation: AuthMode::Enforce,
             token_audiences: vec!["mx".into(), "mx-alt".into()],
             allowed_service_accounts: vec![
                 ServiceAccountRef {
@@ -442,6 +452,10 @@ mod tests {
                 ServiceAccountRef {
                     namespace: "llm-d".into(),
                     service_account: "prefill".into(),
+                },
+                ServiceAccountRef {
+                    namespace: "tenant-a".into(),
+                    service_account: "*".into(),
                 },
             ],
             cache_ttl_secs: Some(120),
@@ -473,12 +487,16 @@ mod tests {
         );
         assert_eq!(value_of(&env, MODEL_EXPRESS_SECURITY_MODE), Some("enforce"));
         assert_eq!(
+            value_of(&env, MODEL_EXPRESS_SECURITY_TENANT_ISOLATION),
+            Some("enforce")
+        );
+        assert_eq!(
             value_of(&env, MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES),
             Some("mx,mx-alt")
         );
         assert_eq!(
             value_of(&env, MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS),
-            Some("llm-d:decode,llm-d:prefill")
+            Some("llm-d:decode,llm-d:prefill,tenant-a:*")
         );
         assert_eq!(
             value_of(&env, MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS),

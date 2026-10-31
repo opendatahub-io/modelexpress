@@ -346,6 +346,7 @@ mod tests {
         let mut spec = spec(MetadataBackend::Kubernetes {}, None);
         spec.security = Some(SecurityConfig {
             mode: AuthMode::Enforce,
+            tenant_isolation: AuthMode::Disabled,
             token_audiences: vec!["modelexpress".into()],
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
@@ -378,6 +379,7 @@ mod tests {
         let mut spec = spec(MetadataBackend::Kubernetes {}, Some("my-sa"));
         spec.security = Some(SecurityConfig {
             mode: AuthMode::Enforce,
+            tenant_isolation: AuthMode::Disabled,
             token_audiences: vec!["modelexpress".into()],
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
@@ -398,6 +400,7 @@ mod tests {
         );
         spec.security = Some(SecurityConfig {
             mode: AuthMode::Disabled,
+            tenant_isolation: AuthMode::Disabled,
             token_audiences: vec![],
             allowed_service_accounts: vec![],
             cache_ttl_secs: None,
