@@ -15,7 +15,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelStatus, Status},
-    providers::ModelDownloadOutcome,
+    providers::{ModelDownloadOutcome, validate_revision},
 };
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
@@ -93,6 +93,14 @@ fn prepare_stream_model_dir(
             provider
         ))
         .into());
+    }
+
+    if let Some(commit_hash) = commit_hash {
+        validate_revision(commit_hash).map_err(|e| {
+            modelexpress_common::Error::Validation(format!(
+                "Failed to resolve model directory: {e}"
+            ))
+        })?;
     }
 
     let model_dir = resolve_model_path(local_cache_path, provider, model_name, commit_hash)
@@ -1517,18 +1525,51 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_stream_model_dir_rejects_paths_outside_cache_root() {
+    fn test_prepare_stream_model_dir_rejects_invalid_revisions() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_root = temp_dir.path().join("cache");
         std::fs::create_dir_all(&cache_root).expect("Failed to create cache root");
+        let outside = temp_dir.path().join("outside");
+
+        for revision in [
+            "../../../../outside".to_string(),
+            outside.to_str().expect("utf-8 path").to_string(),
+        ] {
+            let err = prepare_stream_model_dir(
+                &cache_root,
+                ModelProvider::HuggingFace,
+                "test/model",
+                Some(&revision),
+            )
+            .expect_err("Expected an invalid revision to fail validation");
+
+            assert!(
+                matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("Invalid revision")),
+                "Unexpected error for {revision}: {err}"
+            );
+        }
+        assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_stream_model_dir_rejects_a_symlink_out_of_the_cache_root() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path().join("cache");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(cache_root.join("models--test--model"))
+            .expect("Failed to create repo dir");
+        std::fs::create_dir_all(&outside).expect("Failed to create outside dir");
+        std::os::unix::fs::symlink(&outside, cache_root.join("models--test--model/snapshots"))
+            .expect("Failed to create symlink");
 
         let err = prepare_stream_model_dir(
             &cache_root,
             ModelProvider::HuggingFace,
             "test/model",
-            Some("../../../../outside"),
+            Some("abc123"),
         )
-        .expect_err("Expected escaped model directory to fail validation");
+        .expect_err("Expected a model directory outside the cache root to fail validation");
 
         assert!(
             matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("outside cache root")),
