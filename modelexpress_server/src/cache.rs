@@ -1245,4 +1245,42 @@ mod tests {
         assert_eq!(DownloadManifest::read(&dir, &full), None);
         assert!(DownloadManifest::read(&dir, &metadata).is_some());
     }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn eviction_does_not_follow_a_revision_out_of_its_partition() {
+        use crate::registry::entry_key::{Tenant, partition};
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let cache = TempDir::new().expect("Failed to create cache directory");
+        let service = CacheEvictionService::new(
+            Arc::new(RegistryManager::with_backend(backend.clone())),
+            CacheEvictionConfig::default(),
+            cache.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
+        let tenant = |namespace: &str| Tenant::new(namespace).expect("valid namespace");
+        let key_in = |namespace: &str, revision: &str| {
+            EntryKey::new("test/model", Some(revision.to_string()), false)
+                .in_tenant(Some(tenant(namespace)))
+                .to_string()
+        };
+        let dir_a = partition(cache.path(), Some(&tenant("tenant-a")));
+        let dir_b = partition(cache.path(), Some(&tenant("tenant-b")));
+        record_downloaded(&backend, &key_in("tenant-a", "abc123")).await;
+        install_entry(&dir_a, &key_in("tenant-a", "abc123"), "abc123");
+        record_downloaded(&backend, &key_in("tenant-b", "def456")).await;
+        install_entry(&dir_b, &key_in("tenant-b", "def456"), "def456");
+        let a_snapshot = dir_a.join("models--test--model/snapshots/abc123");
+        let escaping = key_in("tenant-b", a_snapshot.to_str().expect("utf-8 path"));
+        record_downloaded(&backend, &escaping).await;
+
+        assert!(service.evict_model(&escaping).await.is_err());
+        assert!(a_snapshot.join("config.json").is_file());
+        assert!(
+            dir_b
+                .join("models--test--model/snapshots/def456/config.json")
+                .is_file()
+        );
+    }
 }

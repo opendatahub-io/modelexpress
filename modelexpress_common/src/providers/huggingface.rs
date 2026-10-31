@@ -5,7 +5,7 @@ use crate::{
     cache::{ModelInfo, ProviderCache, directory_size},
     constants, envs,
     models::ModelProvider,
-    providers::{ModelDownloadOutcome, ModelProviderTrait},
+    providers::{ModelDownloadOutcome, ModelProviderTrait, validate_revision},
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -95,21 +95,29 @@ impl HuggingFaceProviderCache {
     ///
     /// Returns `None` when the ref does not exist, so callers can fall back to
     /// treating the requested revision as a commit SHA.
-    fn read_ref(cache_root: &Path, model_name: &str, revision: &str) -> Option<String> {
+    fn read_ref(cache_root: &Path, model_name: &str, revision: &str) -> Result<Option<String>> {
+        validate_revision(revision)?;
         let ref_path = Self::refs_dir(cache_root, model_name).join(revision);
-        let commit = fs::read_to_string(ref_path).ok()?;
+        let Ok(commit) = fs::read_to_string(ref_path) else {
+            return Ok(None);
+        };
         let commit = commit.trim();
         if commit.is_empty() {
-            None
-        } else {
-            Some(commit.to_string())
+            return Ok(None);
         }
+        validate_revision(commit)?;
+        Ok(Some(commit.to_string()))
     }
 
     /// Map a requested revision to the commit that identifies its snapshot directory,
     /// using only local cache state.
-    fn local_commit_for_revision(cache_root: &Path, model_name: &str, revision: &str) -> String {
-        Self::read_ref(cache_root, model_name, revision).unwrap_or_else(|| revision.to_string())
+    fn local_commit_for_revision(
+        cache_root: &Path,
+        model_name: &str,
+        revision: &str,
+    ) -> Result<String> {
+        Ok(Self::read_ref(cache_root, model_name, revision)?
+            .unwrap_or_else(|| revision.to_string()))
     }
 
     fn folder_name_to_model_id(folder_name: &str) -> String {
@@ -174,7 +182,10 @@ impl ProviderCache for HuggingFaceProviderCache {
         revision: Option<&str>,
     ) -> Result<PathBuf> {
         match revision {
-            Some(revision) => Ok(Self::snapshots_dir(cache_root, model_name).join(revision)),
+            Some(revision) => {
+                validate_revision(revision)?;
+                Ok(Self::snapshots_dir(cache_root, model_name).join(revision))
+            }
             None => Self::latest_local_snapshot_path(cache_root, model_name),
         }
     }
@@ -350,6 +361,8 @@ impl HuggingFaceProvider {
         revision: &str,
         commit_hash: &str,
     ) -> Result<()> {
+        validate_revision(revision)?;
+        validate_revision(commit_hash)?;
         Cache::new(cache_dir.to_path_buf())
             .repo(Repo::with_revision(
                 model_name.to_string(),
@@ -450,7 +463,7 @@ impl HuggingFaceProvider {
             Some(revision) => {
                 let commit = HuggingFaceProviderCache::local_commit_for_revision(
                     cache_dir, model_name, revision,
-                );
+                )?;
                 let snapshot =
                     HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name).join(&commit);
                 if snapshot.is_dir() {
@@ -814,7 +827,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         };
 
         let commit =
-            HuggingFaceProviderCache::local_commit_for_revision(&cache_dir, model_name, revision);
+            HuggingFaceProviderCache::local_commit_for_revision(&cache_dir, model_name, revision)?;
         let snapshot =
             HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&commit);
 
@@ -1867,6 +1880,149 @@ mod tests {
                 .iter()
                 .all(|request| !request.headers.contains_key("authorization")),
             "A cached token must not be sent once HF_HUB_DISABLE_IMPLICIT_TOKEN is set"
+        );
+    }
+
+    /// A cache with one snapshot of `test/model` and a `victim` directory beside it
+    /// that `../../victim` reaches from both `snapshots/` and `refs/`.
+    fn cache_with_a_neighbour() -> (TempDir, PathBuf, PathBuf) {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let cache = temp_dir.path().join("cache");
+        let repo_root = cache.join("models--test--model");
+        std::fs::create_dir_all(repo_root.join("snapshots/abc1234"))
+            .expect("Failed to create snapshot");
+        std::fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        let victim = cache.join("victim");
+        std::fs::create_dir_all(&victim).expect("Failed to create victim");
+        std::fs::write(victim.join("data.txt"), b"keep").expect("Failed to write victim file");
+        (temp_dir, cache, victim)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_revisions_outside_the_repository_are_rejected() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
+        let (_temp_dir, cache, victim) = cache_with_a_neighbour();
+        let provider = HuggingFaceProvider;
+
+        for revision in [
+            victim.to_str().expect("utf-8 path").to_string(),
+            "../../victim".to_string(),
+            "..".to_string(),
+        ] {
+            let revision = revision.as_str();
+            assert!(
+                HuggingFaceProviderCache
+                    .resolve_model_path(&cache, "test/model", Some(revision))
+                    .is_err(),
+                "resolve_model_path accepted {revision:?}"
+            );
+            assert!(
+                provider
+                    .get_model_path_revision("test/model", cache.clone(), Some(revision))
+                    .await
+                    .is_err(),
+                "get_model_path_revision accepted {revision:?}"
+            );
+            assert!(
+                provider
+                    .resolve_revision("test/model", Some(cache.clone()), Some(revision))
+                    .await
+                    .is_err(),
+                "resolve_revision accepted {revision:?}"
+            );
+            assert!(
+                provider
+                    .download_model_revision(
+                        "test/model",
+                        Some(cache.clone()),
+                        false,
+                        Some(revision)
+                    )
+                    .await
+                    .is_err(),
+                "an offline download accepted {revision:?}"
+            );
+            assert!(
+                provider
+                    .record_local_revision("test/model", &cache, Some(revision), "abc1234")
+                    .await
+                    .is_err(),
+                "record_local_revision wrote a ref named {revision:?}"
+            );
+            assert!(
+                provider
+                    .record_local_revision("test/model", &cache, Some("main"), revision)
+                    .await
+                    .is_err(),
+                "record_local_revision recorded commit {revision:?}"
+            );
+            assert!(
+                provider
+                    .delete_model_revision("test/model", cache.clone(), Some(revision))
+                    .await
+                    .is_err(),
+                "delete_model_revision accepted {revision:?}"
+            );
+            assert!(
+                victim.join("data.txt").is_file(),
+                "{revision:?} deleted the victim"
+            );
+        }
+        assert!(cache.join("models--test--model/snapshots/abc1234").is_dir());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_a_ref_pointing_outside_the_repository_is_rejected() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
+        let (_temp_dir, cache, victim) = cache_with_a_neighbour();
+        std::fs::write(cache.join("models--test--model/refs/main"), "../../victim")
+            .expect("Failed to write ref");
+        let provider = HuggingFaceProvider;
+
+        assert!(
+            provider
+                .get_model_path_revision("test/model", cache.clone(), Some("main"))
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .delete_model_revision("test/model", cache.clone(), Some("main"))
+                .await
+                .is_err()
+        );
+        assert!(victim.join("data.txt").is_file());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_ref_names_with_slashes_resolve_offline() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
+        let (_temp_dir, cache, _victim) = cache_with_a_neighbour();
+        let provider = HuggingFaceProvider;
+        provider
+            .record_local_revision("test/model", &cache, Some("refs/pr/1"), "abc1234")
+            .await
+            .expect("Failed to record refs/pr/1");
+
+        assert_eq!(
+            provider
+                .resolve_revision("test/model", Some(cache.clone()), Some("refs/pr/1"))
+                .await
+                .expect("refs/pr/1 should resolve"),
+            Some("abc1234".to_string())
+        );
+        assert_eq!(
+            provider
+                .get_model_path_revision("test/model", cache.clone(), Some("refs/pr/1"))
+                .await
+                .expect("refs/pr/1 should have a snapshot"),
+            cache.join("models--test--model/snapshots/abc1234")
         );
     }
 }

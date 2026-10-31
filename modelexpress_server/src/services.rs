@@ -22,7 +22,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::is_weight_file,
+    providers::{is_weight_file, validate_revision},
 };
 use std::{
     collections::HashMap,
@@ -114,6 +114,68 @@ impl DownloadTarget {
 /// `tenant`'s cache partition, or the cache root when isolation is off.
 fn cache_dir_for(tenant: Option<&Tenant>) -> Option<PathBuf> {
     get_server_cache_dir().map(|root| partition(&root, tenant))
+}
+
+/// The request's revision, rejected unless it is a commit or a ref name.
+#[allow(clippy::result_large_err)] // tonic::Status grew past Clippy's Rust 1.98 threshold.
+fn requested_revision(revision: Option<&str>) -> Result<Option<&str>, Status> {
+    if let Some(revision) = revision {
+        validate_revision(revision).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+    }
+    Ok(revision)
+}
+
+/// The cached snapshot of `model_name` under `cache_dir`, and its commit for Hugging Face.
+/// Fails unless the snapshot is where the provider's cache layout puts it.
+#[allow(clippy::result_large_err)] // tonic::Status grew past Clippy's Rust 1.98 threshold.
+async fn cached_snapshot(
+    provider: ModelProvider,
+    model_name: &str,
+    cache_dir: &Path,
+    revision: Option<&str>,
+) -> Result<(PathBuf, Option<String>), Status> {
+    // Get the model path using the provider from the request. A requested revision
+    // selects that exact snapshot instead of whichever one is newest on disk.
+    let model_path = download::get_provider(provider)
+        .get_model_path_revision(model_name, cache_dir.to_path_buf(), revision)
+        .await
+        .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+
+    debug!("Model path resolved to: {:?}", model_path);
+
+    let commit_hash = if provider == ModelProvider::HuggingFace {
+        model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from)
+    } else {
+        None
+    };
+
+    if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
+        return Err(Status::internal(
+            "Resolved Hugging Face model path did not contain a revision",
+        ));
+    }
+
+    let expected_model_path =
+        resolve_model_path(cache_dir, provider, model_name, commit_hash.as_deref()).map_err(
+            |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
+        )?;
+
+    if model_path != expected_model_path {
+        error!(
+            "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
+            model_path.display(),
+            expected_model_path.display(),
+            model_name
+        );
+        return Err(Status::internal(
+            "Resolved model path does not match expected cache layout",
+        ));
+    }
+
+    Ok((model_path, commit_hash))
 }
 
 /// Resolve a requested revision to the immutable revision the download will use.
@@ -426,7 +488,7 @@ impl ModelService for ModelServiceImpl {
             &model_name,
             provider,
             cache_dir_for(tenant.as_ref()),
-            model_request.revision.as_deref(),
+            requested_revision(model_request.revision.as_deref())?,
         )
         .await?;
 
@@ -492,7 +554,7 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+        let revision = requested_revision(files_request.revision.as_deref())?;
 
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
@@ -501,51 +563,8 @@ impl ModelService for ModelServiceImpl {
 
         let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request. A requested revision
-        // selects that exact snapshot instead of whichever one is newest on disk.
-        let model_path = provider_impl
-            .get_model_path_revision(
-                &model_name,
-                cache_dir.clone(),
-                files_request.revision.as_deref(),
-            )
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
-
-        debug!("Model path resolved to: {:?}", model_path);
-
-        let commit_hash = if provider == ModelProvider::HuggingFace {
-            model_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
-            return Err(Status::internal(
-                "Resolved Hugging Face model path did not contain a revision",
-            ));
-        }
-
-        let expected_model_path =
-            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
-                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
-            )?;
-
-        if model_path != expected_model_path {
-            error!(
-                "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
-                model_path.display(),
-                expected_model_path.display(),
-                model_name
-            );
-            return Err(Status::internal(
-                "Resolved model path does not match expected cache layout",
-            ));
-        }
+        let (model_path, commit_hash) =
+            cached_snapshot(provider, &model_name, &cache_dir, revision).await?;
 
         // Collect all files to stream
         let files = collect_model_files(
@@ -683,18 +702,13 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+        let revision = requested_revision(files_request.revision.as_deref())?;
 
         info!("Listing files for model: {}", model_name);
 
         let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request
-        let model_path = provider_impl
-            .get_model_path_revision(&model_name, cache_dir, files_request.revision.as_deref())
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+        let (model_path, _) = cached_snapshot(provider, &model_name, &cache_dir, revision).await?;
 
         // Collect all files
         let files = collect_model_files(
@@ -3423,6 +3437,114 @@ mod tests {
             ),
             before,
             "the partition's record was re-downloaded instead of served"
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revisions_outside_the_snapshot_directory_are_invalid_arguments() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", false),
+            &all_files(),
+        );
+        std::fs::create_dir_all(
+            partition_of(cache.path(), "tenant-b").join("models--test--model/snapshots/def456"),
+        )
+        .expect("Failed to create tenant-b snapshot");
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), true);
+        let a_snapshot = snapshot_dir(&partition_of(cache.path(), "tenant-a"));
+
+        for revision in [
+            a_snapshot.to_str().expect("utf-8 path").to_string(),
+            format!("../../../tenant-a/models--test--model/snapshots/{REVISION}"),
+        ] {
+            let files = ModelFilesRequest {
+                revision: Some(revision.clone()),
+                ..files_request()
+            };
+            assert_eq!(
+                listed(&service, as_caller(files.clone(), "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "list {revision}"
+            );
+            assert_eq!(
+                streamed(&service, as_caller(files, "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "stream {revision}"
+            );
+            let download = ModelDownloadRequest {
+                revision: Some(revision.clone()),
+                ..download_request()
+            };
+            assert_eq!(
+                final_status(&service, as_caller(download, "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "ensure {revision}"
+            );
+        }
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_untenanted_list_cannot_name_a_directory_outside_the_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let outside = TempDir::new().expect("Failed to create temp dir");
+        std::fs::write(outside.path().join("data.txt"), b"keep").expect("Failed to write file");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), false);
+        let request = ModelFilesRequest {
+            revision: Some(outside.path().to_str().expect("utf-8 path").to_string()),
+            ..files_request()
+        };
+        assert_eq!(
+            listed(&service, Request::new(request)).await,
+            Err(tonic::Code::InvalidArgument)
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_ref_name_with_slashes_lists_its_snapshot() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        install(cache.path(), &pinned_target(false), &all_files());
+        let refs = cache.path().join("models--test--model/refs/refs/pr");
+        std::fs::create_dir_all(&refs).expect("Failed to create refs");
+        std::fs::write(refs.join("1"), REVISION).expect("Failed to write ref");
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), false);
+        let request = ModelFilesRequest {
+            revision: Some("refs/pr/1".to_string()),
+            ..files_request()
+        };
+        assert_eq!(
+            listed(&service, Request::new(request)).await,
+            Ok(all_file_names())
         );
     }
 }

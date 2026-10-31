@@ -343,7 +343,7 @@ Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downl
 
 #### Pinned revisions
 
-`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none.
+`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none. A revision must be a commit SHA or a ref name that `git check-ref-format --allow-onelevel` accepts; the server rejects anything else, such as an absolute path or a path with `..`, with `INVALID_ARGUMENT`, and the Hugging Face provider refuses to build a cache path from one.
 
 The server resolves the revision to an immutable commit **before** claiming the download lease, then pins every Hub file request to that commit, so a tag that moves mid-download cannot mix commits into one snapshot. A requested revision that does not exist fails the request; it never falls back to the default revision. An unpinned request still resolves the default revision to a commit SHA and reports it, so callers always learn the exact commit they got. If the Hub is unreachable while resolving an *unpinned* request, the server falls back to the snapshot already in its cache, which keeps cache hits working during a Hub outage.
 
