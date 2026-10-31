@@ -503,6 +503,14 @@ jobs:
           --test refit_collective_service_redis \
           -- --include-ignored --test-threads=1
 
+    - name: Run server cache restart integration tests
+      env:
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test server_cache_restart \
+          -- --include-ignored --test-threads=1
+
     - name: Run collective Refit Redis backend tests
       env:
         MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
