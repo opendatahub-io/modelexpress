@@ -382,6 +382,16 @@ Partitions share nothing: two namespaces using the same model each download and 
 copy, so size the cache volume for the number of namespaces using each model. There are
 no per-namespace quotas.
 
+Clients have to read from their own partition. A client in the default shared-storage
+mode resolves the model under its own cache path, so a client that mounts the cache root
+finds nothing. Either:
+
+- point the client's cache path at the namespace's partition: mount the server's cache
+  volume and set `MODEL_EXPRESS_CACHE_DIRECTORY` (and `HF_HUB_CACHE` for the engine) to
+  `<mount>/.modelexpress/tenants/<namespace>`; or
+- set `MODEL_EXPRESS_NO_SHARED_STORAGE=true` so the client streams the files from the
+  server into its own cache.
+
 Downloads use the server's own credentials (`HF_TOKEN` or the Hugging Face token file,
 `NGC_API_KEY`, GCS application default credentials, the S3 credential chain), so every
 allowlisted namespace can fetch anything those credentials can reach. Give a shared
