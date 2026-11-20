@@ -65,10 +65,8 @@ pub(super) async fn validate_binding(metadata: &TrainerTensorsMetadata) -> Resul
         })
         .await?
         .into_inner();
-    let metadata_digest = sha256_hex(&response.metadata)
-        .map_err(|_| Status::internal("could not compute binding metadata digest"))?;
-    if response.metadata_digest != metadata.logical_shard_id
-        || metadata_digest != metadata.logical_shard_id
+    let digest = sha256_hex(&response.metadata).map_err(|e| Status::internal(e.to_string()))?;
+    if response.metadata_digest != metadata.logical_shard_id || digest != metadata.logical_shard_id
     {
         return Err(invalid("binding metadata digest does not match"));
     }
@@ -90,9 +88,8 @@ pub(super) async fn validate_binding(metadata: &TrainerTensorsMetadata) -> Resul
     // Value serialization uses canonical sorted object keys, matching bind-time encoding.
     let value = serde_json::to_value(&manifest).map_err(|_| invalid("invalid bound coverage"))?;
     let bytes = serde_json::to_vec(&value).map_err(|_| invalid("invalid bound coverage"))?;
-    let coverage_digest = sha256_hex(&bytes)
-        .map_err(|_| Status::internal("could not compute binding coverage digest"))?;
-    if coverage_digest != metadata.logical_shard_id {
+    if sha256_hex(&bytes).map_err(|e| Status::internal(e.to_string()))? != metadata.logical_shard_id
+    {
         return Err(invalid("binding coverage differs from logical shard"));
     }
     Ok(())
