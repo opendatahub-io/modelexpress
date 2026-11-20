@@ -84,6 +84,8 @@ ModelExpress/
 │       ├── config.rs                   # ServerConfig, layered loading, validation
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
+│       ├── cache/
+│       │   └── manifest.rs             # Per-volume record of each completed download's files
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
 │       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
 │       ├── metrics/
@@ -337,11 +339,11 @@ Six proto files define the server's gRPC services, all compiled via `tonic-build
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
-`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. Each completed download writes a manifest of the files it left in the snapshot, with their sizes, to `<cache>/.modelexpress/downloads/<sha256(entry key)>.json`. The registry is shared by every replica and outlives an `emptyDir` cache, so a record is a cache hit only when this replica's manifest for it exists and every listed file is present at its recorded size. Otherwise (the volume was replaced, a `model clear` removed local storage, or a metadata-only download repopulated the snapshot without weights) the stale record is deleted and the download is re-claimed. Before the record is deleted, any listed file that is not at its recorded size is removed, so the provider fetches it again instead of reusing it. A request that waits on another claim's download applies the same check when that download finishes, so a server whose cache volume the download did not use fetches the files itself. If the record cannot be cleared, the request fails. A download that leaves no files is recorded as `ERROR`, and eviction removes the entry's manifest.
 
 #### Pinned revisions
 
-`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none.
+`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none. A revision must be a commit SHA or a ref name that `git check-ref-format --allow-onelevel` accepts; the server rejects anything else, such as an absolute path or a path with `..`, with `INVALID_ARGUMENT`, and the Hugging Face provider refuses to build a cache path from one.
 
 The server resolves the revision to an immutable commit **before** claiming the download lease, then pins every Hub file request to that commit, so a tag that moves mid-download cannot mix commits into one snapshot. A requested revision that does not exist fails the request; it never falls back to the default revision. An unpinned request still resolves the default revision to a commit SHA and reports it, so callers always learn the exact commit they got. If the Hub is unreachable while resolving an *unpinned* request, the server falls back to the snapshot already in its cache, which keeps cache hits working during a Hub outage.
 
@@ -354,6 +356,8 @@ When a no-shared-storage client installs a snapshot over the file stream, it als
 Registry backends key every record, lease, and claim on one string. That key is an [`EntryKey`](../modelexpress_server/src/registry/entry_key.rs) encoding of `model_name` + resolved revision + weight mode. This is what keeps two revisions of one model from sharing a lease (and coalescing onto each other's download), and what keeps a metadata-only download from satisfying a later full-weight request with a weightless snapshot.
 
 An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing and providers without a revision concept keep the keys they have always used. Anything else encodes as `mx1:<revision>:<flags>:<model_name>`. The model name goes last because it is the only field with no character restrictions — a GCS object path accepts almost any byte, so a name containing the separator must not be able to impersonate the other fields and aim a delete at the wrong model.
+
+With `security.tenant_isolation=enforce`, every model-cache RPC is confined to the caller's partition, `<cache>/.modelexpress/tenants/<namespace>`, keyed on the TokenReview-verified namespace. A partition is a cache of its own, with its own provider layout and download manifests. Its entries encode as `mxt1:<namespace>:<revision>:<flags>:<model_name>`, so the same model in two namespaces has two leases, two records and two copies on disk, and eviction resolves each key to its partition before deleting files or the manifest. An untenanted name that starts with `mxt1:` is encoded in the `mx1:` form, so it never parses as a tenant's entry. With isolation off, keys and paths are unchanged.
 
 Cache eviction parses the key back to delete the right snapshot. It keeps the files while another entry still references the same commit, treating a revisionless entry as covering every snapshot of its model. When the evicted entry is the last one for its model the whole repository directory goes, so a snapshot kept alive by an earlier shared-file decision cannot outlive the last record pointing at it. Hugging Face snapshot entries are symlinks into `blobs/`, so a per-revision delete also reclaims the blobs no surviving snapshot references — otherwise it would free almost no disk.
 

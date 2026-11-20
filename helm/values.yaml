@@ -38,7 +38,8 @@ security:
   mode: enforce
   # Audiences the caller's projected token must carry. Required for enforce.
   tokenAudiences: []
-  # Exact-match allowlist of "<namespace>:<serviceaccount>". Required for enforce.
+  # Allowlist of "<namespace>:<serviceaccount>", or "<namespace>:*" for every
+  # ServiceAccount in a namespace. Required for enforce.
   allowedServiceAccounts: []
   # cacheTtlSecs: 60
 

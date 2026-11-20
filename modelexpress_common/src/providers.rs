@@ -47,6 +47,24 @@ pub fn reject_unsupported_revision(provider_name: &str, revision: Option<&str>) 
     }
 }
 
+/// Rejects anything but a commit or a ref name that
+/// `git check-ref-format --allow-onelevel` accepts.
+pub fn validate_revision(revision: &str) -> Result<()> {
+    let forbidden = |c: char| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    };
+    let valid = revision != "@"
+        && !revision.ends_with('.')
+        && !revision.contains("..")
+        && !revision.contains("@{")
+        && !revision.contains(forbidden)
+        && revision.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        });
+    anyhow::ensure!(valid, "Invalid revision '{revision}'");
+    Ok(())
+}
+
 /// Trait for model providers
 /// This trait provides the framework for supporting multiple model providers.
 #[async_trait::async_trait]
@@ -456,6 +474,60 @@ mod tests {
             assert!(
                 result.is_err(),
                 "Expected '{model_name}' to be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_revision_accepts_only_commits_and_ref_names() {
+        for revision in [
+            "main",
+            "v1.0",
+            "refs/pr/1",
+            "refs/convert/parquet",
+            "feature/x-y_z",
+            "abc1234",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(
+                validate_revision(revision).is_ok(),
+                "Expected '{revision}' to be accepted"
+            );
+        }
+        for revision in [
+            "",
+            "/",
+            "/etc",
+            "/var/cache/models--x/snapshots/abc",
+            "..",
+            "../x",
+            "a/../b",
+            "a/..",
+            ".",
+            "./a",
+            ".hidden",
+            "a/.b",
+            "a//b",
+            "a/",
+            "a.lock",
+            "a/b.lock/c",
+            "a.",
+            "a:b",
+            "a b",
+            "a~1",
+            "a^",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+            "@",
+            "a@{1}",
+            "a\nb",
+            "a\u{7f}b",
+        ] {
+            assert!(
+                validate_revision(revision).is_err(),
+                "Expected {revision:?} to be rejected"
             );
         }
     }

@@ -497,6 +497,14 @@ jobs:
         cargo test -p modelexpress-server --lib \
           p2p:: -- --ignored --test-threads=1
 
+    - name: Run P2P Redis tenant isolation test
+      env:
+        MX_TEST_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+      run: |
+        cargo test -p modelexpress-server --lib \
+          p2p::service::tests::redis_publish_cannot_take_another_namespaces_worker \
+          -- --ignored --exact --test-threads=1
+
     - name: Run Refit service Redis integration tests
       env:
         REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
@@ -511,6 +519,14 @@ jobs:
       run: |
         cargo test -p model-express-workspace-tests \
           --test refit_collective_service_redis \
+          -- --include-ignored --test-threads=1
+
+    - name: Run server cache restart integration tests
+      env:
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test server_cache_restart \
           -- --include-ignored --test-threads=1
 
     - name: Run collective Refit Redis backend tests

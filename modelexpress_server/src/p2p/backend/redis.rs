@@ -450,6 +450,9 @@ struct WorkerRecordJson {
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
+    /// Namespace that published this worker; `None` when tenant isolation is off.
+    #[serde(default)]
+    pub owner_namespace: Option<String>,
 }
 
 /// Small worker row stored in the source hash. Legacy rows contain only the
@@ -465,6 +468,8 @@ struct WorkerSummaryJson {
     source_load: Option<f32>,
     #[serde(default)]
     topology: HashMap<String, String>,
+    #[serde(default)]
+    owner_namespace: Option<String>,
 }
 
 /// Serializable artifact source summary.
@@ -509,6 +514,7 @@ impl WorkerRecordJson {
             source_load: record.source_load,
             topology: record.topology,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
+            owner_namespace: None,
         }
     }
 }
@@ -713,6 +719,7 @@ impl MetadataBackend for RedisBackend {
         _pod_name: &str,
         _pod_uid: &str,
         _pod_namespace: &str,
+        owner_namespace: Option<String>,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let mut conn = self.get_conn().await?;
@@ -721,7 +728,8 @@ impl MetadataBackend for RedisBackend {
 
         let worker_record = WorkerRecord::from(worker);
         let attr_json = serde_json::to_string(&SourceAttributesJson::from(identity))?;
-        let json = WorkerRecordJson::from_worker_record(worker_record.clone());
+        let mut json = WorkerRecordJson::from_worker_record(worker_record.clone());
+        json.owner_namespace = owner_namespace.clone();
         let value = serde_json::to_string(&json)?;
         let summary = serde_json::to_string(&WorkerSummaryJson {
             worker_rank: worker_record.worker_rank,
@@ -730,6 +738,7 @@ impl MetadataBackend for RedisBackend {
             accelerator: worker_record.accelerator.clone(),
             source_load: worker_record.source_load,
             topology: worker_record.topology.clone(),
+            owner_namespace,
         })?;
 
         let mut pipe = redis::pipe();
@@ -778,11 +787,13 @@ impl MetadataBackend for RedisBackend {
         let (model_name, identity) = source_identity_from_attributes(attr_json.as_deref());
 
         let mut workers: Vec<WorkerRecord> = Vec::with_capacity(fields.len());
+        let mut owner_namespace: Option<String> = None;
         for (field, value) in &fields {
             if field.starts_with(keys::STATUS_FIELD_PREFIX) {
                 continue;
             }
             let json: WorkerRecordJson = serde_json::from_str(value)?;
+            owner_namespace = owner_namespace.or_else(|| json.owner_namespace.clone());
             let mut worker = WorkerRecord::from(json);
             let (status, updated_at, source_load) = overlay_status(
                 &fields,
@@ -811,6 +822,7 @@ impl MetadataBackend for RedisBackend {
             model_name,
             workers,
             published_at: 0,
+            owner_namespace,
             identity,
         }))
     }
@@ -870,20 +882,28 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                let (status, updated_at, accelerator, source_load, topology) = fields
-                    .get(&worker_rank.to_string())
-                    .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| {
-                        let (status, updated_at, source_load) = overlay_status(
-                            &fields,
-                            worker_rank,
-                            j.status,
-                            j.updated_at,
-                            j.source_load,
-                        );
-                        (status, updated_at, j.accelerator, source_load, j.topology)
-                    })
-                    .unwrap_or((0, 0, String::new(), None, HashMap::new()));
+                let (status, updated_at, accelerator, source_load, topology, owner_namespace) =
+                    fields
+                        .get(&worker_rank.to_string())
+                        .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
+                        .map(|j| {
+                            let (status, updated_at, source_load) = overlay_status(
+                                &fields,
+                                worker_rank,
+                                j.status,
+                                j.updated_at,
+                                j.source_load,
+                            );
+                            (
+                                status,
+                                updated_at,
+                                j.accelerator,
+                                source_load,
+                                j.topology,
+                                j.owner_namespace,
+                            )
+                        })
+                        .unwrap_or((0, 0, String::new(), None, HashMap::new(), None));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -897,6 +917,7 @@ impl MetadataBackend for RedisBackend {
                     topology,
                     training_step,
                     layout_signature: layout_signature.clone(),
+                    owner_namespace,
                 });
             }
         }
@@ -999,6 +1020,7 @@ impl MetadataBackend for RedisBackend {
                             topology: summary.topology,
                             training_step,
                             layout_signature: layout_signature.clone(),
+                            owner_namespace: summary.owner_namespace,
                         });
                     }
                 } else {
@@ -1039,26 +1061,28 @@ impl MetadataBackend for RedisBackend {
                 {
                     continue;
                 }
-                let (status, updated_at, accelerator, source_load, topology) = fields
-                    .get(&worker_rank.to_string())
-                    .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
-                    .map(|record| {
-                        let (status, updated_at, source_load) = overlay_status(
-                            &fields,
-                            worker_rank,
-                            record.status,
-                            record.updated_at,
-                            record.source_load,
-                        );
-                        (
-                            status,
-                            updated_at,
-                            record.accelerator,
-                            source_load,
-                            record.topology,
-                        )
-                    })
-                    .unwrap_or((0, 0, String::new(), None, HashMap::new()));
+                let (status, updated_at, accelerator, source_load, topology, owner_namespace) =
+                    fields
+                        .get(&worker_rank.to_string())
+                        .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
+                        .map(|record| {
+                            let (status, updated_at, source_load) = overlay_status(
+                                &fields,
+                                worker_rank,
+                                record.status,
+                                record.updated_at,
+                                record.source_load,
+                            );
+                            (
+                                status,
+                                updated_at,
+                                record.accelerator,
+                                source_load,
+                                record.topology,
+                                record.owner_namespace,
+                            )
+                        })
+                        .unwrap_or((0, 0, String::new(), None, HashMap::new(), None));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
                 }
@@ -1074,6 +1098,7 @@ impl MetadataBackend for RedisBackend {
                     topology,
                     training_step,
                     layout_signature,
+                    owner_namespace,
                 });
             }
         }
@@ -1162,13 +1187,17 @@ impl MetadataBackend for RedisBackend {
         // carried forward rather than recomputed -- but it must be carried, because
         // this summary is also written into the source index that the fast list
         // path reads topology from.
-        let (accelerator, topology) = if let Some(summary) = status_json
+        let (accelerator, topology, owner_namespace) = if let Some(summary) = status_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
         {
-            (summary.accelerator, summary.topology)
+            (
+                summary.accelerator,
+                summary.topology,
+                summary.owner_namespace,
+            )
         } else {
-            // Record predating the status field: seed both from it once.
+            // Record predating the status field: seed from it once.
             let value: Option<String> = conn.hget(&key, worker_rank.to_string()).await?;
             let json_str = value.ok_or_else(|| {
                 format!(
@@ -1177,7 +1206,7 @@ impl MetadataBackend for RedisBackend {
                 )
             })?;
             let record: WorkerRecordJson = serde_json::from_str(&json_str)?;
-            (record.accelerator, record.topology)
+            (record.accelerator, record.topology, record.owner_namespace)
         };
 
         let status_summary = serde_json::to_string(&WorkerSummaryJson {
@@ -1187,6 +1216,7 @@ impl MetadataBackend for RedisBackend {
             accelerator,
             source_load,
             topology,
+            owner_namespace,
         })?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let updated = update_status_if_fresh(
@@ -1424,6 +1454,7 @@ mod tests {
             accelerator: "cuda".to_string(),
             source_load: Some(0.5),
             topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
+            owner_namespace: None,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
@@ -1445,6 +1476,7 @@ mod tests {
             accelerator: "cuda".to_string(),
             source_load: None,
             topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
+            owner_namespace: None,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
@@ -1700,6 +1732,7 @@ mod tests {
                 "",
                 "",
                 "",
+                None,
             )
             .await
             .expect("publish");

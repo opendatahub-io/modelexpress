@@ -5,7 +5,9 @@
 # Build every overlay under config/manifests, then treat the platform overlays
 # (overlays/odh for OpenShift, overlays/odh-xks for any other Kubernetes) the
 # way the KServe module controller does: rewrite params.env in place, force a
-# namespace over the render, and check what comes out.
+# namespace over the render, and check what comes out. Every render also goes
+# through `cargo xtask check-bundle`, the ODH ADR-0016 module-bundle
+# NetworkPolicy and RBAC rules.
 #
 # The controller only ever rewrites the params.env the OpenShift overlay
 # resolves to, including when it goes on to render the xKS overlay, so the xKS
@@ -25,6 +27,13 @@ fail() {
     exit 1
 }
 
+cargo build --quiet --package xtask
+xtask="${root}/target/debug/xtask"
+
+check_bundle() {
+    "${xtask}" check-bundle "$1" || fail "$2 breaks the ADR-0016 bundle rules"
+}
+
 # The controller's resolveParamsEnv: the overlay's own params.env, else
 # base/params.env when the overlay sits directly under a directory named
 # "overlays".
@@ -42,7 +51,9 @@ resolve_params_env() {
 
 for overlay in default openshift "${PLATFORM_OVERLAYS[@]}"; do
     echo "==> kustomize build ${overlay}"
-    kustomize build "${manifests}/${overlay}" > /dev/null
+    out="${work}/raw-$(basename "${overlay}").yaml"
+    kustomize build "${manifests}/${overlay}" > "${out}"
+    check_bundle "${out}" "${overlay}"
 done
 
 operator_image="registry.example/operator@sha256:1111"
@@ -71,6 +82,7 @@ resources:
 EOF
     out="${work}/${name}.yaml"
     kustomize build "${work}/platform/${name}" > "${out}"
+    check_bundle "${out}" "${overlay} (platform render)"
 
     if grep -q '^kind: Namespace$' "${out}"; then
         fail "${overlay} renders a Namespace; the platform owns it"
@@ -103,4 +115,12 @@ if grep -n -E 'service\.beta\.openshift\.io|openshift-service-ca|metrics-tls' "$
     fail "overlays/odh-xks depends on service-ca"
 fi
 
-echo "all clear: overlays build and both platform overlays substitute cleanly"
+echo "==> the operator policy admits metrics on the port each platform serves it on"
+for expect in "odh tcp/8443" "odh-xks tcp/8080"; do
+    read -r name port <<< "${expect}"
+    want="Deployment ${namespace}/modelexpress-operator: modelexpress-operator [ingress ${port}; egress allow-all]"
+    got="$("${xtask}" check-bundle "${work}/${name}.yaml")"
+    [[ "${got}" == "${want}" ]] || fail "overlays/${name}: want '${want}', got '${got}'"
+done
+
+echo "all clear: overlays build, both platform overlays substitute cleanly, and every render meets the ADR-0016 bundle rules"

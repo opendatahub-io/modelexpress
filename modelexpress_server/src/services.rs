@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::auth::CallerIdentity;
+use crate::cache::manifest::DownloadManifest;
 use crate::metrics::grpc::RpcOutcome;
 use crate::metrics::registry::{DownloadMetrics, RegistryMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
-use crate::registry::entry_key::EntryKey;
+use crate::registry::entry_key::{EntryKey, Tenant, partition};
 use crate::registry::state::RegistryManager;
 use modelexpress_common::{
     cache::{CacheConfig, resolve_model_path},
@@ -20,7 +22,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::is_weight_file,
+    providers::{is_weight_file, validate_revision},
 };
 use std::{
     collections::HashMap,
@@ -39,7 +41,7 @@ static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 /// download, so it should complete quickly or not at all.
 const REVISION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Get the configured cache directory for model downloads
+/// Get the configured cache root for model downloads
 fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     // Try to get cache configuration
     if let Ok(config) = CacheConfig::discover() {
@@ -50,24 +52,59 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Returns true if the model's files are present in the given cache directory. Used to
-/// guard against stale `DOWNLOADED` registry records that point at a cache entry which no
-/// longer exists on disk (e.g. left behind by a client-side `model clear`). When no cache
-/// directory is configured we cannot verify, so we assume the files are present to preserve
-/// existing behavior rather than loop re-downloading forever.
-async fn model_files_present(
-    cache_dir: Option<std::path::PathBuf>,
-    model_name: &str,
-    provider: ModelProvider,
-    revision: Option<&str>,
-) -> bool {
+/// True when every file recorded for `target` in this cache is still present. Without a
+/// cache directory there is nothing to check, so this returns true.
+async fn model_files_present(cache_dir: Option<PathBuf>, target: &DownloadTarget) -> bool {
     let Some(cache_dir) = cache_dir else {
         return true;
     };
-    download::get_provider(provider)
-        .get_model_path_revision(model_name, cache_dir, revision)
+    recorded_snapshot(&cache_dir, target)
         .await
-        .is_ok()
+        .is_some_and(|(manifest, snapshot)| manifest.is_satisfied_by(&snapshot))
+}
+
+/// Deletes the files recorded for `target` that are not in this cache at their recorded
+/// size, so downloading again fetches them instead of reusing them.
+async fn remove_damaged_files(cache_dir: Option<PathBuf>, target: &DownloadTarget) {
+    let Some(cache_dir) = cache_dir else {
+        return;
+    };
+    if let Some((manifest, snapshot)) = recorded_snapshot(&cache_dir, target).await {
+        manifest.remove_unsatisfied(&snapshot);
+    }
+}
+
+async fn recorded_snapshot(
+    cache_dir: &Path,
+    target: &DownloadTarget,
+) -> Option<(DownloadManifest, PathBuf)> {
+    let manifest = DownloadManifest::read(cache_dir, &target.entry_key())?;
+    let snapshot = download::get_provider(target.provider)
+        .get_model_path_revision(
+            &target.model_name,
+            cache_dir.to_path_buf(),
+            target.revision.as_deref(),
+        )
+        .await
+        .ok()?;
+    Some((manifest, snapshot))
+}
+
+/// Writes the manifest of the files the download of `entry_key` left in `snapshot`.
+fn record_download(
+    cache_dir: Option<&Path>,
+    entry_key: &str,
+    snapshot: &Path,
+    ignore_weights: bool,
+) -> anyhow::Result<()> {
+    let Some(cache_dir) = cache_dir else {
+        return Ok(());
+    };
+    DownloadManifest::new(
+        entry_key,
+        collect_model_files(snapshot, snapshot, None, ignore_weights),
+    )
+    .write(cache_dir)
 }
 
 /// A model download request reduced to the identity the registry and the provider need.
@@ -77,6 +114,7 @@ async fn model_files_present(
 /// drift when a tag moves.
 #[derive(Debug, Clone)]
 pub struct DownloadTarget {
+    pub tenant: Option<Tenant>,
     pub model_name: String,
     pub provider: ModelProvider,
     pub revision: Option<String>,
@@ -91,8 +129,76 @@ impl DownloadTarget {
             self.revision.clone(),
             self.ignore_weights,
         )
+        .in_tenant(self.tenant.clone())
         .to_string()
     }
+}
+
+/// `tenant`'s cache partition, or the cache root when isolation is off.
+fn cache_dir_for(tenant: Option<&Tenant>) -> Option<PathBuf> {
+    get_server_cache_dir().map(|root| partition(&root, tenant))
+}
+
+/// The request's revision, rejected unless it is a commit or a ref name.
+#[allow(clippy::result_large_err)] // tonic::Status grew past Clippy's Rust 1.98 threshold.
+fn requested_revision(revision: Option<&str>) -> Result<Option<&str>, Status> {
+    if let Some(revision) = revision {
+        validate_revision(revision).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+    }
+    Ok(revision)
+}
+
+/// The cached snapshot of `model_name` under `cache_dir`, and its commit for Hugging Face.
+/// Fails unless the snapshot is where the provider's cache layout puts it.
+#[allow(clippy::result_large_err)] // tonic::Status grew past Clippy's Rust 1.98 threshold.
+async fn cached_snapshot(
+    provider: ModelProvider,
+    model_name: &str,
+    cache_dir: &Path,
+    revision: Option<&str>,
+) -> Result<(PathBuf, Option<String>), Status> {
+    // Get the model path using the provider from the request. A requested revision
+    // selects that exact snapshot instead of whichever one is newest on disk.
+    let model_path = download::get_provider(provider)
+        .get_model_path_revision(model_name, cache_dir.to_path_buf(), revision)
+        .await
+        .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+
+    debug!("Model path resolved to: {:?}", model_path);
+
+    let commit_hash = if provider == ModelProvider::HuggingFace {
+        model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from)
+    } else {
+        None
+    };
+
+    if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
+        return Err(Status::internal(
+            "Resolved Hugging Face model path did not contain a revision",
+        ));
+    }
+
+    let expected_model_path =
+        resolve_model_path(cache_dir, provider, model_name, commit_hash.as_deref()).map_err(
+            |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
+        )?;
+
+    if model_path != expected_model_path {
+        error!(
+            "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
+            model_path.display(),
+            expected_model_path.display(),
+            model_name
+        );
+        return Err(Status::internal(
+            "Resolved model path does not match expected cache layout",
+        ));
+    }
+
+    Ok((model_path, commit_hash))
 }
 
 /// Resolve a requested revision to the immutable revision the download will use.
@@ -241,12 +347,50 @@ impl ApiService for ApiServiceImpl {
 #[derive(Clone)]
 pub struct ModelServiceImpl {
     tracker: Arc<ModelDownloadTracker>,
+    /// Confine every request to the caller's cache partition.
+    tenant_isolation: bool,
 }
 
 impl ModelServiceImpl {
     /// Each server owns its tracker, so multiple servers can run in one process.
     pub fn new(tracker: Arc<ModelDownloadTracker>) -> Self {
-        Self { tracker }
+        Self::with_tenant_isolation(tracker, false)
+    }
+
+    pub fn with_tenant_isolation(
+        tracker: Arc<ModelDownloadTracker>,
+        tenant_isolation: bool,
+    ) -> Self {
+        Self {
+            tracker,
+            tenant_isolation,
+        }
+    }
+
+    /// The cache partition a request is confined to, or `None` when isolation is off.
+    /// Fails with `UNAUTHENTICATED` when isolation is on and the request carries no
+    /// verified caller.
+    #[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+    fn scope<T>(&self, request: &Request<T>) -> Result<Option<Tenant>, Status> {
+        if !self.tenant_isolation {
+            return Ok(None);
+        }
+        let Some(caller) = request.extensions().get::<CallerIdentity>() else {
+            error!(
+                "tenant isolation is enabled but the request carries no verified caller \
+                 identity; rejecting"
+            );
+            return Err(Status::unauthenticated(
+                "tenant isolation requires an authenticated caller",
+            ));
+        };
+        Tenant::new(&caller.namespace).map(Some).ok_or_else(|| {
+            error!(
+                "caller namespace '{}' is not a DNS-1123 label; rejecting",
+                caller.namespace
+            );
+            Status::permission_denied("caller namespace is not a valid namespace")
+        })
     }
 }
 
@@ -345,6 +489,7 @@ impl ModelService for ModelServiceImpl {
         request: Request<ModelDownloadRequest>,
     ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
         info!("Starting model download stream");
+        let tenant = self.scope(&request)?;
         let model_request = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
@@ -365,12 +510,13 @@ impl ModelService for ModelServiceImpl {
         let revision = resolve_target_revision(
             &model_name,
             provider,
-            get_server_cache_dir(),
-            model_request.revision.as_deref(),
+            cache_dir_for(tenant.as_ref()),
+            requested_revision(model_request.revision.as_deref())?,
         )
         .await?;
 
         let target = DownloadTarget {
+            tenant,
             model_name: model_name.clone(),
             provider,
             revision: revision.clone(),
@@ -413,6 +559,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+        let tenant = self.scope(&request)?;
         let files_request = request.into_inner();
         let chunk_size = if files_request.chunk_size == 0 {
             constants::DEFAULT_TRANSFER_CHUNK_SIZE
@@ -430,61 +577,17 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+        let revision = requested_revision(files_request.revision.as_deref())?;
 
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
             model_name, chunk_size
         );
 
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request. A requested revision
-        // selects that exact snapshot instead of whichever one is newest on disk.
-        let model_path = provider_impl
-            .get_model_path_revision(
-                &model_name,
-                cache_dir.clone(),
-                files_request.revision.as_deref(),
-            )
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
-
-        debug!("Model path resolved to: {:?}", model_path);
-
-        let commit_hash = if provider == ModelProvider::HuggingFace {
-            model_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
-            return Err(Status::internal(
-                "Resolved Hugging Face model path did not contain a revision",
-            ));
-        }
-
-        let expected_model_path =
-            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
-                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
-            )?;
-
-        if model_path != expected_model_path {
-            error!(
-                "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
-                model_path.display(),
-                expected_model_path.display(),
-                model_name
-            );
-            return Err(Status::internal(
-                "Resolved model path does not match expected cache layout",
-            ));
-        }
+        let (model_path, commit_hash) =
+            cached_snapshot(provider, &model_name, &cache_dir, revision).await?;
 
         // Collect all files to stream
         let files = collect_model_files(
@@ -609,6 +712,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<ModelFileList>, Status> {
+        let tenant = self.scope(&request)?;
         let files_request = request.into_inner();
 
         // Convert gRPC provider to our enum
@@ -621,19 +725,13 @@ impl ModelService for ModelServiceImpl {
         let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+        let revision = requested_revision(files_request.revision.as_deref())?;
 
         info!("Listing files for model: {}", model_name);
 
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = cache_dir_for(tenant.as_ref())
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request
-        let model_path = provider_impl
-            .get_model_path_revision(&model_name, cache_dir, files_request.revision.as_deref())
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+        let (model_path, _) = cached_snapshot(provider, &model_name, &cache_dir, revision).await?;
 
         // Collect all files
         let files = collect_model_files(
@@ -666,6 +764,7 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<DeleteModelRequest>,
     ) -> Result<Response<DeleteModelResponse>, Status> {
+        let tenant = self.scope(&request)?;
         let delete_request = request.into_inner();
 
         let grpc_provider = GrpcModelProvider::try_from(delete_request.provider).map_err(|_| {
@@ -682,7 +781,9 @@ impl ModelService for ModelServiceImpl {
         // for metadata-only downloads). `model clear` means "forget this model", so drop
         // all of them rather than only the unpinned full-weight entry.
         let tracker = self.tracker.clone();
-        let outcome = tracker.delete_model_entries(&model_name).await;
+        let outcome = tracker
+            .delete_model_entries(tenant.as_ref(), &model_name)
+            .await;
         let removed = outcome.removed;
         info!("Deleted {removed} registry record(s) for model '{model_name}'");
 
@@ -903,21 +1004,28 @@ impl ModelDownloadTracker {
         deleted
     }
 
-    /// Deletes every registry entry belonging to `model_name`, whatever revision or
-    /// weight mode each entry covers.
+    /// Deletes every registry entry belonging to `model_name` in `tenant`'s partition,
+    /// whatever revision or weight mode each entry covers.
     ///
     /// The registry-listing failure is swallowed on purpose: the fallback still
     /// clears the common case, which is better than refusing outright. It is
     /// reported in the return value so the caller can say so, because otherwise a
     /// backend outage and a model with no entries are the same `0`.
-    pub async fn delete_model_entries(&self, model_name: &str) -> DeleteEntriesOutcome {
+    pub async fn delete_model_entries(
+        &self,
+        tenant: Option<&Tenant>,
+        model_name: &str,
+    ) -> DeleteEntriesOutcome {
         let records = match self.registry.get_models_by_last_used(None).await {
             Ok(records) => records,
             Err(e) => {
                 error!("Failed to list registry records for '{model_name}': {e}");
                 // Fall back to the unpinned full-weight key so the common case still
                 // clears rather than failing outright.
-                self.delete_status(model_name).await;
+                let fallback = EntryKey::new(model_name, None, false)
+                    .in_tenant(tenant.cloned())
+                    .to_string();
+                self.delete_status(&fallback).await;
                 return DeleteEntriesOutcome {
                     removed: 0,
                     degraded: true,
@@ -927,7 +1035,7 @@ impl ModelDownloadTracker {
 
         let mut removed: usize = 0;
         for record in records {
-            if EntryKey::parse(&record.model_name).belongs_to(model_name) {
+            if EntryKey::parse(&record.model_name).belongs_to(tenant, model_name) {
                 // Deleting a record mid-download is a real exit from DOWNLOADING,
                 // and the only one the claim lifecycle cannot see: once the key
                 // is gone, finish_download_claim finds nothing to fence and
@@ -960,17 +1068,18 @@ impl ModelDownloadTracker {
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let entry_key = target.entry_key();
+            let cache_dir = cache_dir_for(target.tenant.as_ref());
             let DownloadTarget {
                 model_name,
                 provider,
                 revision,
                 ignore_weights,
+                ..
             } = target;
-            let cache_dir = get_server_cache_dir();
             let download = download::download_model_revision(
                 &model_name,
                 provider,
-                cache_dir,
+                cache_dir.clone(),
                 ignore_weights,
                 revision.as_deref(),
             );
@@ -1008,8 +1117,16 @@ impl ModelDownloadTracker {
                 }
             };
 
+            let result = result.and_then(|outcome| {
+                record_download(
+                    cache_dir.as_deref(),
+                    &entry_key,
+                    &outcome.path,
+                    ignore_weights,
+                )
+            });
             let (status, message) = match result {
-                Ok(_path) => (
+                Ok(()) => (
                     ModelStatus::DOWNLOADED,
                     Some("Model download completed successfully".to_string()),
                 ),
@@ -1063,6 +1180,51 @@ impl ModelDownloadTracker {
         });
     }
 
+    /// True when this server's cache holds every file recorded for `target`.
+    async fn recorded_files_present(&self, target: &DownloadTarget, entry_key: &str) -> bool {
+        if !model_files_present(cache_dir_for(target.tenant.as_ref()), target).await {
+            return false;
+        }
+        // Returning an existing downloaded model is a cache hit for LRU purposes.
+        self.touch_and_log(entry_key).await;
+        true
+    }
+
+    /// Clears a `DOWNLOADED` record whose files this server's cache does not hold, after
+    /// deleting the damaged ones, so the next claim downloads them here. Returns whether the
+    /// record was removed.
+    async fn clear_stale_record(&self, target: &DownloadTarget, entry_key: &str) -> bool {
+        error!(
+            "Registry reports model '{}' as DOWNLOADED but its files are missing from the \
+             cache; clearing the stale record and re-downloading",
+            target.model_name
+        );
+        remove_damaged_files(cache_dir_for(target.tenant.as_ref()), target).await;
+        self.delete_status(entry_key).await
+    }
+
+    async fn report_missing_files(
+        identity: &UpdateIdentity<'_>,
+        tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+    ) -> ModelStatus {
+        error!(
+            "Registry still reports model '{}' as DOWNLOADED after clearing it, but its files \
+             are missing from the cache",
+            identity.model_name
+        );
+        let _ = tx
+            .send(Ok(identity.status_update(
+                ModelStatus::ERROR,
+                Some(
+                    "Registry reports the model as downloaded but its files are missing from \
+                     the server cache"
+                        .to_string(),
+                ),
+            )))
+            .await;
+        ModelStatus::ERROR
+    }
+
     /// Initiates a download for a model and streams status updates.
     ///
     /// All registry operations key on the target's entry key rather than its model name,
@@ -1107,31 +1269,16 @@ impl ModelDownloadTracker {
                 Ok(ClaimOutcome::Claimed | ClaimOutcome::TookOver) => {
                     break (ModelStatus::DOWNLOADING, true);
                 }
-                Ok(ClaimOutcome::AlreadyExists(existing)) => {
-                    if existing == ModelStatus::DOWNLOADED
-                        && attempt < MAX_CLAIM_ATTEMPTS
-                        && !model_files_present(
-                            get_server_cache_dir(),
-                            model_name,
-                            provider,
-                            target.revision.as_deref(),
-                        )
-                        .await
-                    {
-                        error!(
-                            "Registry reports model '{model_name}' as DOWNLOADED but its files \
-                             are missing from the cache; clearing the stale record and \
-                             re-downloading"
-                        );
-                        self.delete_status(entry_key).await;
-                        continue;
+                Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)) => {
+                    if self.recorded_files_present(target, entry_key).await {
+                        break (ModelStatus::DOWNLOADED, false);
                     }
-                    if existing == ModelStatus::DOWNLOADED {
-                        // Returning an existing downloaded model is a cache hit for LRU purposes.
-                        self.touch_and_log(entry_key).await;
+                    if attempt >= MAX_CLAIM_ATTEMPTS {
+                        return Self::report_missing_files(&identity, tx).await;
                     }
-                    break (existing, false);
+                    self.clear_stale_record(target, entry_key).await;
                 }
+                Ok(ClaimOutcome::AlreadyExists(existing)) => break (existing, false),
                 Err(e) => {
                     error!("Failed to claim model for download: {e}");
                     let error_update = identity.status_update(
@@ -1211,6 +1358,14 @@ impl ModelDownloadTracker {
                         self.spawn_download_task(target.clone(), false, claim_id);
                         claim_id = uuid::Uuid::new_v4().to_string();
                     }
+                    Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)) => {
+                        if self.recorded_files_present(target, entry_key).await {
+                            return ModelStatus::DOWNLOADED;
+                        }
+                        if !self.clear_stale_record(target, entry_key).await {
+                            return Self::report_missing_files(&identity, tx).await;
+                        }
+                    }
                     Ok(ClaimOutcome::AlreadyExists(current_status))
                         if current_status != ModelStatus::DOWNLOADING =>
                     {
@@ -1229,12 +1384,15 @@ impl ModelDownloadTracker {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
+    use crate::services::*;
     use modelexpress_common::grpc::{api::ApiRequest, health::HealthRequest};
     use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
     use tonic::Request;
+
+    #[cfg(feature = "memory-backend")]
+    use crate::registry::backend::{RegistryBackend, memory::InMemoryRegistryBackend};
 
     #[tokio::test]
     async fn test_health_service() {
@@ -1385,6 +1543,7 @@ mod tests {
     /// Unpinned, full-weight target: its entry key is the bare model name.
     fn test_target(model_name: &str) -> DownloadTarget {
         DownloadTarget {
+            tenant: None,
             model_name: model_name.to_string(),
             provider: ModelProvider::HuggingFace,
             revision: None,
@@ -1423,9 +1582,7 @@ mod tests {
             temp_dir.path().to_str().expect("Expected temp dir path"),
         );
         let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
-        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
-        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
-        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+        install(temp_dir.path(), &test_target("test/model"), &all_files());
 
         let mut mock = crate::registry::backend::MockRegistryBackend::new();
         mock.expect_try_claim_for_download()
@@ -1504,15 +1661,10 @@ mod tests {
             temp_dir.path().to_str().expect("Expected temp dir path"),
         );
         let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
-        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
-        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
-        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+        let target = pinned_target(false);
+        install(temp_dir.path(), &target, &all_files());
 
-        assert_claims_on_entry_key(DownloadTarget {
-            revision: Some("abc123".to_string()),
-            ..test_target("test/model")
-        })
-        .await;
+        assert_claims_on_entry_key(target).await;
     }
 
     #[tokio::test]
@@ -1526,17 +1678,15 @@ mod tests {
             temp_dir.path().to_str().expect("Expected temp dir path"),
         );
         let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
-        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
-        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
-        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+        let target = DownloadTarget {
+            ignore_weights: true,
+            ..test_target("test/model")
+        };
+        install(temp_dir.path(), &target, METADATA_FILES);
 
         // A metadata-only entry must not be the same registry record as a full-weight
         // one, or a weightless snapshot would satisfy a request that needs weights.
-        assert_claims_on_entry_key(DownloadTarget {
-            ignore_weights: true,
-            ..test_target("test/model")
-        })
-        .await;
+        assert_claims_on_entry_key(target).await;
     }
 
     #[tokio::test]
@@ -1636,7 +1786,7 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker.delete_model_entries(None, "m").await;
         assert_eq!(outcome.removed, 1);
         assert!(!outcome.degraded);
 
@@ -1663,7 +1813,7 @@ mod tests {
             .returning(|_| Err("backend unreachable".into()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        tracker.delete_model_entries("m").await;
+        tracker.delete_model_entries(None, "m").await;
 
         let encoded = encoded_metrics(&metrics_registry);
         assert_eq!(
@@ -1685,7 +1835,7 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker.delete_model_entries(None, "m").await;
         assert_eq!(outcome.removed, 1, "the record is still removed");
 
         let encoded = encoded_metrics(&metrics_registry);
@@ -1757,6 +1907,7 @@ mod tests {
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
         tracker.spawn_download_task(
             DownloadTarget {
+                tenant: None,
                 model_name: "not-a-valid-ngc-artifact".to_string(),
                 provider: ModelProvider::Ngc,
                 revision: None,
@@ -2085,45 +2236,459 @@ mod tests {
         );
     }
 
+    const REVISION: &str = "abc123";
+    const METADATA_FILES: &[(&str, &[u8])] = &[
+        ("config.json", b"{}"),
+        ("tokenizer.json", b"{\"version\":\"1.0\"}"),
+    ];
+    const WEIGHT_FILES: &[(&str, &[u8])] = &[("model.safetensors", b"\x08\x00weights")];
+
+    fn pinned_target(ignore_weights: bool) -> DownloadTarget {
+        DownloadTarget {
+            revision: Some(REVISION.to_string()),
+            ignore_weights,
+            ..test_target("test/model")
+        }
+    }
+
+    fn snapshot_dir(cache_dir: &Path) -> PathBuf {
+        cache_dir
+            .join("models--test--model/snapshots")
+            .join(REVISION)
+    }
+
+    fn write_snapshot(cache_dir: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+        let snapshot = snapshot_dir(cache_dir);
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot dir");
+        for (name, body) in files {
+            std::fs::write(snapshot.join(name), body).expect("Failed to write snapshot file");
+        }
+        snapshot
+    }
+
+    fn install(cache_dir: &Path, target: &DownloadTarget, files: &[(&str, &[u8])]) {
+        let snapshot = write_snapshot(cache_dir, files);
+        record_download(
+            Some(cache_dir),
+            &target.entry_key(),
+            &snapshot,
+            target.ignore_weights,
+        )
+        .expect("Failed to record download");
+    }
+
+    fn all_files() -> Vec<(&'static str, &'static [u8])> {
+        [METADATA_FILES, WEIGHT_FILES].concat()
+    }
+
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_model_files_present_reflects_disk_state() {
-        let env_lock = acquire_env_mutex();
-        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let cache_dir = temp_dir.path().to_path_buf();
+    async fn a_recorded_full_download_is_a_cache_hit() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let full = pinned_target(false);
+        install(cache.path(), &full, &all_files());
+        assert!(model_files_present(Some(cache.path().to_path_buf()), &full).await);
+    }
 
-        // No files on disk: a stale DOWNLOADED record must not be honored.
+    #[tokio::test]
+    async fn a_snapshot_nobody_recorded_is_not_a_cache_hit() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        write_snapshot(cache.path(), &all_files());
         assert!(
-            !model_files_present(
-                Some(cache_dir.clone()),
-                "test/model",
-                ModelProvider::HuggingFace,
-                None
-            )
-            .await
+            !model_files_present(Some(cache.path().to_path_buf()), &pinned_target(false)).await
         );
+    }
 
-        // Once the snapshot exists, the cache hit is real.
-        let model_dir = cache_dir.join("models--test--model/snapshots/abc123");
-        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
-        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+    #[tokio::test]
+    async fn a_metadata_only_download_does_not_satisfy_a_full_weight_record() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let metadata = pinned_target(true);
+        install(cache.path(), &metadata, METADATA_FILES);
+
+        assert!(model_files_present(Some(cache.path().to_path_buf()), &metadata).await);
         assert!(
-            model_files_present(
-                Some(cache_dir),
-                "test/model",
-                ModelProvider::HuggingFace,
-                None
-            )
-            .await
+            !model_files_present(Some(cache.path().to_path_buf()), &pinned_target(false)).await
         );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_only_record_ignores_the_weights_beside_it() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let metadata = pinned_target(true);
+        install(cache.path(), &metadata, &all_files());
+        std::fs::remove_file(snapshot_dir(cache.path()).join("model.safetensors"))
+            .expect("Failed to remove");
+
+        assert!(model_files_present(Some(cache.path().to_path_buf()), &metadata).await);
+    }
+
+    #[tokio::test]
+    async fn losing_a_recorded_file_invalidates_the_record() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let full = pinned_target(false);
+        install(cache.path(), &full, &all_files());
+        std::fs::remove_file(snapshot_dir(cache.path()).join("model.safetensors"))
+            .expect("Failed to remove");
+
+        assert!(!model_files_present(Some(cache.path().to_path_buf()), &full).await);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_cache_volume_invalidates_the_record_even_once_repopulated() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let full = pinned_target(false);
+        install(cache.path(), &full, &all_files());
+
+        std::fs::remove_dir_all(cache.path()).expect("Failed to wipe cache");
+        std::fs::create_dir_all(cache.path()).expect("Failed to recreate cache");
+        write_snapshot(cache.path(), &all_files());
+
+        assert!(!model_files_present(Some(cache.path().to_path_buf()), &full).await);
     }
 
     #[tokio::test]
     async fn test_model_files_present_assumes_present_without_cache_dir() {
         // With no configured cache directory we cannot verify, so we must not force a
         // re-download loop: assume the files are present.
-        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace, None).await);
+        assert!(model_files_present(None, &pinned_target(false)).await);
+    }
+
+    #[test]
+    fn recording_without_a_cache_dir_is_a_no_op() {
+        let missing = Path::new("/nonexistent/snapshot");
+        record_download(None, &pinned_target(false).entry_key(), missing, false)
+            .expect("Failed to record");
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn unreachable_hub() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
+        let port = listener.local_addr().expect("Failed to read addr").port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn tracker_over(backend: Arc<InMemoryRegistryBackend>) -> ModelDownloadTracker {
+        ModelDownloadTracker::new(
+            Arc::new(RegistryManager::with_backend(backend)),
+            DownloadMetrics::register(&mut crate::metrics::new_registry()),
+            RegistryMetrics::register(&mut crate::metrics::new_registry()),
+        )
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn record_downloaded_before_restart(
+        backend: &InMemoryRegistryBackend,
+        target: &DownloadTarget,
+    ) {
+        let key = target.entry_key();
+        let claim = backend
+            .try_claim_for_download(
+                &key,
+                target.provider,
+                "before-restart",
+                DOWNLOAD_LEASE_DURATION,
+            )
+            .await
+            .expect("Failed to claim");
+        assert_eq!(claim, ClaimOutcome::Claimed);
+        assert!(
+            backend
+                .finish_download_claim(
+                    &key,
+                    target.provider,
+                    "before-restart",
+                    ModelStatus::DOWNLOADED,
+                    Some("Model download completed successfully".to_string()),
+                )
+                .await
+                .expect("Failed to finish claim")
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn drain_statuses(
+        mut rx: tokio::sync::mpsc::Receiver<Result<ModelStatusUpdate, Status>>,
+    ) -> Vec<i32> {
+        let mut statuses = Vec::new();
+        while let Some(update) = rx.recv().await {
+            statuses.push(update.expect("Expected an ok status update").status);
+        }
+        statuses
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_restart_that_lost_the_weights_re_downloads_instead_of_reporting_a_hit() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(cache.path(), &pinned_target(true), METADATA_FILES);
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tracker.ensure_model_downloaded(&full, &tx),
+        )
+        .await
+        .expect("ensure_model_downloaded did not finish");
+        drop(tx);
+
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+        let record = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Download failed")),
+            "unexpected message: {:?}",
+            record.message
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_truncated_recorded_file_is_removed_before_downloading_again() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(cache.path(), &full, &all_files());
+        let snapshot = snapshot_dir(cache.path());
+        std::fs::write(snapshot.join("model.safetensors"), b"\x08").expect("Failed to truncate");
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&full, &tx).await,
+            ModelStatus::ERROR
+        );
+        assert!(
+            !snapshot.join("model.safetensors").exists(),
+            "the truncated weight file was kept for the next download to reuse"
+        );
+        for (name, _) in METADATA_FILES {
+            assert!(snapshot.join(name).exists(), "{name} was removed");
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_waiter_does_not_report_a_download_another_server_holds() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        let key = full.entry_key();
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &key,
+                    full.provider,
+                    "other-server",
+                    DOWNLOAD_LEASE_DURATION
+                )
+                .await
+                .expect("Failed to claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let waiter = {
+            let full = full.clone();
+            tokio::spawn(async move { tracker.ensure_model_downloaded(&full, &tx).await })
+        };
+        let waiting = rx
+            .recv()
+            .await
+            .expect("Expected a status update")
+            .expect("Expected an ok status update");
+        assert_eq!(
+            waiting.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloading as i32
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    &key,
+                    full.provider,
+                    "other-server",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("Failed to finish claim")
+        );
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .expect("ensure_model_downloaded did not finish")
+            .expect("ensure_model_downloaded panicked");
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+        let record = backend
+            .get_model_record(&key)
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Download failed")),
+            "unexpected message: {:?}",
+            record.message
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_recorded_download_is_served_after_a_restart_without_the_hub() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let full = pinned_target(false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(cache.path(), &full, &all_files());
+        let before = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&full, &tx).await,
+            ModelStatus::DOWNLOADED
+        );
+        drop(tx);
+
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert_eq!(drain_statuses(rx).await, vec![downloaded]);
+        let after = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(after.created_at, before.created_at);
+        assert!(after.last_used_at >= before.last_used_at);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_completed_download_records_what_it_left_in_the_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let snapshot = write_snapshot(cache.path(), &all_files());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let tracker = tracker_over(Arc::clone(&backend));
+        let full = pinned_target(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&full, &tx).await,
+            ModelStatus::DOWNLOADED
+        );
+
+        let manifest = DownloadManifest::read(cache.path(), &full.entry_key())
+            .expect("Expected the download to be recorded");
+        assert!(manifest.is_satisfied_by(&snapshot));
+        assert!(model_files_present(Some(cache.path().to_path_buf()), &full).await);
+        assert_eq!(
+            DownloadManifest::read(cache.path(), &pinned_target(true).entry_key()),
+            None
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_download_that_leaves_no_files_is_not_reported_as_downloaded() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        write_snapshot(cache.path(), &[]);
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let tracker = tracker_over(Arc::clone(&backend));
+        let full = pinned_target(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&full, &tx).await,
+            ModelStatus::ERROR
+        );
+        let record = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert_eq!(
+            DownloadManifest::read(cache.path(), &full.entry_key()),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2519,5 +3084,749 @@ mod tests {
         assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
         assert!(first_chunk.is_last_chunk);
         assert!(first_chunk.is_last_file);
+    }
+
+    fn tenant(namespace: &str) -> Tenant {
+        Tenant::new(namespace).expect("valid namespace")
+    }
+
+    fn pinned_target_in(namespace: &str, ignore_weights: bool) -> DownloadTarget {
+        DownloadTarget {
+            tenant: Some(tenant(namespace)),
+            ..pinned_target(ignore_weights)
+        }
+    }
+
+    fn partition_of(cache: &Path, namespace: &str) -> PathBuf {
+        partition(cache, Some(&tenant(namespace)))
+    }
+
+    fn as_caller<T>(message: T, namespace: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(CallerIdentity {
+            namespace: namespace.to_string(),
+            service_account: "worker".to_string(),
+            pod_name: None,
+            pod_uid: None,
+        });
+        request
+    }
+
+    fn files_request() -> ModelFilesRequest {
+        ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+            chunk_size: 0,
+            file_selector: None,
+            ignore_weights: false,
+            revision: Some(REVISION.to_string()),
+        }
+    }
+
+    fn download_request() -> ModelDownloadRequest {
+        ModelDownloadRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+            ignore_weights: false,
+            revision: Some(REVISION.to_string()),
+        }
+    }
+
+    fn delete_request() -> DeleteModelRequest {
+        DeleteModelRequest {
+            model_name: "test/model".to_string(),
+            provider: GrpcModelProvider::HuggingFace as i32,
+        }
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn listed(
+        service: &ModelServiceImpl,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Vec<String>, tonic::Code> {
+        let mut files: Vec<String> = service
+            .list_model_files(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .files
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect();
+        files.sort();
+        Ok(files)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn streamed(
+        service: &ModelServiceImpl,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Vec<String>, tonic::Code> {
+        let chunks: Vec<FileChunk> = service
+            .stream_model_files(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .map(|chunk| chunk.expect("Expected chunk"))
+            .collect()
+            .await;
+        let mut files: Vec<String> = chunks
+            .into_iter()
+            .map(|chunk| chunk.relative_path)
+            .collect();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn all_file_names() -> Vec<String> {
+        let mut names: Vec<String> = all_files()
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_verified_caller_fail_closed_under_isolation() {
+        let service = ModelServiceImpl::with_tenant_isolation(test_model_service().tracker, true);
+        let code = |result: Result<_, Status>| result.err().map(|status| status.code());
+        assert_eq!(
+            code(
+                service
+                    .ensure_model_downloaded(Request::new(download_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .stream_model_files(Request::new(files_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .list_model_files(Request::new(files_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+        assert_eq!(
+            code(
+                service
+                    .delete_model(Request::new(delete_request()))
+                    .await
+                    .map(|_| ())
+            ),
+            Some(tonic::Code::Unauthenticated)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_namespace_that_is_not_a_namespace_is_rejected() {
+        let service = ModelServiceImpl::with_tenant_isolation(test_model_service().tracker, true);
+        for namespace in ["..", "a/b", ""] {
+            let status = service
+                .list_model_files(as_caller(files_request(), namespace))
+                .await
+                .expect_err("must be rejected");
+            assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "{namespace:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_record_is_satisfied_only_by_its_own_partition() {
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let a = pinned_target_in("tenant-a", false);
+        let a_partition = partition_of(cache.path(), "tenant-a");
+
+        install(cache.path(), &a, &all_files());
+        install(&partition_of(cache.path(), "tenant-b"), &a, &all_files());
+        assert!(!model_files_present(Some(a_partition.clone()), &a).await);
+
+        install(&a_partition, &a, &all_files());
+        assert!(model_files_present(Some(a_partition), &a).await);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    fn service_over(
+        backend: Arc<crate::registry::backend::memory::InMemoryRegistryBackend>,
+        tenant_isolation: bool,
+    ) -> ModelServiceImpl {
+        ModelServiceImpl::with_tenant_isolation(Arc::new(tracker_over(backend)), tenant_isolation)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    async fn final_status(
+        service: &ModelServiceImpl,
+        request: Request<ModelDownloadRequest>,
+    ) -> Result<i32, tonic::Code> {
+        let updates: Vec<ModelStatusUpdate> = service
+            .ensure_model_downloaded(request)
+            .await
+            .map_err(|status| status.code())?
+            .into_inner()
+            .map(|update| update.expect("Expected an ok status update"))
+            .collect()
+            .await;
+        Ok(updates.last().expect("at least one update").status)
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn isolation_off_keeps_the_existing_keys_and_cache_layout() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+
+        let legacy_key = "mx1:abc123:-:test/model";
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        record_downloaded_before_restart(&backend, &pinned_target(false)).await;
+        let before = backend
+            .get_model_record(legacy_key)
+            .await
+            .expect("Failed to read record")
+            .expect("an isolation-off entry key changed");
+        let snapshot = write_snapshot(cache.path(), &all_files());
+        DownloadManifest::new(
+            legacy_key,
+            collect_model_files(&snapshot, &snapshot, None, false),
+        )
+        .write(cache.path())
+        .expect("Failed to write legacy manifest");
+        assert!(cache.path().join(".modelexpress/downloads").is_dir());
+
+        let service = service_over(Arc::clone(&backend), false);
+        assert_eq!(
+            final_status(&service, Request::new(download_request())).await,
+            Ok(downloaded)
+        );
+        assert_eq!(
+            listed(&service, Request::new(files_request())).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            streamed(&service, Request::new(files_request())).await,
+            Ok(all_file_names())
+        );
+        assert!(!cache.path().join(".modelexpress/tenants").exists());
+        let after = backend
+            .get_model_record(legacy_key)
+            .await
+            .expect("Failed to read record")
+            .expect("Expected the legacy record");
+        assert_eq!(
+            after.created_at, before.created_at,
+            "the legacy record was re-downloaded instead of served"
+        );
+        assert_eq!(
+            backend
+                .get_models_by_last_used(None)
+                .await
+                .expect("Failed to list")
+                .into_iter()
+                .map(|record| record.model_name)
+                .collect::<Vec<_>>(),
+            vec![legacy_key.to_string()]
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_tenant_download_lands_in_its_own_partition() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let a_partition = partition_of(cache.path(), "tenant-a");
+        let snapshot = write_snapshot(&a_partition, &all_files());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(Arc::clone(&backend), true);
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-a")).await,
+            Ok(modelexpress_common::grpc::model::ModelStatus::Downloaded as i32)
+        );
+
+        let key = "mxt1:tenant-a:abc123:-:test/model";
+        assert_eq!(key, pinned_target_in("tenant-a", false).entry_key());
+        let record = backend
+            .get_model_record(key)
+            .await
+            .expect("Failed to read record")
+            .expect("Expected the tenant's record");
+        assert_eq!(record.status, ModelStatus::DOWNLOADED);
+        assert!(
+            DownloadManifest::read(&a_partition, key)
+                .expect("Expected the partition's manifest")
+                .is_satisfied_by(&snapshot)
+        );
+        assert_eq!(DownloadManifest::read(cache.path(), key), None);
+        assert!(!cache.path().join("models--test--model").exists());
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tenants_cannot_download_list_or_stream_each_others_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", false),
+            &all_files(),
+        );
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(Arc::clone(&backend), true);
+
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-b")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert!(
+            !partition_of(cache.path(), "tenant-b")
+                .join("models--test--model")
+                .exists()
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn isolation_hides_the_unpartitioned_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(cache.path(), &pinned_target(false), &all_files());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let service = service_over(backend, true);
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Err(tonic::Code::NotFound)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Err(tonic::Code::NotFound)
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn clearing_a_model_only_touches_the_callers_partition() {
+        use crate::registry::backend::RegistryBackend;
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let a = pinned_target_in("tenant-a", false);
+        let a_metadata = pinned_target_in("tenant-a", true);
+        let b = pinned_target_in("tenant-b", false);
+        let open = pinned_target(false);
+        for target in [&a, &a_metadata, &b, &open] {
+            record_downloaded_before_restart(&backend, target).await;
+        }
+        let keys = async || {
+            let mut keys: Vec<String> = backend
+                .get_models_by_last_used(None)
+                .await
+                .expect("Failed to list")
+                .into_iter()
+                .map(|record| record.model_name)
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let service = service_over(Arc::clone(&backend), true);
+        let response = service
+            .delete_model(as_caller(delete_request(), "tenant-b"))
+            .await
+            .expect("delete")
+            .into_inner();
+        assert!(response.success);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("1 record"))
+        );
+        let mut expected = vec![a.entry_key(), a_metadata.entry_key(), open.entry_key()];
+        expected.sort();
+        assert_eq!(keys().await, expected);
+
+        service
+            .delete_model(as_caller(delete_request(), "tenant-a"))
+            .await
+            .expect("delete");
+        assert_eq!(keys().await, vec![open.entry_key()]);
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_partition_that_lost_its_weights_re_downloads_after_a_restart() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let full = pinned_target_in("tenant-a", false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", true),
+            METADATA_FILES,
+        );
+        install(cache.path(), &full, &all_files());
+        install(&partition_of(cache.path(), "tenant-b"), &full, &all_files());
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tracker.ensure_model_downloaded(&full, &tx),
+        )
+        .await
+        .expect("ensure_model_downloaded did not finish");
+        drop(tx);
+
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+        let record = backend
+            .get_model_record(&full.entry_key())
+            .await
+            .expect("Failed to read record")
+            .expect("Expected a record");
+        assert_eq!(record.status, ModelStatus::ERROR);
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Download failed")),
+            "unexpected message: {:?}",
+            record.message
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_recorded_partition_download_is_served_after_a_restart_without_the_hub() {
+        use crate::registry::backend::RegistryBackend;
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let backend = Arc::new(crate::registry::backend::memory::InMemoryRegistryBackend::new());
+        let full = pinned_target_in("tenant-a", false);
+        record_downloaded_before_restart(&backend, &full).await;
+        install(&partition_of(cache.path(), "tenant-a"), &full, &all_files());
+        let created_at = |record: Option<crate::registry::backend::ModelRecord>| {
+            record.expect("Expected the tenant's record").created_at
+        };
+        let before = created_at(
+            backend
+                .get_model_record(&full.entry_key())
+                .await
+                .expect("Failed to read record"),
+        );
+
+        let service = service_over(Arc::clone(&backend), true);
+        assert_eq!(
+            final_status(&service, as_caller(download_request(), "tenant-a")).await,
+            Ok(modelexpress_common::grpc::model::ModelStatus::Downloaded as i32)
+        );
+        assert_eq!(
+            streamed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+        assert_eq!(
+            created_at(
+                backend
+                    .get_model_record(&full.entry_key())
+                    .await
+                    .expect("Failed to read record")
+            ),
+            before,
+            "the partition's record was re-downloaded instead of served"
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revisions_outside_the_snapshot_directory_are_invalid_arguments() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &pinned_target_in("tenant-a", false),
+            &all_files(),
+        );
+        std::fs::create_dir_all(
+            partition_of(cache.path(), "tenant-b").join("models--test--model/snapshots/def456"),
+        )
+        .expect("Failed to create tenant-b snapshot");
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), true);
+        let a_snapshot = snapshot_dir(&partition_of(cache.path(), "tenant-a"));
+
+        for revision in [
+            a_snapshot.to_str().expect("utf-8 path").to_string(),
+            format!("../../../tenant-a/models--test--model/snapshots/{REVISION}"),
+        ] {
+            let files = ModelFilesRequest {
+                revision: Some(revision.clone()),
+                ..files_request()
+            };
+            assert_eq!(
+                listed(&service, as_caller(files.clone(), "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "list {revision}"
+            );
+            assert_eq!(
+                streamed(&service, as_caller(files, "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "stream {revision}"
+            );
+            let download = ModelDownloadRequest {
+                revision: Some(revision.clone()),
+                ..download_request()
+            };
+            assert_eq!(
+                final_status(&service, as_caller(download, "tenant-b")).await,
+                Err(tonic::Code::InvalidArgument),
+                "ensure {revision}"
+            );
+        }
+        assert_eq!(
+            listed(&service, as_caller(files_request(), "tenant-a")).await,
+            Ok(all_file_names())
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_untenanted_list_cannot_name_a_directory_outside_the_cache() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let outside = TempDir::new().expect("Failed to create temp dir");
+        std::fs::write(outside.path().join("data.txt"), b"keep").expect("Failed to write file");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), false);
+        let request = ModelFilesRequest {
+            revision: Some(outside.path().to_str().expect("utf-8 path").to_string()),
+            ..files_request()
+        };
+        assert_eq!(
+            listed(&service, Request::new(request)).await,
+            Err(tonic::Code::InvalidArgument)
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_ref_name_with_slashes_lists_its_snapshot() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        install(cache.path(), &pinned_target(false), &all_files());
+        let refs = cache.path().join("models--test--model/refs/refs/pr");
+        std::fs::create_dir_all(&refs).expect("Failed to create refs");
+        std::fs::write(refs.join("1"), REVISION).expect("Failed to write ref");
+        let service = service_over(Arc::new(InMemoryRegistryBackend::new()), false);
+        let request = ModelFilesRequest {
+            revision: Some("refs/pr/1".to_string()),
+            ..files_request()
+        };
+        assert_eq!(
+            listed(&service, Request::new(request)).await,
+            Ok(all_file_names())
+        );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_waiter_checks_its_own_partition_before_reporting_a_download() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let target = pinned_target_in("tenant-b", false);
+        let key = target.entry_key();
+        install(cache.path(), &target, &all_files());
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &key,
+                    target.provider,
+                    "other-server",
+                    DOWNLOAD_LEASE_DURATION
+                )
+                .await
+                .expect("Failed to claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let waiter = {
+            let target = target.clone();
+            tokio::spawn(async move { tracker.ensure_model_downloaded(&target, &tx).await })
+        };
+        rx.recv()
+            .await
+            .expect("Expected a status update")
+            .expect("Expected an ok status update");
+        assert!(
+            backend
+                .finish_download_claim(
+                    &key,
+                    target.provider,
+                    "other-server",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("Failed to finish claim")
+        );
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .expect("ensure_model_downloaded did not finish")
+            .expect("ensure_model_downloaded panicked");
+        assert_eq!(status, ModelStatus::ERROR);
+        let downloaded = modelexpress_common::grpc::model::ModelStatus::Downloaded as i32;
+        assert!(!drain_statuses(rx).await.contains(&downloaded));
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_truncated_file_is_removed_from_the_callers_partition_only() {
+        let env_lock = acquire_env_mutex();
+        let cache = TempDir::new().expect("Failed to create temp dir");
+        let _cache_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            cache.path().to_str().expect("Expected temp dir path"),
+        );
+        let _online_guard = EnvVarGuard::remove(&env_lock, "HF_HUB_OFFLINE");
+        let _hub_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &unreachable_hub());
+
+        let backend = Arc::new(InMemoryRegistryBackend::new());
+        let tenant_a = pinned_target_in("tenant-a", false);
+        let open = pinned_target(false);
+        record_downloaded_before_restart(&backend, &tenant_a).await;
+        install(
+            &partition_of(cache.path(), "tenant-a"),
+            &tenant_a,
+            &all_files(),
+        );
+        install(cache.path(), &open, &all_files());
+        let a_snapshot = snapshot_dir(&partition_of(cache.path(), "tenant-a"));
+        let open_snapshot = snapshot_dir(cache.path());
+        for snapshot in [&a_snapshot, &open_snapshot] {
+            std::fs::write(snapshot.join("model.safetensors"), b"\x08")
+                .expect("Failed to truncate");
+        }
+
+        let tracker = tracker_over(Arc::clone(&backend));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        assert_eq!(
+            tracker.ensure_model_downloaded(&tenant_a, &tx).await,
+            ModelStatus::ERROR
+        );
+        assert!(!a_snapshot.join("model.safetensors").exists());
+        assert!(open_snapshot.join("model.safetensors").exists());
     }
 }

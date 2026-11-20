@@ -23,6 +23,7 @@ struct WorkerEntry {
     ranks: BTreeMap<u32, WorkerRecord>,
     // the rank list_workers reports for this worker
     index_rank: u32,
+    owner_namespace: Option<String>,
 }
 
 #[derive(Default)]
@@ -64,6 +65,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         _pod_name: &str,
         _pod_uid: &str,
         _pod_namespace: &str,
+        owner_namespace: Option<String>,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let record = WorkerRecord::from(worker);
@@ -77,6 +79,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let entry = source.workers.entry(worker_id.to_string()).or_default();
         entry.ranks.insert(rank, record);
         entry.index_rank = rank;
+        entry.owner_namespace = owner_namespace;
         Ok(())
     }
 
@@ -101,6 +104,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             model_name: source.model_name.clone(),
             workers: entry.ranks.values().cloned().collect(),
             published_at: 0,
+            owner_namespace: entry.owner_namespace.clone(),
             identity: source.identity.clone(),
         }))
     }
@@ -153,6 +157,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     topology,
                     training_step: super::parse_training_step(&source.extra_parameters),
                     layout_signature: super::parse_layout_signature(&source.extra_parameters),
+                    owner_namespace: entry.owner_namespace.clone(),
                 });
             }
         }
@@ -256,7 +261,7 @@ mod tests {
         let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish");
         let record = backend
@@ -290,7 +295,15 @@ mod tests {
 
         for rank in [2, 0, 1] {
             backend
-                .publish_metadata(&id, "w1", worker(rank, SourceStatus::Ready), "", "", "")
+                .publish_metadata(
+                    &id,
+                    "w1",
+                    worker(rank, SourceStatus::Ready),
+                    "",
+                    "",
+                    "",
+                    None,
+                )
                 .await
                 .expect("publish");
         }
@@ -311,11 +324,19 @@ mod tests {
         let id = identity("m");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
+            .publish_metadata(
+                &id,
+                "w1",
+                worker(0, SourceStatus::Initializing),
+                "",
+                "",
+                "",
+                None,
+            )
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish r1");
 
@@ -357,11 +378,19 @@ mod tests {
         let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
+            .publish_metadata(
+                &id,
+                "w1",
+                worker(0, SourceStatus::Initializing),
+                "",
+                "",
+                "",
+                None,
+            )
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish r3");
 
@@ -387,7 +416,15 @@ mod tests {
         let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
+            .publish_metadata(
+                &id,
+                "w1",
+                worker(0, SourceStatus::Initializing),
+                "",
+                "",
+                "",
+                None,
+            )
             .await
             .expect("publish");
         backend
@@ -427,11 +464,11 @@ mod tests {
         let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish w1");
         backend
-            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish w2");
 
@@ -471,7 +508,7 @@ mod tests {
         let id = identity("m");
         let source_id = compute_mx_source_id(&id).expect("source id");
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "", None)
             .await
             .expect("publish");
 
