@@ -143,6 +143,7 @@ mod tests {
                     "",
                     "",
                     "",
+                    None,
                 )
                 .await
                 .expect("publish_metadata failed");

@@ -1944,7 +1944,7 @@ mod tests {
     }
 
     #[cfg(feature = "memory-backend")]
-    async fn publish_as(svc: &P2pServiceImpl, namespace: &str, worker_id: &str) -> String {
+    async fn publish_worker_as(svc: &P2pServiceImpl, namespace: &str, worker_id: &str) -> String {
         let mut req = Request::new(PublishMetadataRequest {
             identity: Some(test_identity()),
             worker: Some(worker_meta(0)),
@@ -2014,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn list_hides_other_namespace_sources() {
         let svc = isolated_service();
-        publish_as(&svc, "tenant-a", "worker-a").await;
+        publish_worker_as(&svc, "tenant-a", "worker-a").await;
 
         assert_eq!(
             list_as(&svc, "tenant-a").await,
@@ -2027,7 +2027,7 @@ mod tests {
     #[tokio::test]
     async fn get_metadata_denies_cross_namespace() {
         let svc = isolated_service();
-        let source_id = publish_as(&svc, "tenant-a", "worker-a").await;
+        let source_id = publish_worker_as(&svc, "tenant-a", "worker-a").await;
 
         assert!(get_found(&svc, "tenant-a", &source_id, "worker-a").await);
         assert!(
@@ -2040,7 +2040,7 @@ mod tests {
     #[tokio::test]
     async fn update_status_denies_cross_namespace() {
         let svc = isolated_service();
-        let source_id = publish_as(&svc, "tenant-a", "worker-a").await;
+        let source_id = publish_worker_as(&svc, "tenant-a", "worker-a").await;
 
         assert!(
             !update_ok(
@@ -2070,8 +2070,8 @@ mod tests {
     #[tokio::test]
     async fn same_model_across_namespaces_stays_isolated() {
         let svc = isolated_service();
-        let source_a = publish_as(&svc, "tenant-a", "worker-a").await;
-        let source_b = publish_as(&svc, "tenant-b", "worker-b").await;
+        let source_a = publish_worker_as(&svc, "tenant-a", "worker-a").await;
+        let source_b = publish_worker_as(&svc, "tenant-b", "worker-b").await;
         assert_eq!(source_a, source_b, "same model must collide on source_id");
 
         assert_eq!(
