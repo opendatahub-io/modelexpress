@@ -7,6 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 
 This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
+For RL generator checkpoint-cache capacity and
+`MX_REFIT_CHECKPOINT_MAX_SIZE_GB`, see the
+[RL checkpoint-cache configuration](rl/CONFIGURATION.md#generator-refit-checkpoint-cache).
+
+For canonical S3 refit and recovery downloads, `MX_S3_DOWNLOAD_BACKEND=preallocated`
+opts in to parallel reads into a preallocated buffer. TransferManager remains
+the default. See [S3 transfer tuning](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning)
+for concurrency, endpoint compatibility, and memory sizing.
+
 ## Server Configuration
 
 ModelExpress uses a layered configuration system. Sources are applied in order of precedence:
@@ -158,6 +167,14 @@ Kubernetes then garbage-collects those records when the Pod is deleted. Missing,
 partial, or cross-namespace identity does not block publication; ModelExpress
 omits the owner reference and retains the previous reaper-based lifecycle. Redis
 and non-Kubernetes deployments ignore these fields.
+
+With [ServiceAccount authentication](#serviceaccount-authentication) enabled, a
+complete identity is also checked against the caller's verified token. A
+`POD_NAMESPACE` that differs from the ServiceAccount's namespace, or a
+`POD_NAME`/`POD_UID` that differs from the pod the token is bound to, rejects
+the publish. A token with no bound pod cannot confirm the claim, so the record is
+published without an owner reference. Partial identity is not checked and
+behaves as above.
 
 #### Storage access modes
 
@@ -683,7 +700,14 @@ intact.
 
 For the Mooncake TransferEngine SGLang example, add
 `--build-arg INSTALL_MOONCAKE=true` to install
-`mooncake-transfer-engine-cuda13`.
+`mooncake-transfer-engine-cuda13>=0.3.14`. A receiving weight loader requires the
+native `submit_scatter_read` completion-ticket API and rejects unsupported
+runtimes after source discovery, before preparing or registering destination
+weights. A seed with no source can load natively and publish using an older
+runtime without the ticket API. Pending tickets retain their buffers while
+draining and warn every 30 seconds with rank, elapsed time, and batch bytes;
+after submission, native fallback is allowed only after a drained failure. An
+undrainable operation requires supervised worker recovery.
 
 The Dynamo examples use their own runtime image Dockerfile:
 `examples/dynamo_p2p_transfer_k8s/Dockerfile`.
@@ -972,7 +996,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_METRICS_BIND_RETRY_SECS` | `15` | How often a rank that lost the `/metrics` bind re-attempts it, so endpoint ownership migrates when the current owner exits. |
 | `MX_METRICS_SOURCE_ID_LABEL` | `0` | Restore the per-peer `source_worker_id` label on `mx_p2p_source_selections_total`, for comparing source-selection policies; it likewise gates the label on `mx_p2p_source_load`. **Benchmark runs only:** the id is `uuid4().hex[:8]` minted per process, so its label domain grows with process count over time rather than with cluster size. Point such a run at a throwaway Prometheus. |
 | `MX_METRICS_SCHEME` | `""` | Optional run/scheme label, so multiple runs compare on one dashboard. On the client it is a label on `mx_build_info` **and** on every `mx_p2p_*` family; on the server it is on `mx_build_info` only. |
-| `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
@@ -983,9 +1007,10 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
-| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. Main-model P2P and cold-load shard selection are unchanged. The default permits P2P for compatible same-checkpoint MTP drafts; it does not bypass checkpoint identity or compatibility checks, and storage fallback remains available when no compatible READY source is found. |
+| `MX_DISABLE_DRAFT_P2P` | `0` | Set to `1` to load the SGLang or vLLM speculative draft through storage without receiving or publishing draft tensors over NIXL P2P. This overrides `MX_ENABLE_SEPARATE_DRAFT_P2P`. Main-model P2P and cold-load shard selection are unchanged. |
+| `MX_ENABLE_SEPARATE_DRAFT_P2P` | `0` | Set to `1` to enable vLLM separate-checkpoint draft P2P. This flag is vLLM-only and has no effect on SGLang. Compatible same-checkpoint MTP drafts remain enabled by default. Identity and compatibility checks still apply, with storage fallback if no compatible READY source is available. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
-| `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
 | `MX_ARTIFACT_BACKEND` | `nixl` | Select exactly one artifact backend: `nixl` or `mooncake`. There is no fallback. |
@@ -993,10 +1018,11 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP and speculative decoding. TP, DP and PP have been validated on GPUs; EP has not. Prefill or decode context parallelism greater than one is rejected by the opt-in path; reload, sleep/wake and elastic EP are unsupported. |
+| `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, both engines derive their health URLs from resolved serving settings. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -1090,27 +1116,7 @@ exercised against a real engine.
 
 ### Collective Refit (NCCL M2N) Environment Variables
 
-Client-side policy for the NCCL M2N collective refit path
-(`modelexpress_rl.collective`), which is a sibling of the NIXL pull path
-rather than a mode of it. Every value is validated when it is read: a
-non-numeric, zero or negative setting raises rather than falling back to the
-default, so a typo fails loudly at startup instead of silently restoring
-stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
-| `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
-| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
-| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version and checked between submissions, not inside them. A native `nccl.m2n.reshard` call, or the `nccl.m2n.group()` exit that issues a grouped submission (its group end), that blocks the host cannot be interrupted by it: the deadline cannot fire while it blocks, and the client only logs that the call is still blocking. The launcher must therefore bound each trainer and generator process with its own process-level timeout (the reference `examples/rl/m2n_collective_refit/run_e2e.sh` does so only when `PROC_TIMEOUT_S` is set; see [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md) section 8.2). `READY` only means the group formed, so this bounds what happens after it; on expiry the client aborts its lanes, because peers that disagree about which collectives completed cannot be recovered on the same communicator. The abort is local: the group epoch moves when that failure is reported against the operation `start_weight_update` bound (every round call reports on failure, best effort), or when membership changes. Until then the group stays at its epoch and a re-join cannot bootstrap fresh communicators. |
-| `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | `10.0` | Shared budget for aborting every lane of a group, data and control communicators included. An overrun raises `CommunicatorWedgedError`, and a wedged abort can only be recovered by exiting the process (see [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md) section 8.2). |
-| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | Size of the CUDA stream pool an integration builds when it does not pass its own `streams`. `RefitClientTrainer` and `RefitClientGenerator` do not read it: they use the `streams` the caller passes, or the current stream. |
-| `MX_NCCL_REFIT_BLOCKING_DATA_PLANE` | `1` | On by default; set `0` to run data traffic on the non-blocking communicator instead. When on, each lane is still initialized as a non-blocking communicator, bounded by `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`, and the reshard and broadcast traffic then runs on a blocking communicator split off it, also under that deadline. On the M2N NVLink path a non-blocking communicator costs roughly 0.4 ms of host time per reshard call, so this cuts a single-node refit of a few hundred parameters several-fold; over the network the per-call cost is already small and this changes little. Abort tears down both communicators. With it off, a rank whose peer dies in the middle of a refit can block past `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` instead of raising. Read once per client and part of the plan digest, so a cohort that disagrees on it stays `FORMING`. |
-| `MX_NCCL_REFIT_GROUPED_SUBMISSION` | `0` | Opt in to recording each layer group as one `nccl.m2n.group()` instead of one `nccl.m2n.reshard` call per entry. Requires GIN: nccl-extensions 0.1.0 fails a group of two or more reshards at group end on every rank without it. Read once per client and part of the plan digest, so a cohort that disagrees on it stays `FORMING`. |
-| `MX_NCCL_REFIT_PIPELINE_DEPTH` | `2` | How many layer groups `RefitClientGenerator.update_weights` keeps in flight before installing the oldest. At 2, group N is installed while group N+1 is on the wire; every group is installed before `finish_weight_update` returns. `1` installs each group before `update_weights` returns. Each extra level keeps one more group's outstanding receive buffers alive (at most `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` of `pre` scratch per group on the default per-call path). |
-| `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES` | `1073741824` | Generator-side bound on the `pre` scratch receive buffers one layer group keeps alive on the per-call path. Calls are closed into windows of half this size; once two are closed, the older is waited on (its lane events) and dropped, so a group holding the whole bulk does not keep all of its scratch at once. Peak scratch per group is about this budget plus two calls. `0` keeps every buffer until the group is waited on. Ignored with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1`, where nothing is issued before the group closes. |
-| `MX_NCCL_REFIT_SEND_WINDOW_BYTES` | `1073741824` | Trainer-side counterpart of `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES`: bounds the `pre` scratch one layer group keeps alive while it is sent, for example grouped experts stacked into a fresh buffer per call. Without it every such buffer stays allocated until the finish-time drain, so an integration that empties the allocator cache between rounds allocates and frees the whole set each round. `0` keeps every buffer until the drain. Ignored with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1`. |
-| `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
+The collective refit environment variables are documented in the [RL configuration guide](rl/CONFIGURATION.md#collective-refit-nccl-m2n-environment-variables).
 
 ### NIXL Backend Selection
 
@@ -1289,6 +1295,35 @@ handles.
 
 ### P2P Metadata Exchange
 
+With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
+Redis lease, renewed every 20 seconds. Followers check READY ranks every two
+seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
+term. The configured cold-start wait timeout also caps total donor renewal time
+from acquisition, after which the donor attempts to release the lease. The lease
+may also be released earlier after READY ranks are discovered. Transient discovery
+and election RPC failures are retried for up to three seconds after the first failure,
+within the overall wait deadline.
+If coordination fails or the configured cold-start wait timeout expires, the replica's workers skip the
+built-in RDMA strategy and continue through the remaining loading strategies;
+successful loads can still be published as peers. Plugins are unaffected, and
+multiple replicas may then load from storage concurrently. Subsequent strategy
+selection and runtime failures are not coordinated across workers and can still
+prevent startup. The timeout starts after worker-group validation; it does not
+bound collective operations or subsequent model loading. A donor can continue
+loading after its lease is released or expires; it is not fenced from publishing,
+and another donor can load from storage concurrently. The lease is scoped to source identity, not accelerator
+compatibility, and the normal load strategy can fall back to object storage.
+Election runs at weight loading and does not prevent earlier downloads. For
+server-backed, non-shared storage, set `MODEL_EXPRESS_NO_SHARED_STORAGE=1`
+and configure the MX server so the vLLM loader leaves weight acquisition to
+the strategy chain. Metadata may still be fetched before election.
+
+On UCX/RC deployments where short GPU reads are emulated in the source process,
+peer reads during CUDA graph capture can invalidate capture. Operators may set
+`UCX_RC_MLX5_TX_INLINE_RESP=0` and `UCX_PROTO_EMULATION_ENABLE=n` for affected
+configurations, or explicitly defer publication using `MX_ARTIFACT_READY_URL`.
+Validate UCX protocol selection and performance for the deployment.
+
 P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
 
 RL generator peer leases and in-place update safety are described in the [RL refit architecture](rl/ARCHITECTURE.md#generator-peer-lease-behavior).
@@ -1297,6 +1332,17 @@ RL generator peer leases and in-place update safety are described in the [RL ref
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
+
+Both settings are base ports: each worker listens on base + `device_id`, so each one reserves the range base..base+num_local_devices-1 (for example `5555`-`5562` on an 8-GPU node). Make sure neither range overlaps a port used by another service in the pod, such as an inference engine's own ZMQ or HTTP ports. If a port is already taken, the worker logs which setting and device produced it and continues without P2P serving.
+
+Worker metadata endpoints may use DNS hostnames or numeric IPv4/IPv6 addresses.
+Before fetching NIXL metadata, the client resolves hostnames using the system
+resolver and selects the first IPv4 or IPv6 address in resolver order; it does
+not retry other addresses if the connection fails. Numeric addresses bypass
+DNS, bracketed IPv6 literals are normalized, and IPv6 scope IDs are preserved.
+DNS failures are reported before calling NIXL. IPv6 socket metadata exchange
+requires a NIXL build containing
+[IPv6 support from PR #2236](https://github.com/ai-dynamo/nixl/pull/2236).
 
 ### Artifact Transfer Backends
 
@@ -1386,6 +1432,15 @@ should share caches and different across those that should not. Note that this
 partitions the pool but does not by itself make prefill and decode share a
 cache — they cannot, because vLLM's own cache keys already differ.
 
+The same digest partitions the kernel JIT caches (Triton, DeepGEMM, TileLang,
+CuTe DSL, FlashInfer, and SGLang's TVM-FFI). Their files are keyed per kernel,
+so a bundle from another compile configuration is never wrong, but it can be
+incomplete: which kernels a worker JIT-compiles follows its configuration, most
+visibly `max_num_batched_tokens`, which bounds the GEMM shapes DeepGEMM warms up.
+A prefill worker that installs a decode worker's DeepGEMM bundle reuses the
+smaller shape set and compiles the rest at startup. With the digest set per
+compile configuration, each worker installs only bundles produced under its own.
+
 To check whether a transferred cache was actually used, look for the
 effectiveness line the vLLM loader emits once the engine is up:
 
@@ -1406,7 +1461,44 @@ and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
 
+#### Artifact startup readiness
+
+`MX_ARTIFACT_READY_URL` remains an optional HTTP(S) override. When unset, empty,
+or whitespace-only:
+
+- vLLM probes its resolved HTTP host and port, including CLI/config-file
+  overrides. For example, `vllm serve MODEL --port 8001 --load-format modelexpress`
+  probes `http://127.0.0.1:8001/health` without another setting.
+- SGLang probes its resolved HTTP listener without plugin hooks. Python follower
+  nodes use their local plain-HTTP health listener, including when the head uses
+  TLS. Rust listener placement follows SGLang's native helper.
+
+Both paths wait for cache files to settle. Weight-metadata policy is unchanged.
+Startup completion does not cover specializations compiled by later requests.
+
+vLLM carries the parsed endpoint to workers through its general-plugin
+compatibility adapter, without changing source identities or compilation-cache
+hashes. Wildcard bind hosts become loopback addresses. TLS selects HTTPS with
+normal certificate verification. Without serving configuration, the fallback
+is `http://127.0.0.1:8000/health`; this also applies when compatibility patches
+are disabled. UDS, gRPC-only serving, dynamic ports, and custom frontends require
+an explicit reachable HTTP(S) URL. Headless workers retain head-address routing.
+SGLang needs no runtime compatibility patch for listener discovery. Its fallback
+is `http://127.0.0.1:30000/health`; TLS uses normal certificate verification.
+No vLLM worker extension or endpoint plugin is required. Worker-local readiness
+is supplied through `LoadContext.artifact_ready_fn`; the artifact layer adds cache
+settling and keeps publication closed if the callback is missing. The serialized
+URL travels in `model_loader_extra_config` through a single CLI-conversion
+wrapper; MX removes its key from copies passed to native loaders.
+Automatic discovery only attaches metadata for MX loaders while artifact
+transfer is enabled and no explicit URL is set. Unsupported hook shapes, missing
+parsed arguments, or read-only configuration are logged; use
+`MX_ARTIFACT_READY_URL` when discovery cannot run.
+
 #### Multi-node readiness
+
+SGLang's inferred local follower health listeners are probed locally. The
+following head-address routing applies to other loopback health URLs.
 
 Only the head node of a multi-node engine serves HTTP; the others run headless
 (for vLLM, `--headless`, which starts the executor and no API server), so a
@@ -1522,6 +1614,8 @@ selection does not affect P2P target transfer.
 With vLLM, `MX_MODEL_URI` can also be a Hugging Face model ID. vLLM first downloads the safetensors into its local Hugging Face cache, then ModelStreamer reads those local files; ModelStreamer does not stream directly from the Hub.
 
 For vLLM MTP with a shared checkpoint, configure both the main and speculative draft loads through ModelExpress and use the same pinned checkpoint, revision, vLLM build, and MX build on source and target. One main NIXL listener serves both role-scoped tensor sets; do not allocate a second metadata port for the draft. On cold start, ModelStreamer prefers the model's `is_unused_checkpoint_weight` hook and delegates to a compatible RunAI loader or uses vLLM's local filter and the checkpoint index. Older engines without the hook can use the bounded Qwen3.5, Qwen3-Next, DeepSeek and GLM MTP compatibility paths described in [vLLM Loader](ARCHITECTURE.md#vllm-loader). Other models and unusable optional metadata retain full-file loading. Main models without their own hook also retain full-file loading. Logs identify whether shard selection used the model-owned hook or the legacy compatibility rule. Mixed shards can be read by both passes. With `MX_VMM_ARENA=1`, the main weights use the arena while draft tensors are registered individually; the draft must not replace the live main arena.
+
+For vLLM separate-checkpoint drafts, configure both loads through ModelExpress and set `MX_ENABLE_SEPARATE_DRAFT_P2P=1` on all replicas. The draft joins the main model's NIXL publication under a namespace derived from its checkpoint identity, revision, speculative method and vLLM version. Use matching immutable main and draft checkpoints, revisions and software builds on all replicas. A nonempty draft revision is required but does not pin or verify the checkpoint contents. If the identity is incomplete or a compatible source is unavailable, loading falls back to storage.
 
 **S3 / S3-compatible:**
 

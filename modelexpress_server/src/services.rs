@@ -2798,7 +2798,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_ensure_model_downloaded_rejects_a_revision_on_a_provider_without_revisions() {
+        let _env_lock = acquire_env_mutex();
         let service = test_model_service();
         let request = Request::new(ModelDownloadRequest {
             model_name: "gs://test-bucket/org/model/rev-1".to_string(),
@@ -2895,7 +2897,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_list_model_files_not_found() {
+        let _env_lock = acquire_env_mutex();
         let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
@@ -2914,7 +2918,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_stream_model_files_not_found() {
+        let _env_lock = acquire_env_mutex();
         let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
