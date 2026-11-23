@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
+from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
@@ -386,6 +387,45 @@ class TestAbstractMethodCompleteness:
                 loader.download_model(cfg)
                 mock_cls.return_value.download_model.assert_not_called()
 
+
+    @pytest.mark.parametrize(
+        "env, expected",
+        [({}, "auto"), ({"MX_COLD_START_FORMAT": " SafeTensors "}, "safetensors")],
+    )
+    def test_disk_paths_use_cold_start_format(self, env, expected):
+        """download_model and load_weights build DefaultModelLoader with MX_COLD_START_FORMAT."""
+        loader = _make_loader()
+        original = loader.load_config.load_format
+        with patch.dict("os.environ", env, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(MagicMock())
+                loader.load_weights(MagicMock(), MagicMock())
+        assert [c.args[0].load_format for c in mock_cls.call_args_list] == [expected, expected]
+        assert loader.load_config.load_format == original
+
+    @pytest.mark.parametrize("fmt", ["safetensor", "runai_streamer", "dummy"])
+    def test_unknown_cold_start_format_fails_up_front(self, fmt):
+        """A format DefaultModelLoader can't use fails before any load, naming the variable."""
+        loader = _make_loader()
+        with patch.dict("os.environ", {"MX_COLD_START_FORMAT": fmt}, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                with pytest.raises(ValueError, match="MX_COLD_START_FORMAT"):
+                    loader.download_model(MagicMock())
+                with pytest.raises(ValueError, match="MX_COLD_START_FORMAT"):
+                    loader._validate_load_policy()
+                with pytest.raises(ValueError, match="MX_COLD_START_FORMAT"):
+                    loader.load_weights(MagicMock(), MagicMock())
+        mock_cls.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fmt",
+        ["auto", "hf", "safetensors", "fastsafetensors", "instanttensor", "mistral", "pt", "npcache"],
+    )
+    def test_known_cold_start_formats_pass_validation(self, fmt):
+        """Every format DefaultModelLoader accepts passes the startup check."""
+        loader = _make_loader()
+        with patch.dict("os.environ", {"MX_COLD_START_FORMAT": fmt}, clear=True):
+            loader._validate_load_policy()
 
     def test_load_weights_delegates(self):
         loader = _make_loader()
@@ -1545,7 +1585,12 @@ class TestMtpDrafterSecondLoad:
         ) as publish:
             publish_metadata(ctx)
 
-        extend.assert_called_once_with(ctx.tensors, device_id=2, worker_rank=5)
+        extend.assert_called_once_with(
+            ctx.tensors,
+            device_id=2,
+            worker_rank=5,
+            accelerator_backend=ctx.accelerator_backend,
+        )
         publish.assert_not_called()
         assert ctx.draft_published is True
 
@@ -2084,10 +2129,27 @@ class TestExtendPublishedTensors:
         t.dtype = torch.bfloat16
         return {f"{prefix}.weight": t}
 
+    def test_protos_carry_tensor_memory_type(self):
+        from modelexpress.metadata.publish import build_tensor_protos
+
+        protos = build_tensor_protos(
+            {"host.weight": torch.zeros(4)},
+            device_id=3,
+            global_rank=3,
+            accelerator_backend=CudaAcceleratorBackend(),
+        )
+        assert protos[0].mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        assert protos[0].device_id == 0
+
     def test_returns_false_without_publication(self):
         from modelexpress.metadata.publish import extend_published_tensors
 
-        assert extend_published_tensors(self._tensors("x"), device_id=7, worker_rank=7) is False
+        assert extend_published_tensors(
+            self._tensors("x"),
+            device_id=7,
+            worker_rank=7,
+            accelerator_backend=CudaAcceleratorBackend(),
+        ) is False
 
     def test_p2p_mode_extends_running_worker_server(self):
         from modelexpress.metadata import publish as publish_mod
@@ -2096,7 +2158,10 @@ class TestExtendPublishedTensors:
         publish_mod._worker_servers[3] = server
         try:
             assert publish_mod.extend_published_tensors(
-                self._tensors("mx_draft::mtp"), device_id=3, worker_rank=3
+                self._tensors("mx_draft::mtp"),
+                device_id=3,
+                worker_rank=3,
+                accelerator_backend=CudaAcceleratorBackend(),
             ) is True
         finally:
             publish_mod._worker_servers.pop(3, None)
@@ -2151,12 +2216,16 @@ class TestExtendPublishedTensors:
                     device_id=4,
                     identity=_make_identity("my-model"),
                     worker_id="inst",
+                    accelerator_backend=CudaAcceleratorBackend(),
                 )
                 publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
 
                 nixl_manager.nixl_metadata = b"target-and-draft"
                 assert publish_mod.extend_published_tensors(
-                    self._tensors("mx_draft::mtp"), device_id=4, worker_rank=4
+                    self._tensors("mx_draft::mtp"),
+                    device_id=4,
+                    worker_rank=4,
+                    accelerator_backend=CudaAcceleratorBackend(),
                 ) is True
                 publisher.republish.assert_called_once()
 
@@ -2937,6 +3006,7 @@ class TestPublishMetadataAndReady:
                 identity=identity,
                 worker_id="inst-uuid",
                 ready_fn=ready_fn,
+                accelerator_backend=CudaAcceleratorBackend(),
             )
 
         mx_client.publish_metadata.assert_not_called()
@@ -2983,7 +3053,16 @@ class TestPublishMetadataAndReady:
         mock_publisher = MagicMock()
         with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=0, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                tensors,
+                worker_rank=0,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+                accelerator_backend=CudaAcceleratorBackend(),
+            )
             publisher_cls.call_args.kwargs["publish_fn"]()
 
         worker = mx_client.publish_metadata.call_args.args[1]
@@ -3024,6 +3103,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             result = publish_fn()
@@ -3059,6 +3139,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
@@ -3093,6 +3174,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(_FakeRpcError, match="permission denied"):
@@ -3127,6 +3209,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=_make_identity(),
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
 
             mx_client.publish_metadata.assert_not_called()
