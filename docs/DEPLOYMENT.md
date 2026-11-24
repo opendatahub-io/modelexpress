@@ -445,6 +445,11 @@ docker build -f docker/Dockerfile -t model-express .
 docker run -p 8001:8001 model-express
 ```
 
+Konflux server and operator images use separate UBI 9.9 build and runtime
+stages in `docker/Dockerfile.konflux` and `docker/Dockerfile.konflux.operator`.
+Keep their RPM locks aligned with those image releases; regenerate them with
+`./docker/konflux/lock-rpms.sh all` after changing a base image.
+
 ### Docker Compose
 
 Local development setup. Brings up the server plus a Redis metadata backend:
