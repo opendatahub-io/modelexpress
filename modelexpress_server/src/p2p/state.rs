@@ -302,7 +302,7 @@ mod tests {
     use crate::p2p::backend::MockMetadataBackend;
     use mockall::predicate::eq;
     use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
+        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor, TensorMemoryType,
     };
 
     fn test_identity() -> SourceIdentity {
@@ -335,15 +335,18 @@ mod tests {
             size: 1024 * 1024 * 1024,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Dram as i32,
         };
 
         let record = TensorRecord::from(desc.clone());
         assert_eq!(record.name, "model.layers.0.weight");
         assert_eq!(record.size, 1024 * 1024 * 1024);
+        assert_eq!(record.mem_type, TensorMemoryType::Dram as i32);
 
         let back: TensorDescriptor = record.into();
         assert_eq!(back.name, desc.name);
         assert_eq!(back.addr, desc.addr);
+        assert_eq!(back.mem_type, desc.mem_type);
     }
 
     #[test]
@@ -361,6 +364,7 @@ mod tests {
                 size: 4096,
                 device_id: 3,
                 dtype: "float16".to_string(),
+                mem_type: TensorMemoryType::Vram as i32,
             }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
@@ -371,6 +375,7 @@ mod tests {
                     size: 8192,
                     device_id: 3,
                     dtype: "float16".to_string(),
+                    mem_type: TensorMemoryType::Vram as i32,
                 }],
             })),
             ..Default::default()
@@ -412,6 +417,7 @@ mod tests {
                 size: 4096,
                 device_id: 3,
                 dtype: "float16".to_string(),
+                mem_type: TensorMemoryType::Vram as i32,
             }],
             ..Default::default()
         };
@@ -472,6 +478,7 @@ mod tests {
                 size: 8192,
                 device_id: 0,
                 dtype: "float16".to_string(),
+                mem_type: TensorMemoryType::Vram as i32,
             }],
             status: 0,
             updated_at: 0,
@@ -541,6 +548,7 @@ mod tests {
                         size: 1_000_000,
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
+                        mem_type: TensorMemoryType::Vram as i32,
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
@@ -561,6 +569,7 @@ mod tests {
                         size: 1_000_000,
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
+                        mem_type: TensorMemoryType::Vram as i32,
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,

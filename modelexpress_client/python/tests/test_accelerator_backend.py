@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from modelexpress import p2p_pb2
 from modelexpress.accelerators import (
     CudaAcceleratorBackend,
     XpuAcceleratorBackend,
@@ -78,6 +79,17 @@ class TestCudaAcceleratorBackend:
             is_cuda = True
 
         assert backend.is_accel_tensor(FakeCudaTensor()) is True
+
+    def test_cuda_backend_tensor_mem_type(self):
+        backend = CudaAcceleratorBackend()
+
+        class FakeCudaTensor:
+            is_cuda = True
+
+        assert backend.tensor_mem_type(FakeCudaTensor()) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        assert backend.tensor_mem_type(torch.zeros(1)) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="meta"):
+            backend.tensor_mem_type(torch.empty(1, device="meta"))
 
     def test_accelerator_backend_for_cuda(self):
         assert isinstance(
@@ -180,6 +192,18 @@ class TestXpuAcceleratorBackend:
         assert backend.is_accel_tensor(FakeTensor("cuda")) is False
         assert backend.is_accel_tensor(FakeTensor("cpu")) is False
 
+    def test_xpu_backend_tensor_mem_type(self):
+        backend = XpuAcceleratorBackend()
+
+        class FakeTensor:
+            def __init__(self, device_type):
+                self.device = SimpleNamespace(type=device_type)
+
+        assert backend.tensor_mem_type(FakeTensor("xpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        assert backend.tensor_mem_type(FakeTensor("cpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="cuda"):
+            backend.tensor_mem_type(FakeTensor("cuda"))
+
     def test_xpu_backend_torch_device(self):
         assert XpuAcceleratorBackend().torch_device(1) == torch.device("xpu", 1)
 
@@ -219,7 +243,7 @@ class TestAcceleratorCapabilityGates:
         monkeypatch,
         mock_accelerator_backend_cls,
     ):
-        backend = mock_accelerator_backend_cls(pool_reg=False)
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu", pool_reg=False)
         mgr = self._make_manager(backend)
         tensor = torch.zeros(4, dtype=torch.float32)
         monkeypatch.setenv("MX_POOL_REG", "1")
@@ -242,7 +266,7 @@ class TestAcceleratorCapabilityGates:
         mock_accelerator_backend_cls,
     ):
         monkeypatch.delenv("MX_POOL_REG", raising=False)
-        mgr = self._make_manager(mock_accelerator_backend_cls())
+        mgr = self._make_manager(mock_accelerator_backend_cls(torch_device_type="cpu"))
         tensor = torch.zeros(4, dtype=torch.float32)
         empty = torch.empty(0, dtype=torch.float32)
 
@@ -265,7 +289,7 @@ class TestAcceleratorCapabilityGates:
             def registered_range(self):
                 return 0x1000, 0x2000
 
-        backend = mock_accelerator_backend_cls(vmm=False)
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu", vmm=False)
         mgr = self._make_manager(backend)
         tensor = torch.zeros(1)
 
