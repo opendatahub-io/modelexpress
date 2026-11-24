@@ -109,6 +109,7 @@ impl KubernetesBackend {
                 size: t.size.to_string(),
                 device_id: t.device_id,
                 dtype: t.dtype.clone(),
+                mem_type: t.mem_type,
             })
             .collect();
 
@@ -199,6 +200,7 @@ impl KubernetesBackend {
                     size,
                     device_id: t.device_id,
                     dtype: t.dtype,
+                    mem_type: t.mem_type,
                 })
             })
             .collect::<MetadataResult<Vec<_>>>()?;

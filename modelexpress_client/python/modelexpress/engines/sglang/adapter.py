@@ -82,6 +82,22 @@ class SglangAdapter(EngineAdapter):
 
         return int(parallel_state.get_world_group().local_rank)
 
+    def all_gather_state(self, state) -> tuple[object, ...]:
+        """Gather rank-local state through SGLang's world CPU process group."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return (state,)
+
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            group = parallel.world_group
+        else:
+            from sglang.srt.distributed import parallel_state
+
+            group = parallel_state.get_world_group()
+        states = [None] * group.world_size
+        torch.distributed.all_gather_object(states, state, group=group.cpu_group)
+        return tuple(states)
+
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
         if gpu_id is not None:
@@ -110,6 +126,9 @@ class SglangAdapter(EngineAdapter):
             )
         )
 
+    def discovers_host_parameters(self) -> bool:
+        return True
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
@@ -132,7 +151,11 @@ class SglangAdapter(EngineAdapter):
             self.accelerator_backend,
             exclude=self._exclude_hidden_tensor_object,
         )
-        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(
+            result.model,
+            self.accelerator_backend,
+            include_host_parameters=self.discovers_host_parameters(),
+        )
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
                 type(result.model).__name__, role="draft", model=result.model

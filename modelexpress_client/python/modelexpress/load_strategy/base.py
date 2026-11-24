@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import host_resident_parameters, log_tensor_summary
+from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -320,17 +320,18 @@ def register_tensors(
                 )
                 return
 
-            # Only accelerator tensors are transferred, so a peer would keep
-            # dummy values for host parameters. Raise instead of returning so
-            # the handler below also releases a manager that artifact install
-            # already created.
-            host_params = host_resident_parameters(
-                result.model, ctx.accelerator_backend
+            # A peer would keep dummy values for parameters discovery skips.
+            # Raise instead of returning so the handler below also releases a
+            # manager that artifact install already created.
+            skipped = undiscovered_parameters(
+                result.model,
+                ctx.accelerator_backend,
+                include_host_parameters=ctx.adapter.discovers_host_parameters(),
             )
-            if host_params:
+            if skipped:
                 raise RuntimeError(
-                    f"{len(host_params)} parameters are outside accelerator "
-                    f"memory (first: {host_params[0]})"
+                    f"{len(skipped)} parameters are in memory that discovery "
+                    f"does not collect from (first: {skipped[0]})"
                 )
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
@@ -453,6 +454,7 @@ def publish_metadata(ctx: LoadContext) -> None:
                 ctx.tensors,
                 device_id=ctx.device_id,
                 worker_rank=ctx.worker_rank,
+                accelerator_backend=ctx.accelerator_backend,
             )
         except Exception as e:
             logger.warning(
@@ -474,6 +476,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
+            accelerator_backend=ctx.accelerator_backend,
         )
     except Exception as e:
         logger.warning(
