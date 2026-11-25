@@ -814,6 +814,27 @@ storage-view naming used for non-contiguous SGLang parameters.
 The SGLang side does not expose separate source and target modes; transport
 selection and source discovery remain inside the ModelExpress package.
 
+TransferEngine registration uses PyTorch's CUDA allocator snapshot to register
+each occupied block once and merge adjacent selected blocks within the same
+non-expandable segment. A tensor's complete byte range must fit inside an
+active allocation block, including buffers and storage views with nonzero
+offsets. Unrecognized ranges retain per-tensor registration; expandable segments,
+non-CUDA backends, and unavailable or malformed snapshots do not use this
+optimization.
+Merging never crosses allocation boundaries or unselected blocks. If expanding
+a block would overlap an unrecognized range, the whole registration falls back
+to the original tensor ranges. Transfers use each tensor's original address and
+size. When coalescing leaves every range unchanged, the loader tries the
+original ranges once. If the coalesced attempt fails, the loader rolls back
+its successful registrations. After a complete rollback, it retries once with
+the original deduplicated tensor ranges. If the retry fails,
+it cleans up that attempt before the receiver falls back to native loading or
+the seed skips source publication. A drained receive failure unregisters the
+bases from the successful attempt. Registration logs report the final region
+count, tensor count, registered bytes, and total time across attempts.
+Failure logs identify the registration attempt as `coalesced` or `original`.
+Both attempts use Mooncake's single-region `register_memory` API.
+
 **Cold-load quantization state.** A source manifest can describe buffers whose
 existence depends on checkpoint values. After placeholder post-processing and
 before registering destination memory, the receive strategy calls
@@ -1043,7 +1064,7 @@ Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and p
 
 ### Tensor Discovery
 
-The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. The vLLM and SGLang adapters also pass `include_host_parameters=True`, which adds parameters in host memory (see [Parameters in Host Memory](#parameters-in-host-memory)). This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|
@@ -1259,9 +1280,18 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
 
-### Parameters in Host Memory Skip RDMA
+### Parameters in Host Memory
 
-Tensor discovery only collects accelerator tensors, so a parameter in host memory is never transferred and the target would serve its dummy values. `register_tensors()` therefore skips NIXL registration when the model has any non-empty parameter outside accelerator memory: such a worker serves inference but never publishes itself as a P2P source, so targets fall back to the next strategy. A target whose own model has such parameters skips registration the same way and falls back instead of receiving. Known case: DeepSeek V4.1 Engram tables, which vLLM keeps in pinned host memory by default. `--engram-config '{"cpu_offload": false}'` keeps them on the GPU so RDMA can transfer them, at the cost of the tables' GPU memory on every rank.
+Some models keep parameters in pinned host memory, such as the DeepSeek V4.1 Engram tables.
+
+The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which, at the time of writing, detects host memory itself. Host buffers are not collected.
+
+A guard in `register_tensors()` keeps a target from serving initial values for parameters that discovery does not collect. It skips NIXL registration when the model has a non-empty parameter that is:
+
+- For engines that discover host parameters: in neither accelerator nor host memory, for example left on `meta`.
+- For other engines: outside accelerator memory, including host memory.
+
+The worker then serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are, at the time of writing, always in host memory.
 
 ### Long Source Warmup
 
