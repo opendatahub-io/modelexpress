@@ -219,7 +219,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::p2p::source_identity::compute_mx_source_id;
