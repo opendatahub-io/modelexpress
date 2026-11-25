@@ -497,7 +497,6 @@ pub struct CacheStats {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use crate::cache::*;
     use crate::registry::backend::MockRegistryBackend;

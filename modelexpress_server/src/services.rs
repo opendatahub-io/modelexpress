@@ -1382,7 +1382,6 @@ impl ModelDownloadTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use crate::services::*;
     use modelexpress_common::grpc::{api::ApiRequest, health::HealthRequest};
